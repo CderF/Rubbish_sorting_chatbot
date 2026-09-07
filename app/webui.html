@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>北九州市 ごみ分別チャットボット</title>
+<style>
+  :root{
+    --bg:#f4f6f8; --panel:#ffffff; --border:#dfe4ea; --text:#1a2027;
+    --muted:#6b7684; --accent:#1a56b8; --accent-soft:#e8f0fd;
+    --user-bg:#1a56b8; --user-fg:#ffffff; --bot-bg:#f0f2f5; --bot-fg:#1a2027;
+    --ok:#1c8c4a; --warn:#b8860b; --err:#c0392b;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#14181d; --panel:#1c2127; --border:#2b323b; --text:#e4e8ed;
+      --muted:#8b95a3; --accent:#5a9bf5; --accent-soft:#1e2a3d;
+      --user-bg:#2d6fd8; --user-fg:#ffffff; --bot-bg:#252b33; --bot-fg:#e4e8ed;
+      --ok:#3fbf6f; --warn:#d4a12c; --err:#e05c4b;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
+       height:100vh;display:flex;flex-direction:column}
+
+  header{background:var(--panel);border-bottom:1px solid var(--border);
+         padding:12px 20px;display:flex;align-items:center;gap:14px;flex-shrink:0}
+  header h1{margin:0;font-size:16px;font-weight:650}
+  .badge{font-size:11px;padding:3px 9px;border-radius:11px;
+         background:var(--accent-soft);color:var(--accent);font-weight:600}
+  .status{margin-left:auto;font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+  .dot.up{background:var(--ok)} .dot.down{background:var(--err)}
+
+  main{flex:1;display:flex;min-height:0}
+
+  /* ---- chat ---- */
+  .chat{flex:1;display:flex;flex-direction:column;min-width:0}
+  .messages{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:14px}
+  .msg{display:flex;gap:10px;max-width:min(760px,92%)}
+  .msg.user{align-self:flex-end;flex-direction:row-reverse}
+  .bubble{padding:11px 15px;border-radius:14px;line-height:1.65;font-size:14px;
+          white-space:pre-wrap;word-break:break-word}
+  .msg.user .bubble{background:var(--user-bg);color:var(--user-fg);border-bottom-right-radius:4px}
+  .msg.bot .bubble{background:var(--bot-bg);color:var(--bot-fg);border-bottom-left-radius:4px}
+  .msg img{max-width:200px;border-radius:10px;display:block;margin-bottom:8px}
+  .bubble h3,.bubble h4{margin:12px 0 6px;font-size:14px;font-weight:700}
+  .bubble h3:first-child,.bubble h4:first-child{margin-top:0}
+  .bubble ul{margin:6px 0;padding-left:20px}
+  .bubble li{margin:2px 0}
+  .bubble hr{border:none;border-top:1px solid var(--border);margin:11px 0}
+  .bubble code{background:rgba(127,127,127,.18);padding:1px 5px;border-radius:4px;font-size:13px}
+  .bubble pre{background:rgba(127,127,127,.14);padding:10px;border-radius:8px;overflow-x:auto;
+              font-size:13px;margin:8px 0}
+  .bubble a{color:var(--accent)}
+  .bubble strong{font-weight:700}
+  .who{font-size:11px;color:var(--muted);margin-bottom:4px}
+  .empty{margin:auto;text-align:center;color:var(--muted);font-size:13px;line-height:2}
+  .empty .ex{display:inline-block;margin:4px;padding:7px 13px;border:1px solid var(--border);
+             border-radius:16px;cursor:pointer;background:var(--panel);font-size:13px;color:var(--text)}
+  .empty .ex:hover{border-color:var(--accent);color:var(--accent)}
+  .cursor::after{content:"▌";animation:blink 1s step-end infinite;color:var(--accent)}
+  @keyframes blink{50%{opacity:0}}
+
+  /* ---- composer ---- */
+  .composer{border-top:1px solid var(--border);background:var(--panel);padding:12px 16px;flex-shrink:0}
+  .preview{display:none;margin-bottom:9px;position:relative;width:fit-content}
+  .preview img{max-height:76px;border-radius:8px;display:block}
+  .preview button{position:absolute;top:-7px;right:-7px;width:21px;height:21px;border-radius:50%;
+                  border:none;background:var(--err);color:#fff;cursor:pointer;font-size:13px;line-height:1}
+  .row{display:flex;gap:9px;align-items:flex-end}
+  textarea{flex:1;resize:none;border:1px solid var(--border);border-radius:10px;padding:10px 13px;
+           font:inherit;font-size:14px;background:var(--bg);color:var(--text);max-height:132px;min-height:42px}
+  textarea:focus{outline:none;border-color:var(--accent)}
+  button.act{border:1px solid var(--border);background:var(--bg);color:var(--text);
+             border-radius:10px;padding:0 14px;height:42px;cursor:pointer;font-size:14px;white-space:nowrap}
+  button.act:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+  button.send{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+  button.send:hover:not(:disabled){opacity:.9;color:#fff}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .hint{font-size:11px;color:var(--muted);margin-top:7px}
+
+  /* ---- side panel ---- */
+  aside{width:290px;border-left:1px solid var(--border);background:var(--panel);
+        overflow-y:auto;padding:16px;flex-shrink:0}
+  .card{margin-bottom:20px}
+  .card h2{margin:0 0 9px;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+  .bar{background:var(--bg);border:1px solid var(--border);border-radius:6px;height:22px;
+       overflow:hidden;position:relative}
+  .fill{background:var(--accent);height:100%;width:0;transition:width .4s}
+  .bar span{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+            font-size:11px;font-weight:600;color:var(--text);text-shadow:0 0 3px var(--panel)}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  td{padding:5px 0;border-bottom:1px solid var(--border)}
+  td:last-child{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+  tr:last-child td{border-bottom:none}
+  .sid{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--muted);
+       word-break:break-all;margin-bottom:9px}
+  @media (max-width:860px){
+    aside{display:none}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>北九州市 ごみ分別チャットボット</h1>
+  <span class="badge" id="modelBadge">Qwen3-VL-8B-Instruct</span>
+  <div class="status"><span class="dot" id="dot"></span><span id="statusText">接続確認中…</span></div>
+</header>
+
+<main>
+  <section class="chat">
+    <div class="messages" id="messages">
+      <div class="empty" id="empty">
+        質問を入力してください。画像を添付して品物の分別を尋ねることもできます。<br>
+        <span class="ex">ペットボトルはどう捨てますか?</span>
+        <span class="ex">小倉北区の燃えるごみの収集日は?</span>
+        <span class="ex">古い電子レンジの処分方法は?</span>
+      </div>
+    </div>
+
+    <div class="composer">
+      <div class="preview" id="preview">
+        <img id="previewImg" alt="添付画像">
+        <button id="removeImg" title="削除">×</button>
+      </div>
+      <div class="row">
+        <button class="act" id="attachBtn" title="画像を添付">画像</button>
+        <input type="file" id="fileInput" accept="image/*" hidden>
+        <textarea id="input" rows="1" placeholder="質問を入力（Enterで送信 / Shift+Enterで改行）"></textarea>
+        <button class="act send" id="sendBtn">送信</button>
+      </div>
+      <div class="hint">
+        セッションIDは会話を通じて保持されます。文脈をリセットするには「新しい会話」を押してください。
+      </div>
+    </div>
+  </section>
+
+  <aside>
+    <div class="card">
+      <h2>VRAM 使用量</h2>
+      <div class="bar"><div class="fill" id="vramFill"></div><span id="vramText">–</span></div>
+      <table style="margin-top:9px">
+        <tr><td>GPU 使用率</td><td id="gpuUtil">–</td></tr>
+        <tr><td>アクティブセッション</td><td id="sessCount">–</td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>直近リクエストの速度</h2>
+      <table>
+        <tr><td>初回トークンまで</td><td id="ttft">–</td></tr>
+        <tr><td>生成完了まで</td><td id="total">–</td></tr>
+        <tr><td>生成トークン数</td><td id="tokens">–</td></tr>
+        <tr><td>スループット</td><td id="tps">–</td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>セッション</h2>
+      <div class="sid" id="sidText">–</div>
+      <button class="act" id="newSession" style="width:100%">新しい会話</button>
+    </div>
+
+    <div class="card">
+      <h2>構成</h2>
+      <table>
+        <tr><td>モデル</td><td id="infoModel">–</td></tr>
+        <tr><td>量子化</td><td id="infoQuant">–</td></tr>
+        <tr><td>GPU</td><td id="infoGpu">–</td></tr>
+        <tr><td>最大コンテキスト</td><td id="infoCtx">–</td></tr>
+      </table>
+    </div>
+  </aside>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let attachedImage = null;   // base64 without the data: prefix
+let sessionId = newSessionId();
+let busy = false;
+
+function newSessionId(){
+  return 'webui-' + Math.random().toString(36).slice(2, 12);
+}
+function setSession(id){
+  sessionId = id;
+  $('sidText').textContent = id;
+}
+setSession(sessionId);
+
+/* ---------- markdown ----------
+   The model replies in markdown. Everything is HTML-escaped first, so model
+   output can never inject markup; only the patterns below become tags. */
+function escapeHtml(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+          .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function renderMarkdown(src){
+  let h = escapeHtml(src);
+  h = h.replace(/```([\s\S]*?)```/g, (m,c)=>'<pre>'+c.trim()+'</pre>');
+  h = h.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  h = h.replace(/^\s*#{4,6}\s+(.+)$/gm, '<h4>$1</h4>');
+  h = h.replace(/^\s*###\s+(.+)$/gm, '<h3>$1</h3>');
+  h = h.replace(/^\s*##\s+(.+)$/gm, '<h3>$1</h3>');
+  h = h.replace(/^\s*#\s+(.+)$/gm, '<h3>$1</h3>');
+  h = h.replace(/^\s*(?:---|\*\*\*|___)\s*$/gm, '<hr>');
+  h = h.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  h = h.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  h = h.replace(/^\s*(?:[-*+]|\d+\.)\s+(.+)$/gm, '<li>$1</li>');
+  h = h.replace(/(<li>[\s\S]*?<\/li>)(?!\s*<li>)/g, '<ul>$1</ul>');
+  h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+                '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return h;
+}
+
+/* ---------- message rendering ---------- */
+function addMessage(role, text, imgDataUrl){
+  $('empty')?.remove();
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + role;
+  const col = document.createElement('div');
+  const who = document.createElement('div');
+  who.className = 'who';
+  who.textContent = role === 'user' ? 'あなた' : 'ボット';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  if (imgDataUrl){
+    const im = document.createElement('img');
+    im.src = imgDataUrl;
+    bubble.appendChild(im);
+  }
+  const span = document.createElement('span');
+  span.textContent = text;
+  bubble.appendChild(span);
+  col.appendChild(who); col.appendChild(bubble);
+  wrap.appendChild(col);
+  $('messages').appendChild(wrap);
+  $('messages').scrollTop = $('messages').scrollHeight;
+  return span;
+}
+
+/* ---------- sending ---------- */
+async function send(){
+  const text = $('input').value.trim();
+  if ((!text && !attachedImage) || busy) return;
+
+  busy = true;
+  $('sendBtn').disabled = true;
+
+  const previewUrl = attachedImage ? $('previewImg').src : null;
+  addMessage('user', text, previewUrl);
+  $('input').value = '';
+  $('input').style.height = 'auto';
+
+  const payload = {session_id: sessionId, prompt: text, img: attachedImage};
+  clearImage();
+
+  const target = addMessage('bot', '');
+  target.parentElement.classList.add('cursor');
+  let raw = '';
+
+  try{
+    const res = await fetch('/ui/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true){
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream: true});
+      const parts = buf.split('\n\n');
+      buf = parts.pop();
+      for (const part of parts){
+        const line = part.trim();
+        if (!line.startsWith('data:')) continue;
+        const payloadStr = line.slice(5).trim();
+        if (payloadStr === '[DONE]') continue;
+        try{
+          const obj = JSON.parse(payloadStr);
+          if (obj.delta) raw += obj.delta;
+        }catch(e){
+          raw += payloadStr;
+        }
+        target.innerHTML = renderMarkdown(raw);
+        $('messages').scrollTop = $('messages').scrollHeight;
+      }
+    }
+    if (!raw) target.textContent = '(応答が空でした)';
+  }catch(err){
+    target.textContent = '通信エラー: ' + err.message;
+  }finally{
+    target.parentElement.classList.remove('cursor');
+    busy = false;
+    $('sendBtn').disabled = false;
+    $('input').focus();
+    refreshStats();
+  }
+}
+
+/* ---------- image attachment ---------- */
+function clearImage(){
+  attachedImage = null;
+  $('preview').style.display = 'none';
+  $('fileInput').value = '';
+}
+$('attachBtn').onclick = () => $('fileInput').click();
+$('removeImg').onclick = clearImage;
+$('fileInput').onchange = e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    $('previewImg').src = rd.result;
+    $('preview').style.display = 'block';
+    attachedImage = rd.result.split(',')[1];   // strip "data:image/png;base64,"
+  };
+  rd.readAsDataURL(file);
+};
+
+/* ---------- input behaviour ---------- */
+$('input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }
+});
+$('input').addEventListener('input', e => {
+  e.target.style.height = 'auto';
+  e.target.style.height = Math.min(e.target.scrollHeight, 132) + 'px';
+});
+$('sendBtn').onclick = send;
+$('newSession').onclick = () => {
+  setSession(newSessionId());
+  $('messages').innerHTML =
+    '<div class="empty" id="empty">新しい会話を開始しました。前の文脈は引き継ぎません。</div>';
+};
+document.addEventListener('click', e => {
+  if (e.target.classList.contains('ex')){
+    $('input').value = e.target.textContent;
+    send();
+  }
+});
+
+/* ---------- live stats ---------- */
+async function refreshStats(){
+  try{
+    const res = await fetch('/vram');
+    if (res.status === 401){ location.href = '/login'; return; }
+    const d = await res.json();
+    const pct = (d.used_mb / d.total_mb * 100);
+    $('vramFill').style.width = pct.toFixed(1) + '%';
+    $('vramText').textContent =
+      `${d.used_mb.toLocaleString()} / ${d.total_mb.toLocaleString()} MB (${pct.toFixed(0)}%)`;
+    $('gpuUtil').textContent = d.gpu_util_pct + ' %';
+    $('sessCount').textContent = d.active_sessions;
+
+    const t = d.last_timing || {};
+    $('ttft').textContent   = t.first_token_s != null ? t.first_token_s.toFixed(3) + ' 秒' : '–';
+    $('total').textContent  = t.total_s != null ? t.total_s.toFixed(3) + ' 秒' : '–';
+    $('tokens').textContent = t.tokens != null ? t.tokens : '–';
+    $('tps').textContent    = (t.tokens && t.total_s)
+      ? (t.tokens / t.total_s).toFixed(1) + ' tok/s' : '–';
+
+    $('dot').className = 'dot up';
+    $('statusText').textContent = '稼働中';
+  }catch(e){
+    $('dot').className = 'dot down';
+    $('statusText').textContent = '接続できません';
+  }
+}
+
+async function loadInfo(){
+  try{
+    const i = await (await fetch('/info')).json();
+    $('infoModel').textContent = i.model;
+    $('infoQuant').textContent = i.quantization;
+    $('infoGpu').textContent   = i.gpu;
+    $('infoCtx').textContent   = i.max_model_len.toLocaleString();
+    $('modelBadge').textContent = i.model;
+  }catch(e){ /* leave placeholders */ }
+}
+
+loadInfo();
+refreshStats();
+setInterval(refreshStats, 1000);
+$('input').focus();
+</script>
+</body>
+</html>

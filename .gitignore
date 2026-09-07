@@ -1,8 +1,42 @@
-.DS_Store
+# --- secrets ---------------------------------------------------------------
+# The real values live in /etc/rag-chatbot.env (root-owned, mode 600) on the
+# server. Only .env.example belongs in the repo.
 .env
 .env.*
-.venv/
+!.env.example
+*rag-chatbot.env
+
+# --- model weights (17GB, re-downloadable) ---------------------------------
+models/
+*.safetensors
+*.gguf
+
+# --- python ----------------------------------------------------------------
 venv/
+.venv/
 env/
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- runtime artefacts -----------------------------------------------------
+server.log
+*.log
+.cache/
+.triton/
+.nv/
+.tilelang/
+
+# --- confidential material -------------------------------------------------
+# NOTE: documents/課題.pdf is ALREADY TRACKED and pushed, so this rule has no
+# effect on it today — .gitignore only applies to untracked files. It is kept
+# here so the file is not re-added if it is ever untracked. The PDF is marked
+# "Strictly confidential for internal use only" by GMO; see README / team
+# decision on whether it should be purged from history.
+documents/課題.pdf
+
+# --- os / editor -----------------------------------------------------------
+.DS_Store
+.vscode/
+.idea/

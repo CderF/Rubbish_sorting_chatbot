@@ -1,0 +1,29 @@
+[Unit]
+Description=RAG Chatbot (Qwen3-VL-8B-Instruct via vLLM + FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust these four lines for the machine you deploy on.
+# The defaults match the B1 server (user teamb2, repo cloned to ~/app).
+User=teamb2
+Group=teamb2
+WorkingDirectory=/home/teamb2/app/app
+ExecStart=/home/teamb2/venv/bin/uvicorn server:app --host 0.0.0.0 --port 8080
+
+# Secrets (WEBUI_PASSWORD etc.) — see .env.example.
+# Create it with: sudo install -m 600 -o root -g root /dev/null /etc/rag-chatbot.env
+EnvironmentFile=/etc/rag-chatbot.env
+
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/teamb2/server.log
+StandardError=append:/home/teamb2/server.log
+
+# GPU init / model load / JIT warm-up can take ~1-2 minutes; give it room
+# before systemd considers a start attempt to have failed.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
