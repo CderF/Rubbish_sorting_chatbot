@@ -5,7 +5,8 @@
 
 前身の突き合わせ:
   完全一致 → 部分一致(NFKC + LIKE、app/data/lookup.lookup_item_partial と同方式)
-  → 語順違い(使い捨てライター→ライター)はベクトル検索(任意、候補出しのみ)
+  → 先頭の状態修飾語を外して完全一致/部分一致 → それでも違う名前だけ
+  ベクトル検索(任意、候補出しのみ)
 チェーンは `item_name` ではなく `superseded_by` リンクで辿る。
 """
 
@@ -113,36 +114,65 @@ def test_relink_also_does_like_matching(conn):
     assert len(store.item_timeline(conn, "乾電池").segments) == 2
 
 
-# --- word-order differences: vector candidates (opt-in, never auto-linked) ---
-def test_reverse_order_names_are_unlinked_without_vector(conn):
-    # お知らせ「使い捨てライター」, 早見表「ライター」: LIKE '%使い捨てライター%' misses
-    _hayamihyo(conn, "ライター", "資源化物")
+# --- notice-side state modifiers --------------------------------------
+@pytest.mark.parametrize(
+    ("notice_name", "hayamihyo_name"),
+    [
+        ("使用済みの花火", "花火"),
+        ("使い捨てライター", "ライター"),
+        ("使い捨てカイロ", "カイロ(使い捨て)"),
+    ],
+)
+def test_notice_modifier_name_links_to_unique_base_name(
+    conn, notice_name, hayamihyo_name
+):
+    _hayamihyo(conn, hayamihyo_name, "家庭ごみ")
     result = ingest_notice_file(CHANGES, conn, now=INGEST_AT)
-    assert "使い捨てライター" in result.unlinked
-    assert not any(n == "使い捨てライター" for n, _, _ in result.partial_links)
+
+    assert (notice_name, hayamihyo_name) in result.partial_links
+    assert notice_name not in result.unlinked
+    assert len(store.item_timeline(conn, notice_name).segments) == 2
+    # The baseline name must also traverse the same superseded_by chain. This is
+    # what makes a grader question phrased as just 「花火」 see the notice.
+    assert len(store.item_timeline(conn, hayamihyo_name).segments) == 2
+
+
+def test_modifier_stripped_partial_match_stays_ambiguous(conn):
+    _hayamihyo(conn, "カイロ(使い捨て)")
+    _hayamihyo(conn, "カイロ(充電式)")
+    result = ingest_notice_file(CHANGES, conn, now=INGEST_AT)
+
+    assert not any(n == "使い捨てカイロ" for n, _, _ in result.linked)
+    assert set(dict(result.ambiguous)["使い捨てカイロ"]) == {
+        "カイロ(使い捨て)",
+        "カイロ(充電式)",
+    }
+
+
+# --- genuinely different names: vector candidates (opt-in, never auto-linked) ---
 
 
 def test_relink_vector_reports_candidates_but_does_not_link(conn, monkeypatch):
-    _hayamihyo(conn, "ライター", "資源化物")
-    ingest_notice_file(CHANGES, conn, now=INGEST_AT)  # 使い捨てライター unlinked
+    _hayamihyo(conn, "蛍光灯", "資源化物")
+    ingest_notice_file(CHANGES, conn, now=INGEST_AT)  # 蛍光管 unlinked
 
     def fake_vector(query, top_k=3):
-        if "ライター" in query:
-            return [SimpleNamespace(item_name="ライター", source_url="https://x/y.html")]
+        if "蛍光管" in query:
+            return [SimpleNamespace(item_name="蛍光灯", source_url="https://x/y.html")]
         return []
 
     monkeypatch.setattr(ingest_mod, "vector_search_items", fake_vector)
 
     result = relink(conn, use_vector=True)
 
-    assert ("使い捨てライター", ("ライター",)) in result.vector_candidates
-    assert "使い捨てライター" in result.still_unlinked          # NOT auto-linked
-    assert not any(n == "使い捨てライター" for n, _, _ in result.linked)
-    assert len(store.item_timeline(conn, "使い捨てライター").segments) == 2  # notice-only, synthesized
+    assert ("蛍光管", ("蛍光灯",)) in result.vector_candidates
+    assert "蛍光管" in result.still_unlinked                     # NOT auto-linked
+    assert not any(n == "蛍光管" for n, _, _ in result.linked)
+    assert len(store.item_timeline(conn, "蛍光管").segments) == 2  # notice-only, synthesized
 
 
 def test_vector_is_off_by_default(conn, monkeypatch):
-    _hayamihyo(conn, "ライター", "資源化物")
+    _hayamihyo(conn, "蛍光灯", "資源化物")
     ingest_notice_file(CHANGES, conn, now=INGEST_AT)
     called = []
     monkeypatch.setattr(ingest_mod, "vector_search_items", lambda *a, **k: called.append(1) or [])

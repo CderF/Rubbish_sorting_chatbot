@@ -11,13 +11,16 @@ LLM 出力そのものは対象外(決定的な部分のみ)。
 
 from __future__ import annotations
 
+from datetime import date
 from types import SimpleNamespace
 
 import app.rag.router as router
 from app.rag.router import (
     _build_context,
     _classify_item_match,
+    _item_name_candidates,
     _search_item,
+    _timeline_method_text,
     build_system_prompt,
 )
 from app.rag.types import RoutedAnswer
@@ -71,6 +74,37 @@ def test_classify_item_match_is_name_based_not_tier_based(monkeypatch):
     assert _classify_item_match("テレビ", [_rec("テレビ台"), _rec("テレビアンテナ")]) == "analogy"
     # vector hits are different items -> analogy
     assert _classify_item_match("電動スケートボード", [_rec("電動キックボード")]) == "analogy"
+    # 修飾語つき原文と清掃後候補のどちらで一致しても、別品目扱いにしない
+    assert _classify_item_match(["壊れたテレビ", "テレビ"], [_rec("テレビ")]) == "exact"
+
+
+def test_item_candidates_keep_raw_official_name_and_cleaned_fallback():
+    candidates, vector_query = _item_name_candidates("使用済みの花火はどう捨てますか")
+    assert candidates[0] == "使用済みの花火"
+    assert "花火" in candidates
+    assert vector_query == "使用済みの花火"
+
+    candidates, _ = _item_name_candidates("壊れたテレビはどう捨てますか")
+    assert "壊れたテレビ" in candidates
+    assert "テレビ" in candidates
+
+    candidates, vector_query = _item_name_candidates("カイロ(使い捨て)はどう捨てますか")
+    assert candidates[0] == "カイロ(使い捨て)"
+    assert "カイロ" in candidates and "使い捨て" in candidates
+    assert vector_query == "カイロ(使い捨て)"
+
+
+def test_timeline_method_uses_only_the_structured_exact_date():
+    start = date(2026, 10, 1)
+    assert _timeline_method_text(
+        "2026年10月から、蛍光管は家庭ごみでは収集しなくなります。", start
+    ) == "蛍光管は家庭ごみでは収集しなくなります。"
+    assert _timeline_method_text(
+        "2026年10月1日から、乾電池を家庭ごみへ出すことはできません。", start
+    ) == "乾電池を家庭ごみへ出すことはできません。"
+    assert _timeline_method_text(
+        "2026年10月から、安全のため花火の出し方を変更します。", start
+    ) == "安全のため花火の出し方を変更します。"
 
 
 def test_search_item_returns_hits_and_stage(monkeypatch):
@@ -95,6 +129,7 @@ def test_analogy_relabels_only_the_item_section():
     )
     ctx = _build_context(ans)
     assert "早見表に「テレビ」の個別記載なし" in ctx
+    assert "類似候補1: テレビ台" in ctx
     assert "## 分別早見表の検索結果" not in ctx
     # the collection-day section is untouched
     assert "## 収集日の検索結果" in ctx
@@ -114,7 +149,8 @@ def test_analogy_rule_only_for_analogy_and_names_the_real_item():
 
     prompt = build_system_prompt(RoutedAnswer(found=True, item_match="analogy"))
     assert "類似する" in prompt
-    assert "実際の品目名を挙げて" in prompt          # substitute, don't echo a placeholder
+    assert "必ず1件だけ選ぶ" in prompt
+    assert "別候補の区分・条件を併記せず" in prompt
     assert "収集日など他の欄の情報はこの限りではない" in prompt  # don't blur the schedule
     assert "確認" in prompt
 
