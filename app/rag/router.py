@@ -209,20 +209,24 @@ def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str
 
 
 # --- 検索 ------------------------------------------------------------------
-def _search_item(item_name: str) -> list[ItemRecord]:
+def _search_item(item_name: str) -> tuple[list[ItemRecord], str]:
     """完全一致 → 部分一致 → ベクトル類似度 の順にフォールバックする(早見表パス)。
 
+    戻り値はヒットと、どの段でヒットしたか("exact" / "partial" / "similar" /
+    "none")。tier は要件4-3 の判定に使う ―― "similar" は早見表に個別記載が
+    なくベクトル類似で拾っただけなので、回答側で「類推」の断り書きを付ける。
+
     ベクトル類似度は前2段がどちらも0件のときだけ発火する(issue #7)。
-    `vector_search_items` はChroma未構築でも例外を投げず空リストを返すので、
-    ここでの呼び出しに追加のガードは要らない。
+    `vector_search_items` はChroma未構築でも例外を投げず空リストを返す。
     """
     exact = lookup_item_exact(item_name)
     if exact:
-        return [exact]
+        return [exact], "exact"
     partial = lookup_item_partial(item_name)[:5]
     if partial:
-        return partial
-    return vector_search_items(item_name, top_k=3)
+        return partial, "partial"
+    similar = vector_search_items(item_name, top_k=3)
+    return similar, ("similar" if similar else "none")
 
 
 def _apply_timeline(ans: RoutedAnswer, item_name: str, today: "date | None" = None) -> None:
@@ -276,7 +280,7 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     ans.detected_item = item_name
 
     if item_name:
-        ans.item_hits = _search_item(item_name)
+        ans.item_hits, ans.item_match = _search_item(item_name)
 
     if ward:
         # ごみ種別が明示されていれば絞り込むが、0件なら種別なしで引き直す。
@@ -432,6 +436,14 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
             "- この品目は将来出し方が変わる。「現在は〜。YYYY年MM月DD日からは〜」の"
             "形で、旧ルールと新ルールの両方を時系列に沿って説明する。"
             "どちらか一方だけを答えて断定しない。\n"
+        )
+
+    if ans.item_match == "similar":
+        parts.append(
+            "- 検索した品名は早見表に個別の記載がなく、下記は類似する品目の情報である。"
+            "「類似する『(検索結果の品名)』に準じると〜」の形で案内し、"
+            "断定しない。あわせて「個別の記載がないため、正確な分別は"
+            "北九州市の公式ページや窓口で確認してください」と必ず添える。\n"
         )
 
     if ans.missing:

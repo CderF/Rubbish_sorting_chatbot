@@ -261,9 +261,10 @@ system prompt ルールを見て詰める。
 
 ## 9. まだやっていないこと(担当境界)
 
-- **4-3(類似品物の但し書き)は未対応。** `_search_item` がヒット段階(exact/partial/similar)を
-  `RoutedAnswer` に立て、`build_system_prompt` に「similar のときは『類似する◯◯に準じると…。
-  確実な分別は市に確認を』と書く」規則を足す。`_search_item` の1行変更が要るので藤井さんと相談。
+- **4-3(類似品物の但し書き)は実装済み(別PR)。** `_search_item` がヒット段階
+  (`exact`/`partial`/`similar`/`none`)を返し `ans.item_match` に入る。`similar` のとき
+  `build_system_prompt` が「早見表に個別記載なし。『類似する◯◯に準じると〜』の形で
+  案内し、正確には市に確認、と添える」規則を出す。回答文言の詰めは本田さん。
 - 4-3(早見表に無い品目の類似品物フォールバック) — 本田さん担当
 - 早見表・収集日クローラー(issue #4) — Teamb2担当
 

@@ -72,6 +72,11 @@ class RoutedAnswer:
     """STAGE04 4-2: この品目は将来出し方が変わる。旧・新・切替日を時系列で
     案内させ、どちらか一方だけで断定させない。"""
 
+    item_match: str = "none"
+    """品名検索がどの段でヒットしたか: "exact" / "partial" / "similar" / "none"。
+    "similar"(ベクトル類似のみ)のとき、要件4-3 として「早見表に個別記載が
+    ないので類似品目に準じた案内である」旨を明示させる。"""
+
     missing: list[str] = field(default_factory=list)
     """回答に不足している入力項目(例: ["町名"])。
 
