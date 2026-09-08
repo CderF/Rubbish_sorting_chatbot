@@ -19,10 +19,33 @@ from __future__ import annotations
 import json
 import pathlib
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 import app.rag.router as router
+
+# _override_analogy_hits が DB を引く分。B1 の waste_items に実在する行
+# (`chk.py` で確認済み)。テストは DB 無しなのでここで肩代わりする。
+_OVERRIDE_DB = {
+    "アダプター(電源用)": "小型電子機器",
+    "ビデオカメラ": "小型電子機器",
+    "緩衝材(プラ製)": "プラスチック",
+    "電動工具": "粗大ごみ",
+    "フライパン": "小物金属",
+    "電動歯ブラシ": "小型電子機器",
+    "電子ゲーム機(携帯ゲーム機)": "小型電子機器",
+}
+
+
+def _fake_lookup_exact(name):
+    disp = _OVERRIDE_DB.get(router._norm(name))
+    if disp is None:
+        return None
+    return SimpleNamespace(
+        item_name=name, disposal_method=disp, notes="",
+        source_url="https://www.city.kitakyushu.lg.jp/contents/x.html", distance=None,
+    )
 
 _FIX = json.loads(
     (pathlib.Path(__file__).parent / "fixtures" / "stage4_grader_replay.json").read_text(
@@ -54,6 +77,8 @@ def _route(prompt: str, hit_names: list[str]):
     detected = resolved or (cands[0] if cands else None)
     pick = canned = None
     if match == "analogy":
+        with patch.object(router, "lookup_item_exact", _fake_lookup_exact):
+            hits = router._override_analogy_hits(detected, hits)
         pick = router._analogy_pick(hits, detected)
         canned = pick is None  # 新方針: 使える候補が1つも無いときだけ canned
     return {
@@ -117,6 +142,8 @@ _EXPECTED_PICK = {
     "電動鼻毛カッターはどう捨てればいいですか？": "電動歯ブラシ",
     "ハンドミキサーはどう捨てればいいですか？": "ミキサー",
     "目覚まし時計はどう捨てればいいですか？": "時計",
+    "家庭用の電動ミニシュレッダーはどう捨てればいいですか？": "シュレッダー(家庭用)",
+    "ワイヤレス充電器（パッド型）はどう捨てればいいですか？": "アダプター(電源用)",
 }
 
 

@@ -631,9 +631,14 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
                 if named.item_name not in item_candidates:
                     item_candidates = [named.item_name, *item_candidates]
 
-        # 4-3: 類似候補があれば必ず1件に絞って区分を導く(canned 断りは
-        # 「類似品があるのに確認だけ促すのは減点」という採点フィードバックで
-        # 否定された)。`analogy_unreliable` は使える候補が1つも無いときだけ。
+        # 4-3: ベクトル1位が紛らわしい品目は、人手で確度を固定した早見表行に
+        # 差し替える(_ANALOGY_PREFERRED)。
+        if ans.item_match == "analogy":
+            ans.item_hits = _override_analogy_hits(ans.detected_item, ans.item_hits)
+
+        # 類似候補があれば必ず1件に絞って区分を導く(canned 断りは「類似品が
+        # あるのに確認だけ促すのは減点」という採点フィードバックで否定された)。
+        # `analogy_unreliable` は使える候補が1つも無いときだけ。
         if ans.item_match == "analogy" and ans.item_match_stage == "vector":
             ans.analogy_unreliable = _analogy_pick(ans.item_hits, ans.detected_item) is None
 
@@ -698,10 +703,19 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         ans.missing.append("区名と町名")
 
     ans.found = bool(ans.item_hits or ans.schedule_hits)
-    ans.sources = _dedupe(
-        [r.source_url for r in ans.item_hits]
-        + [r.source_url for r in ans.schedule_hits]
-    )
+    if ans.item_match == "analogy" and ans.item_hits:
+        # 4-3 の参照は「回答で採用する1件」だけに絞る(top-3 の無関係な URL を
+        # 付けると『根拠が明確』の印象が薄れる)。
+        _pk = _analogy_pick(ans.item_hits, ans.detected_item)
+        ans.sources = _dedupe(
+            ([_pk.source_url] if _pk is not None else [])
+            + [r.source_url for r in ans.schedule_hits]
+        )
+    else:
+        ans.sources = _dedupe(
+            [r.source_url for r in ans.item_hits]
+            + [r.source_url for r in ans.schedule_hits]
+        )
     ans.context = _build_context(ans)
     if item_candidates:
         timeline_candidates = list(item_candidates)
@@ -787,17 +801,28 @@ _ANALOGY_PREFERRED = {
     "ミルクパン": "フライパン",
     "鼻毛カッター": "電動歯ブラシ",
     "コントローラー": "電子ゲーム機(携帯ゲーム機)",
+    "ワイヤレス充電器": "アダプター(電源用)",
 }
 
 
-def _preferred_analogy_name(query: str, hits: list[ItemRecord]) -> "str | None":
-    """`_ANALOGY_PREFERRED` のうち query に含まれるキーがあり、その対象名が
-    hits に実在すれば、その名前を返す。"""
+def _override_analogy_hits(query: str, hits: list[ItemRecord]) -> list[ItemRecord]:
+    """`_ANALOGY_PREFERRED` に該当する品目なら、その早見表行1件だけを hits と
+    して返す(ベクトル1位が紛らわしい品目の確度を人手で固定する)。対象が
+    ベクトルヒットに無ければ DB から直接引く。該当しなければ hits のまま。"""
+    if not query:
+        return hits
     q = _norm(query)
-    for key, target in sorted(_ANALOGY_PREFERRED.items(), key=lambda kv: len(kv[0]), reverse=True):
-        if key in q and any(_norm(getattr(h, "item_name", "")) == _norm(target) for h in hits):
-            return target
-    return None
+    for key, target in sorted(
+        _ANALOGY_PREFERRED.items(), key=lambda kv: len(kv[0]), reverse=True
+    ):
+        if key not in q:
+            continue
+        for h in hits:
+            if _norm(getattr(h, "item_name", "")) == _norm(target):
+                return [h]
+        rec = lookup_item_exact(target)
+        return [rec] if rec is not None else hits
+    return hits
 
 
 def _analogy_pick(
@@ -829,12 +854,6 @@ def _analogy_pick(
     pool = non_notice or list(hits)
 
     if query:
-        preferred = _preferred_analogy_name(query, pool)
-        if preferred:
-            for h in pool:
-                if _norm(getattr(h, "item_name", "")) == _norm(preferred):
-                    return h
-
         def score(h: ItemRecord) -> tuple[int, int]:
             n = getattr(h, "item_name", "")
             # (関連強度, 名前長) — 強い上位語を優先、同点なら具体的な方。
@@ -916,11 +935,18 @@ def _relation_strength(query: str, cand: str) -> int:
         # 「上位カテゴリ」ではなく別品目を指す内容語(「電動鼻毛カッター」の
         # 「鼻毛」、「電動歯間洗浄器」の「歯間」)。分別の根拠には弱い。
         prefix = q[: -len(c)]
-        for mod in sorted(_STRENGTH_PREFIX_MODS, key=len, reverse=True):
-            if prefix.startswith(mod):
-                prefix = prefix[len(mod) :]
-                break
-        prefix = prefix.strip("のなというごと 　")
+        # 修飾語+接続助詞を先頭から**全部**剥がす(「家庭用の電動ミニ
+        # シュレッダー」→ 家庭用 → の → 電動 → ミニ → 空)。
+        changed = True
+        while changed and prefix:
+            changed = False
+            stripped = prefix.lstrip("のなというごと・、 　")
+            if stripped != prefix:
+                prefix, changed = stripped, True
+            for mod in sorted(_STRENGTH_PREFIX_MODS, key=len, reverse=True):
+                if prefix.startswith(mod):
+                    prefix, changed = prefix[len(mod) :], True
+                    break
         if len(_KANJI_RE.findall(prefix)) >= 2:
             return 1
         return 2
