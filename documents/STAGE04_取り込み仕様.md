@@ -210,11 +210,56 @@ python -m pytest tests/stage04_ingest_test.py -v
 
 テストはすべてインメモリSQLite上で完結し、GPU・L4サーバー・ネットワークを必要としない。
 
+## 8-2. 応用層(`app/rag/*`)への接続点
+
+PR #6〜#10 がマージされ、`app/rag/router.py`(藤井さん)・`app/rag/knowledge.py`
+(WebUI 2-3)が main にある。STAGE04 側はそこに次の形で噛み合う。
+
+### router 向けの読み取り API — `app/stage04/lookup.py`
+
+`app/data/lookup.py` と同じ作法(接続引数なし・スレッドローカル接続・`query_only`・
+未検出でも例外なし)。違いは **`is_current = 1` で絞らない**こと(4-2 は旧ルールも要る)。
+
+```python
+from datetime import date
+from app.stage04 import lookup
+
+tl = lookup.item_timeline(item_name)              # ItemTimeline（found=False なら 4-3 へ）
+tl = lookup.pending_change(item_name, date.today())  # 切替が今日以降にあるときだけ ItemTimeline、なければ None
+```
+
+### `router.py` への1ブロック追加(藤井さん・本田さん向け、未適用)
+
+`_blocking_route` の `ans.item_hits` を埋めた直後に:
+
+```python
+from app.stage04.lookup import pending_change
+
+tl = pending_change(item_name, date.today())
+if tl is not None:
+    now_seg = tl.segment_on(date.today())
+    later = [s for s in tl.segments if s.valid_from and s.valid_from > date.today()]
+    ans.context += (
+        "\n\n## この品目は出し方が変わります（断定せず両方を案内する）\n"
+        f"- 現在（〜{now_seg.valid_until}）: {now_seg.disposal_method}\n"
+        + "".join(f"- {s.valid_from} から: {s.disposal_method}\n" for s in later)
+    )
+    ans.sources = _dedupe(ans.sources + [s.source_url for s in tl.segments])
+```
+
+system prompt 側に「適用期間が複数あるときは時系列で説明し、片方だけで断定しない」
+の一文を足す(`build_system_prompt` の `_RULES_WITH_CONTEXT`)。回答文言の詰めは本田さん。
+
+### WebUI ナレッジ一覧 — 対応済み
+
+`app/rag/knowledge.py` を更新し、取り込んだお知らせを **ファイル単位**で一覧に出す
+(`knowledge_sources` を参照)。早見表に混ざった `knowledge://` 出典行は
+クロールページ側の集計から除外して二重表示を防いでいる。
+
 ## 9. まだやっていないこと(担当境界)
 
-- **`app/server.py` は変更していない。`/chat` はまだこのデータを見ない。**
-  取り込んだ内容が回答に現れるのは、router(`app/rag/`、藤井さん)が `lookup_item_versions` を呼び、
-  本田さんの時系列判定ロジックが文面を組み立ててからになる。これは分担上の境界であり、実装漏れではない。
+- **`app/rag/router.py` への1ブロック追加(§8-2)は未適用。** これを入れると 4-2 が `/chat` に反映される。
+  `app/stage04/lookup.py` まで用意済みなので、藤井さん側は import 1行 + 1ブロックで済む。回答文言は本田さん。
 - 4-3(早見表に無い品目の類似品物フォールバック) — 本田さん担当
 - 早見表・収集日クローラー(issue #4) — Teamb2担当
 
