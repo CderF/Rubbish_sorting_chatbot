@@ -667,27 +667,56 @@ def _dedupe(urls: list[str]) -> list[str]:
     return out
 
 
+def _analogy_pick(hits: list[ItemRecord]) -> "ItemRecord | None":
+    """4-3: 類似候補を「コード側で」1件に確定する。
+
+    複数候補を LLM に渡すと小型モデルが各候補の出し方を混ぜて答えてしまう
+    (STAGE04採点フィードバックの実例: VRヘッドセット→ヘッドホンとVRゴーグルの
+    両方の出し方を併記)。プロンプトで「1件選べ」と指示しても守られないため、
+    渡す前に1件へ絞る。
+
+    選定規則:
+    - ベクトル距離の最上位(`vector_search_items` は距離昇順)を基本とする。
+    - ただし 4-1 の追加告知(`knowledge://お知らせ-4-1…`)は disposal_method が
+      区分ではなくイベント回収の案内(「◯◯祭で無料回収」)であり、
+      「類似品から区分を類推する」4-3 の根拠には使えない。実際の早見表行
+      (非 `knowledge://`)があればそちらを優先し、無ければ最上位に戻す。
+    """
+    if not hits:
+        return None
+    # お知らせ由来行の source_url は knowledge://<file>#<anchor>(store.py)。
+    for h in hits:
+        if not getattr(h, "source_url", "").startswith("knowledge://"):
+            return h
+    return hits[0]
+
+
 def _build_context(ans: RoutedAnswer) -> str:
     """検索結果をLLMに渡す平文に整形する。"""
     blocks: list[str] = []
 
     if ans.item_hits:
         if ans.item_match == "analogy":
+            # 類推は必ず1件に絞ってから渡す(_analogy_pick 参照)。item_hits
+            # 自体は WebUI の根拠表示用に全件残す。
             q = ans.detected_item or "この品名"
-            header = (
-                f"## 早見表に「{q}」の個別記載なし ― 類似候補"
-                "(回答では最も妥当な1件だけを選ぶ)"
-            )
+            pick = _analogy_pick(ans.item_hits)
+            header = f"## 早見表に「{q}」の個別記載なし ― 類似する品目1件のみ"
+            lines = [header]
+            if pick is not None:
+                lines.append(f"- 類似品目: {pick.item_name}")
+                lines.append(f"  出し方: {pick.disposal_method}")
+                if pick.notes:
+                    lines.append(f"  備考: {pick.notes}")
+            blocks.append("\n".join(lines))
         else:
-            header = "## 分別早見表の検索結果"
-        lines = [header]
-        for rank, r in enumerate(ans.item_hits, 1):
-            prefix = f"類似候補{rank}" if ans.item_match == "analogy" else "品名"
-            lines.append(f"- {prefix}: {r.item_name}")
-            lines.append(f"  出し方: {r.disposal_method}")
-            if r.notes:
-                lines.append(f"  備考: {r.notes}")
-        blocks.append("\n".join(lines))
+            lines = ["## 分別早見表の検索結果"]
+            for r in ans.item_hits:
+                lines.append(f"- 品名: {r.item_name}")
+                lines.append(f"  出し方: {r.disposal_method}")
+                if r.notes:
+                    lines.append(f"  備考: {r.notes}")
+            blocks.append("\n".join(lines))
 
     if ans.schedule_hits:
         lines = ["## 収集日の検索結果"]
@@ -820,13 +849,12 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
     if ans.found and ans.item_match != "analogy":
         parts.append(_RULES_WITH_CONTEXT)
     elif ans.found:
+        # 類似候補はコード側(_analogy_pick)で既に1件へ絞ってある。ここでは
+        # 「その1件だけを根拠にし、勝手に足さない」ことだけを課す。
         parts.append(
-            "- 下記『検索結果』の類似候補を比較し、質問品と用途・機能・動力・"
-            "材質が最も近いものを必ず1件だけ選ぶ。候補を複数列挙したり、複数の"
-            "出し方を混ぜたりしてはならない。\n"
-            "- 採用した1件の『出し方』と『備考』だけを根拠として使い、その表記を"
-            "変えずに案内する。採用しなかった候補の情報や、検索結果にない条件を"
-            "追加してはならない。妥当な候補を選べない場合は区分を断定しない。\n"
+            "- 『検索結果』には類似する品目が1件だけ載っている。その1件の"
+            "『出し方』と『備考』だけを根拠に案内し、表記を変えない。"
+            "検索結果にない区分・条件・品目を新たに付け加えてはならない。\n"
         )
     else:
         parts.append(_RULES_NO_CONTEXT)
@@ -841,11 +869,10 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
 
     if ans.item_match == "analogy":
         parts.append(
-            "- 類似候補は質問された品名そのものではない。上で選んだ1件の実際の"
+            "- 『検索結果』の類似品目は質問された品名そのものではない。その実際の"
             "品目名を挙げて「類似する『(その品目名)』に準じると〜」の形で案内し、"
-            "その候補だけを根拠にする。別候補の区分・条件を併記せず、断定しない。"
-            "個別の記載がないため、正確な分別は北九州市の公式ページや窓口で"
-            "確認するよう必ず添える。収集日など他の欄の情報はこの限りではない。\n"
+            "断定しない。個別の記載がないため、正確な分別は北九州市の公式ページや"
+            "窓口で確認するよう必ず添える。収集日など他の欄の情報はこの限りではない。\n"
         )
 
     if ans.missing:
