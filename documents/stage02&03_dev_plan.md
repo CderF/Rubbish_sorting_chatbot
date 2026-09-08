@@ -93,8 +93,11 @@ def vector_search_explanations(query: str, top_k: int = 3) -> list[ChunkRecord]:
     """説明・注意事項ページ(ごみステーション等)に対するベクトル検索。"""
 
 # app/rag/image_classify.py
-def classify_image_to_item_name(image_base64: str) -> str | None:
-    """VLMに画像を渡し、品目名相当の文字列を抽出する。特定できない場合は None。"""
+def classify_image_to_item_name(image_base64: str, engine, processor) -> str | None:
+    """VLMに画像を渡し、品目名相当の文字列を抽出する。特定できない場合は None。
+    engine/processor は app/server.py が起動時に初期化する共有vLLMエンジンを
+    そのまま受け取る(L4 1枚のVRAMで2つ目のモデルをロードしないため。詳細は
+    GitHub issue #7 のImplementation Decisions参照)。"""
 
 # app/rag/router.py
 def handle_query(prompt: str, img_b64: str | None) -> RoutedAnswer:
