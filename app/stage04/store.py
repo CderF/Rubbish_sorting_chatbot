@@ -124,23 +124,61 @@ def insert_waste_item(conn: sqlite3.Connection, item: WasteItem) -> int:
     return int(cur.lastrowid)
 
 
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+@dataclass(frozen=True)
+class PredecessorMatch:
+    """`find_current_predecessor` の結果。
+
+    * `item` あり + `exact` — 完全一致
+    * `item` あり + not `exact` — 部分一致(LIKE)が1件だけ。早見表が複合名で持つ
+      ケース(お知らせ「乾電池」→ 早見表「乾電池(充電式でないもの)」)。回答側は
+      `TimelineSegment.matched_item_name` で限定を付けられる
+    * `item` なし + `candidates` — 部分一致が複数。自動リンクせず人手判断
+    * すべて空 — 前身なし(語順違い等。`relink(use_vector=True)` でベクトル候補を出せる)
+    """
+
+    item: "WasteItem | None" = None
+    exact: bool = False
+    candidates: "tuple[str, ...]" = ()
+
+
 def find_current_predecessor(
     conn: sqlite3.Connection, item_name: str, exclude_id: "int | None" = None
-) -> "WasteItem | None":
-    """The 早見表 row a change notice supersedes: same name, still current, and
-    NOT itself a distributed-file row (so notices don't supersede each other)."""
-    rows = conn.execute(
-        """
-        SELECT * FROM waste_items
-        WHERE item_name = ? AND is_current = 1 AND source_url NOT LIKE ?
-        ORDER BY id DESC
-        """,
-        (normalize_item_name(item_name), KNOWLEDGE_SCHEME + "%"),
+) -> PredecessorMatch:
+    """The 早見表 row a change notice supersedes: still current, and NOT itself a
+    distributed-file row (so notices don't supersede each other).
+
+    完全一致 → 部分一致(NFKC 正規化 + LIKE、`app/data/lookup.py` の
+    `lookup_item_partial` と同じ方式。呼び出し側の接続で実行するだけ)。
+    部分一致が複数なら曖昧としてリンクしない(お知らせ「乾電池」が早見表の
+    充電式/非充電式のどちらを指すか通知文だけでは決まらない、等)。
+    語順が違うケース(使い捨てライター→ライター)は LIKE では拾えない ―― これは
+    ベクトル検索の担当(`relink(use_vector=True)`)。
+    """
+    norm = normalize_item_name(item_name)
+
+    exact = conn.execute(
+        "SELECT * FROM waste_items WHERE item_name = ? AND is_current = 1 "
+        "AND source_url NOT LIKE ? AND id IS NOT ?",
+        (norm, KNOWLEDGE_SCHEME + "%", exclude_id),
+    ).fetchone()
+    if exact:
+        return PredecessorMatch(item=_row_to_item(exact), exact=True)
+
+    partial = conn.execute(
+        "SELECT * FROM waste_items "
+        "WHERE item_name LIKE ? ESCAPE '\\' AND is_current = 1 "
+        "AND source_url NOT LIKE ? AND id IS NOT ? ORDER BY id",
+        (f"%{_like_escape(norm)}%", KNOWLEDGE_SCHEME + "%", exclude_id),
     ).fetchall()
-    for row in rows:
-        if exclude_id is None or row["id"] != exclude_id:
-            return _row_to_item(row)
-    return None
+    if len(partial) == 1:
+        return PredecessorMatch(item=_row_to_item(partial[0]), exact=False)
+    if len(partial) > 1:
+        return PredecessorMatch(candidates=tuple(r["item_name"] for r in partial))
+    return PredecessorMatch()
 
 
 def mark_superseded(conn: sqlite3.Connection, old_id: int, new_id: int) -> None:
@@ -162,22 +200,54 @@ def has_predecessor(conn: sqlite3.Connection, new_id: int) -> bool:
     return row is not None
 
 
+def _history_sort_key(row: "sqlite3.Row | dict") -> tuple:
+    # NULL effective_from (the 早見表 baseline) first, then by date, then id.
+    ef = row["effective_from"]
+    return (ef is not None, ef or "", row["id"])
+
+
 def lookup_item_history(conn: sqlite3.Connection, item_name: str) -> "list[WasteItem]":
     """Every known version of one item, oldest first — the requirement 4-2 read
     path. No `WHERE is_current = 1`, unlike `app/data/lookup.py`: the caller gets
     the whole chain and decides what applies on a given date (see
-    `version_window`). Rows with no `effective_from` (the 早見表 crawl baseline)
-    sort first, then by date ascending.
+    `version_window`).
+
+    The chain is followed through `superseded_by`, not just `item_name`: a
+    change notice may be linked to a 早見表 row stored under a more specific name
+    (お知らせ「乾電池」→ 早見表「乾電池(充電式でないもの)」), so name-only matching
+    would miss the predecessor. Starting from every row whose name matches, the
+    connected component in the supersede graph is collected.
     """
-    rows = conn.execute(
-        """
-        SELECT * FROM waste_items
-        WHERE item_name = ?
-        ORDER BY (effective_from IS NULL) DESC, effective_from ASC, id ASC
-        """,
+    seed = conn.execute(
+        "SELECT * FROM waste_items WHERE item_name = ?",
         (normalize_item_name(item_name),),
     ).fetchall()
-    return [_row_to_item(r) for r in rows]
+    if not seed:
+        return []
+
+    by_id: "dict[int, dict]" = {}
+    frontier = [dict(r) for r in seed]
+    while frontier:
+        row = frontier.pop()
+        if row["id"] in by_id:
+            continue
+        by_id[row["id"]] = row
+        # newer: the row this one was superseded by
+        nxt_id = row["superseded_by"]
+        if nxt_id and nxt_id not in by_id:
+            nxt = conn.execute(
+                "SELECT * FROM waste_items WHERE id = ?", (nxt_id,)
+            ).fetchone()
+            if nxt:
+                frontier.append(dict(nxt))
+        # older: rows that were superseded by this one
+        for prev in conn.execute(
+            "SELECT * FROM waste_items WHERE superseded_by = ?", (row["id"],)
+        ).fetchall():
+            if prev["id"] not in by_id:
+                frontier.append(dict(prev))
+
+    return [_row_to_item(r) for r in sorted(by_id.values(), key=_history_sort_key)]
 
 
 def version_window(
@@ -292,6 +362,9 @@ class TimelineSegment:
     # the crawled row's differing value.
     disputed: bool = False
     hayamihyo_disposal_method: "str | None" = None
+    # set when this segment's 早見表 row is stored under a more specific name
+    # than the query (e.g. queried 乾電池 → row 乾電池(充電式でないもの)).
+    matched_item_name: "str | None" = None
 
 
 @dataclass(frozen=True)
@@ -374,10 +447,14 @@ def item_timeline(conn: sqlite3.Connection, item_name: str) -> ItemTimeline:
                 )
             )
 
+    queried = normalize_item_name(item_name)
     for i, v in enumerate(versions):
         vf, vu = version_window(versions, i)
         from_notice = v.source_url.startswith(KNOWLEDGE_SCHEME)
         method, disputed, hayamihyo_method = v.disposal_method, False, None
+        matched_name = (
+            v.item_name if not from_notice and v.item_name != queried else None
+        )
         successor = versions[i + 1] if i + 1 < len(versions) else None
         if not from_notice and successor is not None:
             ks = (
@@ -400,6 +477,7 @@ def item_timeline(conn: sqlite3.Connection, item_name: str) -> ItemTimeline:
                 from_notice=from_notice,
                 disputed=disputed,
                 hayamihyo_disposal_method=hayamihyo_method,
+                matched_item_name=matched_name,
             )
         )
 

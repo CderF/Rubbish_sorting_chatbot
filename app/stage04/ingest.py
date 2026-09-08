@@ -42,6 +42,16 @@ from app.data.schema import WasteItem
 from app.stage04 import store
 from app.stage04.notice_parser import Notice, parse_notice_file
 
+# 語順違い(使い捨てライター→ライター)は LIKE では拾えないので、任意でベクトル
+# 検索(issue #7)を使う。未インストール/インデックス未構築でも動くようフォール
+# バック。vector_search_items は現状スコアを返さないため、ヒットしても自動リンク
+# せず人手レビュー行き(RelinkResult.vector_candidates)にとどめる。
+try:
+    from app.rag.vector_store import vector_search_items  # type: ignore[import-not-found]
+except ImportError:
+    def vector_search_items(query: str, top_k: int = 3):  # noqa: ARG001
+        return []
+
 SOURCE_TYPE = "notice"
 
 
@@ -55,6 +65,11 @@ class IngestResult:
     unlinked: "list[str]" = field(default_factory=list)
     skipped: "list[str]" = field(default_factory=list)
     disputed: "list[tuple[str, str, str]]" = field(default_factory=list)
+    # linked via a base-name match, not an identical name (お知らせ「乾電池」→
+    # 早見表「乾電池(充電式でないもの)」). (notice_name, hayamihyo_name).
+    partial_links: "list[tuple[str, str]]" = field(default_factory=list)
+    # base-name matched several 早見表 rows — NOT linked, needs a human.
+    ambiguous: "list[tuple[str, tuple[str, ...]]]" = field(default_factory=list)
     warnings: "list[str]" = field(default_factory=list)
 
     @property
@@ -73,6 +88,15 @@ class IngestResult:
                 "（クローラー実行後に `--relink` でリンクされます）: "
                 + "、".join(self.unlinked)
             )
+        for notice_name, hayamihyo_name in self.partial_links:
+            lines.append(
+                f"  部分一致リンク: お知らせ「{notice_name}」→ 早見表「{hayamihyo_name}」"
+            )
+        for name, cands in self.ambiguous:
+            lines.append(
+                f"  曖昧: お知らせ「{name}」が早見表の複数行に該当（{'、'.join(cands)}）。"
+                "自動リンクせず。人手で確認"
+            )
         for name, notice_says, crawl_says in self.disputed:
             lines.append(
                 f"  不一致: {name} — お知らせは現行「{notice_says}」だが"
@@ -87,6 +111,11 @@ class IngestResult:
 class RelinkResult:
     linked: "list[tuple[str, int, int]]" = field(default_factory=list)
     still_unlinked: "list[str]" = field(default_factory=list)
+    partial_links: "list[tuple[str, str]]" = field(default_factory=list)
+    ambiguous: "list[tuple[str, tuple[str, ...]]]" = field(default_factory=list)
+    # vector search found candidates for a name LIKE can't reach; NOT linked
+    # (no similarity score yet) — for human review. (notice_name, candidate names).
+    vector_candidates: "list[tuple[str, tuple[str, ...]]]" = field(default_factory=list)
     # linked, but the crawled 早見表 row's disposal_method does not corroborate
     # the notice's stated 現行 treatment — surfaced, not blocked.
     disputed: "list[tuple[str, str, str]]" = field(default_factory=list)
@@ -94,10 +123,22 @@ class RelinkResult:
     def summary(self) -> str:
         line = (
             f"relink: {len(self.linked)}件をリンクしました "
-            f"(未リンクのまま {len(self.still_unlinked)}件 / 現行表記の不一致 {len(self.disputed)}件)"
+            f"(未リンクのまま {len(self.still_unlinked)}件 / 部分一致 {len(self.partial_links)}件 / "
+            f"曖昧 {len(self.ambiguous)}件 / 現行表記の不一致 {len(self.disputed)}件)"
         )
         if self.still_unlinked:
             line += "\n  早見表に該当なし: " + "、".join(self.still_unlinked)
+        for notice_name, hayamihyo_name in self.partial_links:
+            line += f"\n  部分一致: お知らせ「{notice_name}」→ 早見表「{hayamihyo_name}」"
+        for name, cands in self.ambiguous:
+            line += (
+                f"\n  曖昧: お知らせ「{name}」→ 複数該当（{'、'.join(cands)}）。人手で確認"
+            )
+        for name, cands in self.vector_candidates:
+            line += (
+                f"\n  ベクトル候補: お知らせ「{name}」→ {'、'.join(cands)}"
+                "（スコア未対応のため自動リンクせず。人手で確認）"
+            )
         for name, notice_says, crawl_says in self.disputed:
             line += (
                 f"\n  不一致: {name} — お知らせは現行「{notice_says}」だが"
@@ -146,6 +187,34 @@ def notice_to_waste_item(notice: Notice, ingested_at: datetime) -> WasteItem:
     )
 
 
+def _record_link(
+    result: "IngestResult | RelinkResult",
+    notice_name: str,
+    prior_disposal_method: "str | None",
+    match: "store.PredecessorMatch",
+    new_id: int,
+    conn: sqlite3.Connection,
+) -> None:
+    """Apply one predecessor match: link it, or record why it wasn't linked."""
+    if match.item is not None and match.item.id is not None:
+        store.mark_superseded(conn, match.item.id, new_id)
+        result.linked.append((notice_name, match.item.id, new_id))
+        if not match.exact:
+            result.partial_links.append((notice_name, match.item.item_name))
+        if prior_disposal_method and (
+            prior_disposal_method not in (match.item.disposal_method or "")
+        ):
+            result.disputed.append(
+                (notice_name, prior_disposal_method, match.item.disposal_method)
+            )
+    elif match.candidates:
+        result.ambiguous.append((notice_name, match.candidates))
+    elif isinstance(result, IngestResult):
+        result.unlinked.append(notice_name)
+    else:
+        result.still_unlinked.append(notice_name)
+
+
 def ingest_notices(
     notices: "list[Notice]",
     conn: sqlite3.Connection,
@@ -165,31 +234,19 @@ def ingest_notices(
 
         # Find the predecessor *before* inserting, else the new row matches its
         # own is_current = 1 lookup.
-        predecessor = (
+        match = (
             store.find_current_predecessor(conn, notice.item_name)
             if notice.is_change_notice
-            else None
+            else store.PredecessorMatch()
         )
 
         new_id = store.insert_waste_item(conn, notice_to_waste_item(notice, ingested_at))
         result.inserted.append(notice.item_name)
 
         if notice.is_change_notice:
-            if predecessor is not None and predecessor.id is not None:
-                store.mark_superseded(conn, predecessor.id, new_id)
-                result.linked.append((notice.item_name, predecessor.id, new_id))
-                if notice.prior_disposal_method and (
-                    notice.prior_disposal_method not in (predecessor.disposal_method or "")
-                ):
-                    result.disputed.append(
-                        (
-                            notice.item_name,
-                            notice.prior_disposal_method,
-                            predecessor.disposal_method,
-                        )
-                    )
-            else:
-                result.unlinked.append(notice.item_name)
+            _record_link(
+                result, notice.item_name, notice.prior_disposal_method, match, new_id, conn
+            )
 
         store.record_knowledge_source(
             conn,
@@ -220,30 +277,35 @@ def ingest_notice_file(
     )
 
 
-def relink(conn: sqlite3.Connection) -> RelinkResult:
+def relink(conn: sqlite3.Connection, *, use_vector: bool = False) -> RelinkResult:
     """Link change-notices that had no predecessor at ingest time to the 早見表
     row that now exists (e.g. after `app/data/crawler.py` populated it).
 
     Safe to run repeatedly: rows that are already linked are skipped by
-    `store.unlinked_change_sources`.
+    `store.unlinked_change_sources`. With `use_vector=True`, names that exact +
+    LIKE can't reach (語順違い: 使い捨てライター→ライター) are looked up with
+    `vector_search_items`; the hits are reported in `vector_candidates` for a
+    human — never auto-linked, since there is no similarity score to threshold on.
     """
     result = RelinkResult()
     for row in store.unlinked_change_sources(conn):
-        new_id = row["produced_item_id"]
-        predecessor = store.find_current_predecessor(
-            conn, row["item_name"], exclude_id=new_id
-        )
-        if predecessor is None or predecessor.id is None:
-            result.still_unlinked.append(row["item_name"])
-            continue
-        store.mark_superseded(conn, predecessor.id, new_id)
-        result.linked.append((row["item_name"], predecessor.id, new_id))
+        name, new_id = row["item_name"], row["produced_item_id"]
+        match = store.find_current_predecessor(conn, name, exclude_id=new_id)
 
-        notice_says = row["prior_disposal_method"]
-        if notice_says and notice_says not in (predecessor.disposal_method or ""):
-            result.disputed.append(
-                (row["item_name"], notice_says, predecessor.disposal_method)
-            )
+        if match.item is None and not match.candidates and use_vector:
+            hits = [
+                h.item_name
+                for h in vector_search_items(name, top_k=3)
+                if not h.source_url.startswith(store.KNOWLEDGE_SCHEME)
+            ]
+            if hits:
+                result.vector_candidates.append((name, tuple(hits)))
+                result.still_unlinked.append(name)
+                continue
+
+        _record_link(
+            result, name, row["prior_disposal_method"], match, new_id, conn
+        )
     conn.commit()
     return result
 
@@ -257,6 +319,12 @@ def main(argv: "list[str] | None" = None) -> int:
         "--relink",
         action="store_true",
         help="取り込み済みの変更通知を、いま存在する早見表レコードにリンクし直す",
+    )
+    parser.add_argument(
+        "--vector",
+        action="store_true",
+        help="--relink 時、LIKE で拾えない品名をベクトル検索で候補出しする"
+        "（自動リンクはしない）",
     )
     parser.add_argument(
         "--db",
@@ -278,7 +346,7 @@ def main(argv: "list[str] | None" = None) -> int:
                 return 1
             print(ingest_notice_file(path, conn).summary())
         if args.relink:
-            print(relink(conn).summary())
+            print(relink(conn, use_vector=args.vector).summary())
     finally:
         conn.close()
     return 0
