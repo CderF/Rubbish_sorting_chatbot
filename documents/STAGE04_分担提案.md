@@ -3,7 +3,7 @@
 Team B / Teamb4 (周 楚涵)
 作成日: 2026-09-08
 
-関連: [[proposal.md]](STAGE 02 設計) / [[CONTEXT.md]](ドメイン用語集)
+関連: [[stage02&03_proposal.md]](STAGE 02/03 設計) / [[CONTEXT.md]](ドメイン用語集)
 
 ---
 
