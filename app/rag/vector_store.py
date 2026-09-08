@@ -311,6 +311,26 @@ def build_explanation_index(client: chromadb.ClientAPI | None = None) -> int:
 # --------------------------------------------------------------------------
 # 検索(router.py が呼ぶ公開関数)
 # --------------------------------------------------------------------------
+# Chroma の hnsw:space="cosine" では距離 = 1 - コサイン類似度(範囲 [0, 2]、
+# 0 が完全一致)。これより遠いヒットは「関連なし」として返さない。無関係な
+# 品名クエリでも top_k 件が必ず返り found=True になってしまう問題(PR #14
+# レビュー #1)への対策。実データでの調整が必要な暫定値。
+_ITEM_MATCH_MAX_DISTANCE = 0.55
+
+
+def _filter_by_distance(
+    metadatas: list, distances: list, max_distance: float
+) -> list:
+    """距離しきい値で足切りする。距離が取れないときは従来どおり素通し。"""
+    if not distances or len(distances) != len(metadatas):
+        return metadatas
+    return [
+        m
+        for m, d in zip(metadatas, distances)
+        if d is not None and d <= max_distance
+    ]
+
+
 def _search_items_impl(
     query: str, top_k: int, client: chromadb.ClientAPI | None
 ) -> list[ItemRecord]:
@@ -326,6 +346,8 @@ def _search_items_impl(
         query_embeddings=[_embed_query(query)], n_results=min(top_k, collection.count())
     )
     metadatas = (result.get("metadatas") or [[]])[0]
+    distances = (result.get("distances") or [[]])[0]
+    metadatas = _filter_by_distance(metadatas, distances, _ITEM_MATCH_MAX_DISTANCE)
     return [
         _VectorItemMatch(
             item_name=m["item_name"],
