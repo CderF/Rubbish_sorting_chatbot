@@ -317,3 +317,39 @@ def test_blocking_route_keeps_related_vector_analogy(monkeypatch):
     assert ans.item_match == "analogy"
     assert ans.analogy_unreliable is False
     assert "準じると" in build_system_prompt(ans)
+
+
+# --- 4-3 unreliable analogy → canned response (skip the LLM) ------------
+# プロンプトで断定を禁じても小型モデルは context 無しだと自前知識で推測を
+# 書き足す(採点フィードバック実例)。canned_response を立てて server 側で
+# 生成そのものをスキップさせる。
+def test_blocking_route_sets_canned_response_for_unreliable_analogy(monkeypatch):
+    monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
+    monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [_rec("かご")])
+    monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
+
+    ans = router._blocking_route("セグウェイはどう捨てますか")
+    assert ans.analogy_unreliable is True
+    assert ans.canned_response is not None
+    assert "断定できません" in ans.canned_response
+    assert "北九州市" in ans.canned_response
+    # 退けた候補の区分は固定文に混ぜない
+    assert "粗大ごみ" not in ans.canned_response
+
+
+def test_blocking_route_no_canned_for_reliable_analogy(monkeypatch):
+    monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
+    monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    monkeypatch.setattr(
+        router, "vector_search_items", lambda q, top_k=3: [_rec("スケートボード")]
+    )
+    monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
+
+    ans = router._blocking_route("電動スケートボードはどう捨てますか")
+    assert ans.analogy_unreliable is False
+    assert ans.canned_response is None
+
+
+def test_default_routed_answer_has_no_canned_response():
+    assert RoutedAnswer().canned_response is None
