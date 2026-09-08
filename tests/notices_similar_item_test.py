@@ -514,3 +514,33 @@ def test_analogy_pick_no_query_keeps_first_non_notice():
 
     hits = [_rec_src("VRゴーグル", "knowledge://x"), _rec("ヘッドホン")]
     assert _analogy_pick(hits).item_name == "ヘッドホン"
+
+
+# --- 末尾一致でも内容語プレフィクスがあれば弱い関連(Codex追加要望) ------
+def test_relation_strength_downgrades_content_prefix():
+    from app.rag.router import _relation_strength as S
+
+    # 2文字カテゴリ語は末尾一致で強い
+    assert S("目覚まし時計", "時計") == 2
+    assert S("乾電池", "電池") == 2
+    # 3文字以上 + 内容語プレフィクス(修飾語を除いても漢字2つ) → 弱い
+    assert S("電動鼻毛カッター", "カッター") == 1
+    assert S("電動歯間洗浄器", "洗浄器") == 1
+    # 修飾語のみ(電動/小型/ネイル…)なら末尾一致は強いまま
+    assert S("電動スケートボード", "スケートボード") == 2
+    assert S("小型のネイルドライヤー", "ドライヤー") == 2
+    assert S("ハンドミキサー", "ミキサー") == 2
+
+
+def test_electric_nose_trimmer_goes_to_canned(monkeypatch):
+    monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
+    monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    monkeypatch.setattr(
+        router, "vector_search_items",
+        lambda q, top_k=3: [_rec("カッター(刃を含む)"), _rec("使い捨てカイロ")],
+    )
+    monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
+    ans = router._blocking_route("電動鼻毛カッターはどう捨てればいいですか？")
+    assert ans.item_match == "analogy"
+    assert ans.analogy_unreliable is True
+    assert ans.canned_response is not None
