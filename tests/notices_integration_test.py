@@ -141,12 +141,47 @@ def test_router_surfaces_both_rules_for_a_pending_change(db):
     ans = _blocking_route("スプレー缶はどう捨てますか")
 
     assert ans.timeline_change is True
-    assert "現在(〜2026-09-30): 燃えないごみ" in ans.context     # 旧ルール(お知らせの記述)
-    assert "2026-10-01 から:" in ans.context                    # 切替日 + 新ルール
+    assert "変更前・現在(〜2026-09-30): 燃えないごみ" in ans.context  # 旧ルール
+    assert "切替日(省略・月単位への丸め禁止): 2026-10-01" in ans.context
+    assert "変更後(2026-10-01から):" in ans.context              # 新ルール
     assert "かん・びん" in ans.context                           # 新ルール本文
     assert "家庭ごみ" in ans.context                             # disputed: 早見表側も注記
+    assert "## 分別早見表の検索結果" not in ans.context           # 日付なしの未来行を除外
     assert "knowledge://お知らせ-4-2.md#お知らせ-01-スプレー缶" in ans.sources
-    assert "どちらか一方だけを答えて断定しない" in build_system_prompt(ans)
+    prompt = build_system_prompt(ans)
+    assert "日付を月だけに丸めること" in prompt
+    assert "どちらか一方だけを答えることは禁止" in prompt
+
+
+def test_router_keeps_official_name_that_contains_a_modifier(db):
+    """「使用済み」を雑音として落としても、正式品名自体は候補に残す。"""
+    from app.rag import router
+
+    importlib.reload(router)
+    ans = router._blocking_route("使用済みの花火はどう捨てますか")
+
+    assert ans.detected_item == "使用済みの花火"
+    assert ans.timeline_change is True
+    assert "そのまま家庭ごみに出してよい" in ans.context
+    assert "水にひたしてから家庭ごみ" in ans.context
+
+
+def test_router_all_change_notices_keep_the_exact_switch_date(db):
+    from app.rag import router
+
+    importlib.reload(router)
+    names = (
+        "スプレー缶", "蛍光管", "保冷剤", "傘", "カセットボンベ",
+        "魔法びん", "使い捨てライター", "カセットテープ",
+        "フロッピーディスク", "使い捨てカイロ", "紙おむつ",
+        "ボールペン", "使用済みの花火", "ヘアピン", "乾電池",
+    )
+    for name in names:
+        ans = router._blocking_route(f"{name}はどう捨てますか")
+        assert ans.timeline_change is True, name
+        assert "切替日(省略・月単位への丸め禁止): 2026-10-01" in ans.context, name
+        assert "変更後(2026-10-01から):" in ans.context, name
+        assert "2026年10月から、" not in ans.context, name
 
 
 def test_router_leaves_unchanged_items_alone(db):

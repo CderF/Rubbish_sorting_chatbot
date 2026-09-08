@@ -337,15 +337,22 @@ def _item_name_candidates(
     text = _LEADING.sub("", text)
     text = _TRAILING.sub("", text).strip()
 
-    # 記号・空白で切り、断片ごとに修飾語を落として候補化する
+    # 記号・空白で切り、断片ごとに「原文」と「修飾語を落とした形」の両方を
+    # 候補化する。原文だけだと「壊れたテレビ」が完全一致しない一方、加工後
+    # だけだと正式な品名そのものに語が含まれるケース
+    # (「使用済みの花火」)を「花火」に壊してしまい、STAGE04 の変更履歴を
+    # 引けなくなるため、情報を捨てず検索段階で順に試す。
     # (raw_fragments は修飾語を落とす前の断片。ベクトル検索クエリの選定用)。
-    raw_fragments: list[str] = []
-    candidates: list[str] = []
+    # 括弧を含む正式名(「カイロ(使い捨て)」等)も分割前の形で残す。
+    raw_fragments: list[str] = [text]
+    candidates: list[str] = [text]
     for frag in re.split(r"[\s、。「」()（）]+", text):
         frag = _TRAILING.sub("", _LEADING.sub("", frag))
         if not frag:
             continue
         raw_fragments.append(frag)
+        if frag not in candidates:
+            candidates.append(frag)
         cleaned = _clean_fragment(frag)
         if cleaned and cleaned not in candidates:
             candidates.append(cleaned)
@@ -408,20 +415,39 @@ def _search_item(
     return vector, ("vector" if vector else None)
 
 
-def _classify_item_match(item_name: str, hits: list[ItemRecord]) -> str:
+def _classify_item_match(item_names: "str | list[str]", hits: list[ItemRecord]) -> str:
     """"exact" / "analogy" / "none"。どの段でヒットしたかではなく、返ってきた
     行の名前が質問の品名と実際に一致しているかで決める(PR #14 レビュー)。
     partial(`LIKE '%クエリ%'`)は「テレビ」→「テレビ台」のように別品目を返す
     ので analogy 側になる。"""
     if not hits:
         return "none"
-    q = _norm(item_name)
-    if any(_norm(getattr(h, "item_name", "")) == q for h in hits):
+    names = [item_names] if isinstance(item_names, str) else item_names
+    queries = {_norm(name) for name in names}
+    if any(_norm(getattr(h, "item_name", "")) in queries for h in hits):
         return "exact"
     return "analogy"
 
 
-def _apply_timeline(ans: RoutedAnswer, item_name: str, today: "date | None" = None) -> None:
+def _timeline_method_text(method: str, effective_from: "date | None") -> str:
+    """変更後本文の先頭にある月単位の日付を除き、規則本体だけを返す。
+
+    切替日は構造化済みの ``effective_from`` から別行に正確な日付で出す。
+    原文の「2026年10月から」と同時に渡すと、小さいLLMがそちらをコピーして
+    「1日」を落とすことがあるため。本文中の手順・条件は削らない。
+    """
+    if effective_from is None:
+        return method
+    prefix = re.compile(
+        rf"^{effective_from.year}年0?{effective_from.month}月"
+        rf"(?:0?{effective_from.day}日)?から[、,\s]*"
+    )
+    return prefix.sub("", method, count=1).strip()
+
+
+def _apply_timeline(
+    ans: RoutedAnswer, item_names: "str | list[str]", today: "date | None" = None
+) -> None:
     """STAGE04 4-2: この品目に「これから出し方が変わる」予定があれば、旧ルール・
     新ルール・切替日をまとめて context に足す。
 
@@ -429,28 +455,53 @@ def _apply_timeline(ans: RoutedAnswer, item_name: str, today: "date | None" = No
     足さないと変更予定の品目は新ルールしか LLM に届かず「片方だけで断定」して
     しまう(要件4-2 が禁じる状態)。
     """
-    tl = pending_change(item_name, today or date.today())
+    names = [item_names] if isinstance(item_names, str) else item_names
+    ref = today or date.today()
+    tl = None
+    for name in names:
+        tl = pending_change(name, ref)
+        if tl is not None:
+            break
     if tl is None:
         return
 
-    ref = today or date.today()
     now_seg = tl.segment_on(ref)
     future = [s for s in tl.segments if s.valid_from and s.valid_from > ref]
 
-    lines = ["## この品目は出し方が変わります(旧・新の両方を必ず時系列で案内する)"]
+    # 通常の item_hits は is_current=1 の行だけなので、切替日前でも未来の通知行
+    # が日付なしの「分別早見表の検索結果」として入っている。これと時間軸を同時
+    # に渡すと、LLM が未来の規則を現在の規則として答えたり、どちらか片方を
+    # 落としたりする。変更品目については、この日付付きブロックだけを品目情報の
+    # 正本とし、収集日など別セクションだけを残す。
+    kept_blocks = [
+        block
+        for block in ans.context.split("\n\n")
+        if not block.startswith("## 分別早見表の検索結果")
+        and not block.startswith("## 早見表に")
+    ]
+
+    lines = [
+        "## この品目の変更前後(このブロックだけを正本として回答する)",
+        f"- 対象品目: {tl.item_name}",
+    ]
     if now_seg is not None:
         until = now_seg.valid_until.isoformat() if now_seg.valid_until else "当面"
-        lines.append(f"- 現在(〜{until}): {now_seg.disposal_method}")
+        lines.append(f"- 変更前・現在(〜{until}): {now_seg.disposal_method}")
         if now_seg.disputed and now_seg.hayamihyo_disposal_method:
             lines.append(
                 f"  (早見表には「{now_seg.hayamihyo_disposal_method}」と記載。"
                 "お知らせの内容を優先する)"
             )
     for seg in future:
-        lines.append(f"- {seg.valid_from.isoformat()} から: {seg.disposal_method}")
+        lines.append(f"- 切替日(省略・月単位への丸め禁止): {seg.valid_from.isoformat()}")
+        method = _timeline_method_text(seg.disposal_method, seg.valid_from)
+        lines.append(f"- 変更後({seg.valid_from.isoformat()}から): {method}")
 
-    ans.context = (ans.context + "\n\n" + "\n".join(lines)).strip()
+    ans.context = "\n\n".join(kept_blocks + ["\n".join(lines)]).strip()
     ans.sources = _dedupe(ans.sources + [s.source_url for s in tl.segments])
+    # 「花火」→ linked notice「使用済みの花火」のように、文字列上は部分一致でも
+    # 版本鎖で同一品目だと確定できた。4-3 の類推扱い・断り書きを重ねない。
+    ans.item_match = "exact"
     ans.timeline_change = True
 
 
@@ -482,7 +533,7 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         ans.item_hits, ans.item_match_stage = _search_item(
             item_name, item_candidates[1:], vector_query
         )
-        ans.item_match = _classify_item_match(item_name, ans.item_hits)
+        ans.item_match = _classify_item_match(item_candidates, ans.item_hits)
 
     if ward:
         # 早見表がヒットしていれば、その出し方(disposal_method)を収集日検索の
@@ -550,8 +601,16 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         + [r.source_url for r in ans.schedule_hits]
     )
     ans.context = _build_context(ans)
-    if item_name:
-        _apply_timeline(ans, item_name)
+    if item_candidates:
+        timeline_candidates = list(item_candidates)
+        # 「カイロ」→現行通知行「使い捨てカイロ」のように、部分一致が一意なら
+        # その実レコード名も版本鎖の入口として試す。vector 類似候補では別品物の
+        # 時間軸を誤適用するため、この補完は partial 1件だけに限定する。
+        if ans.item_match_stage == "partial" and len(ans.item_hits) == 1:
+            hit_name = getattr(ans.item_hits[0], "item_name", "")
+            if hit_name and hit_name not in timeline_candidates:
+                timeline_candidates.append(hit_name)
+        _apply_timeline(ans, timeline_candidates)
     return ans
 
 
@@ -615,12 +674,16 @@ def _build_context(ans: RoutedAnswer) -> str:
     if ans.item_hits:
         if ans.item_match == "analogy":
             q = ans.detected_item or "この品名"
-            header = f"## 早見表に「{q}」の個別記載なし ― 類似する品目の情報"
+            header = (
+                f"## 早見表に「{q}」の個別記載なし ― 類似候補"
+                "(回答では最も妥当な1件だけを選ぶ)"
+            )
         else:
             header = "## 分別早見表の検索結果"
         lines = [header]
-        for r in ans.item_hits:
-            lines.append(f"- 品名: {r.item_name}")
+        for rank, r in enumerate(ans.item_hits, 1):
+            prefix = f"類似候補{rank}" if ans.item_match == "analogy" else "品名"
+            lines.append(f"- {prefix}: {r.item_name}")
             lines.append(f"  出し方: {r.disposal_method}")
             if r.notes:
                 lines.append(f"  備考: {r.notes}")
@@ -754,23 +817,33 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
     """
     parts = [_BASE_RULES]
 
-    if ans.found:
+    if ans.found and ans.item_match != "analogy":
         parts.append(_RULES_WITH_CONTEXT)
+    elif ans.found:
+        parts.append(
+            "- 下記『検索結果』の類似候補を比較し、質問品と用途・機能・動力・"
+            "材質が最も近いものを必ず1件だけ選ぶ。候補を複数列挙したり、複数の"
+            "出し方を混ぜたりしてはならない。\n"
+            "- 採用した1件の『出し方』と『備考』だけを根拠として使い、その表記を"
+            "変えずに案内する。採用しなかった候補の情報や、検索結果にない条件を"
+            "追加してはならない。妥当な候補を選べない場合は区分を断定しない。\n"
+        )
     else:
         parts.append(_RULES_NO_CONTEXT)
 
     if ans.timeline_change:
         parts.append(
-            "- この品目は将来出し方が変わる。「現在は〜。YYYY年MM月DD日からは〜」の"
-            "形で、旧ルールと新ルールの両方を時系列に沿って説明する。"
-            "どちらか一方だけを答えて断定しない。\n"
+            "- この品目は将来出し方が変わる。検索結果の『変更前・現在』、"
+            "『切替日』、『変更後』の3項目を一つも省略せず、"
+            "「現在は〜。YYYY年MM月DD日からは〜」の形で時系列に沿って説明する。"
+            "日付を月だけに丸めること、どちらか一方だけを答えることは禁止。\n"
         )
 
     if ans.item_match == "analogy":
         parts.append(
-            "- 『類似する品目の情報』欄の品目は、質問された品名そのものではなく"
-            "早見表にある別の品目である。その欄に書かれている実際の品目名を挙げて"
-            "「類似する『(その品目名)』に準じると〜」の形で案内し、断定しない。"
+            "- 類似候補は質問された品名そのものではない。上で選んだ1件の実際の"
+            "品目名を挙げて「類似する『(その品目名)』に準じると〜」の形で案内し、"
+            "その候補だけを根拠にする。別候補の区分・条件を併記せず、断定しない。"
             "個別の記載がないため、正確な分別は北九州市の公式ページや窓口で"
             "確認するよう必ず添える。収集日など他の欄の情報はこの限りではない。\n"
         )

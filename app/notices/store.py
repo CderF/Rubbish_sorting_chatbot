@@ -20,6 +20,7 @@ Target runtime is the B1 server's Python 3.10 — no 3.11+ syntax.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
@@ -128,6 +129,20 @@ def _like_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+# お知らせ側だけに付く、品物の状態・用途を表す先頭修飾語。早見表は基礎名や
+# 括弧つきの形で持つことがあるため、元の名前による exact/LIKE が空だった時に
+# 限り、この修飾語を外してもう一度照合する。名称そのものを書き換えるためでは
+# なく、旧行と新行を結ぶための限定的な照合用。
+_PREDECESSOR_PREFIX_RE = re.compile(
+    r"^(?:(?:使い捨て)|(?:使用済み(?:の)?)|(?:中古(?:の)?)|古い|(?:不要(?:な)?))+"
+)
+
+
+def _strip_predecessor_prefix(name: str) -> str:
+    stripped = _PREDECESSOR_PREFIX_RE.sub("", name).strip()
+    return stripped or name
+
+
 @dataclass(frozen=True)
 class PredecessorMatch:
     """`find_current_predecessor` の結果。
@@ -168,16 +183,42 @@ def find_current_predecessor(
     if exact:
         return PredecessorMatch(item=_row_to_item(exact), exact=True)
 
-    partial = conn.execute(
-        "SELECT * FROM waste_items "
-        "WHERE item_name LIKE ? ESCAPE '\\' AND is_current = 1 "
-        "AND source_url NOT LIKE ? AND id IS NOT ? ORDER BY id",
-        (f"%{_like_escape(norm)}%", KNOWLEDGE_SCHEME + "%", exclude_id),
-    ).fetchall()
+    def partial_rows(name: str):
+        return conn.execute(
+            "SELECT * FROM waste_items "
+            "WHERE item_name LIKE ? ESCAPE '\\' AND is_current = 1 "
+            "AND source_url NOT LIKE ? AND id IS NOT ? ORDER BY id",
+            (f"%{_like_escape(name)}%", KNOWLEDGE_SCHEME + "%", exclude_id),
+        ).fetchall()
+
+    partial = partial_rows(norm)
     if len(partial) == 1:
         return PredecessorMatch(item=_row_to_item(partial[0]), exact=False)
     if len(partial) > 1:
         return PredecessorMatch(candidates=tuple(r["item_name"] for r in partial))
+
+    # 早見表「花火」←お知らせ「使用済みの花火」、早見表「ライター」←
+    # お知らせ「使い捨てライター」、早見表「カイロ(使い捨て)」←お知らせ
+    # 「使い捨てカイロ」。元名で何も見つからなかった時だけ、状態修飾語を
+    # 外して exact → LIKE を再試行する。LIKE は従来どおり一意な時だけ採用。
+    base = _strip_predecessor_prefix(norm)
+    if base != norm:
+        stripped_exact = conn.execute(
+            "SELECT * FROM waste_items WHERE item_name = ? AND is_current = 1 "
+            "AND source_url NOT LIKE ? AND id IS NOT ?",
+            (base, KNOWLEDGE_SCHEME + "%", exclude_id),
+        ).fetchone()
+        if stripped_exact:
+            # 元の通知名との完全一致ではないため partial link として可視化する。
+            return PredecessorMatch(item=_row_to_item(stripped_exact), exact=False)
+
+        stripped_partial = partial_rows(base)
+        if len(stripped_partial) == 1:
+            return PredecessorMatch(item=_row_to_item(stripped_partial[0]), exact=False)
+        if len(stripped_partial) > 1:
+            return PredecessorMatch(
+                candidates=tuple(r["item_name"] for r in stripped_partial)
+            )
     return PredecessorMatch()
 
 
