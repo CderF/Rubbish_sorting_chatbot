@@ -53,3 +53,7 @@ chroma/
 .DS_Store
 .vscode/
 .idea/
+
+# local scratch — earlier drafts kept on disk, not part of the repo
+/Claude outputs/
+/stage1/
