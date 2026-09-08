@@ -132,6 +132,23 @@ def _expand_town_range(town: str) -> list[str]:
     return [f"{prefix}{n}丁目" for n in range(start, end + 1)]
 
 
+_RESOURCE_WEEKDAY_RE = re.compile(r"「かん・びん」「ペットボトル」は(?:毎週)?(.+?)に収集します")
+
+
+def _resource_weekday(soup: BeautifulSoup) -> str | None:
+    """各区ページの表より前にある案内文から「かん・びん」「ペットボトル」の
+    収集曜日を拾う。7区全ページで一言一句同じ文言("「かん・びん」「ペットボトル」
+    は毎週水曜日に収集します。")で、かつ町名によらず区内一律 — 早見表の
+    `waste_items.disposal_method` には "ペットボトル" というそれ専用の区分が
+    あるのに、収集日側の表は 家庭ごみ/プラスチック/粗大ごみ の3列しか持たず、
+    この情報が丸ごと欠落していた(STAGE03 3-1採点で「プラスチックごみに分類され
+    木曜日」のように誤った曜日を回答するハルシネーションの原因)。表の外にある
+    ため、テーブル走査とは別に本文全体から拾う。
+    """
+    m = _RESOURCE_WEEKDAY_RE.search(soup.get_text(" ", strip=True))
+    return m.group(1).strip() if m else None
+
+
 def parse_schedule_page(html: str, source_url: str) -> list[CollectionSchedule]:
     """Parse one 収集日 ward page into CollectionSchedule records: one row per
     (town, waste type) pair, pivoted out of the page's per-town table row.
@@ -153,10 +170,13 @@ def parse_schedule_page(html: str, source_url: str) -> list[CollectionSchedule]:
     if table is None:
         return []
 
+    resource_weekday = _resource_weekday(soup)
+
     # columns: [gojuon index letter, 町名, <waste type 1>, <waste type 2>, ...]
     waste_types: list[str] | None = None
     now = datetime.now(timezone.utc)
     records: list[CollectionSchedule] = []
+    towns_seen: set[str] = set()
 
     for tr in table.find_all("tr"):
         header_cells = tr.find_all("th")
@@ -177,6 +197,7 @@ def parse_schedule_page(html: str, source_url: str) -> list[CollectionSchedule]:
         if not town_raw:
             continue
         for town in _expand_town_range(town_raw):
+            towns_seen.add(town)
             for i, waste_type in enumerate(waste_types):
                 weekday = cells[2 + i].get_text(strip=True)
                 if not weekday:
@@ -187,6 +208,20 @@ def parse_schedule_page(html: str, source_url: str) -> list[CollectionSchedule]:
                         town=town,
                         waste_type=waste_type,
                         weekday=weekday,
+                        source_url=source_url,
+                        crawled_at=now,
+                    )
+                )
+
+    if resource_weekday:
+        for town in towns_seen:
+            for waste_type in ("かん・びん", "ペットボトル"):
+                records.append(
+                    CollectionSchedule(
+                        ward=ward,
+                        town=town,
+                        waste_type=waste_type,
+                        weekday=resource_weekday,
                         source_url=source_url,
                         crawled_at=now,
                     )
