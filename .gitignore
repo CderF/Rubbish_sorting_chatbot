@@ -35,6 +35,8 @@ server.log
 # "Strictly confidential for internal use only" by GMO; see README / team
 # decision on whether it should be purged from history.
 documents/課題.pdf
+# Renamed copy of the same confidential PDF; never tracked, keep it that way.
+documents/北九州ゴミ分類Chatbot課題.pdf
 
 # --- os / editor -----------------------------------------------------------
 .DS_Store
