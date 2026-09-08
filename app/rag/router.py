@@ -13,9 +13,18 @@ import asyncio
 import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import date
 
-from app.rag.types import ItemRecord, RoutedAnswer, ScheduleRecord
+from app.rag.session_state import (
+    ADD_WORDS,
+    CORRECTION_WORDS,
+    DialogState,
+    TurnInput,
+    is_plausible_item_name,
+)
+from app.rag.session_state import merge as merge_state
+from app.rag.types import ItemRecord, ItemResult, RoutedAnswer, ScheduleRecord
 
 # --- データ層の解決 --------------------------------------------------------
 # FANG が app/data/lookup.py を push した時点で、こちら側は無変更で実結合に
@@ -121,6 +130,14 @@ _QUESTION_TAIL = re.compile(
     r"[^ぁ-んァ-ヶ一-龥]*.*$"
 )
 
+# 「〜でお願いします」「〜でした」など、品名の後ろに付く丁寧語・依頼形。
+# `_QUESTION_TAIL` は「捨て方」「分別」等の質問語を要求するため、
+# 「冷蔵庫も追加でお願いします」のような依頼文を1語も削れない。
+_POLITE_TAIL = re.compile(
+    r"(?:で)?(?:お願い(?:します|いたします)?|おねがい(?:します)?|でした|です|ます|ました|"
+    r"してください|ください|したい(?:です)?|しま(?:す|した))\s*[。、!！?？]*$"
+)
+
 # 文頭・文末に残る助詞や記号だけを落とす軽量な後処理。
 _PARTICLES = r"はがをにへとでもやのねよかっ、。？?!！\s"
 _LEADING = re.compile(rf"^[{_PARTICLES}]+")
@@ -181,6 +198,13 @@ def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str
     if strip_waste_words is None:
         strip_waste_words = asks_schedule(text)
 
+    # 訂正されたターンでは、訂正マーカーより後ろが新しい品名
+    # (「冷蔵庫じゃなくて洗濯機でした」→「洗濯機でした」)。前半を残すと
+    # 断片の長さ比べで訂正前の品名を拾ってしまう。
+    for marker in CORRECTION_WORDS:
+        if marker in text:
+            text = text.rsplit(marker, 1)[1]
+
     # 区名・町名は品名ではないので先に除去する。
     ward, town = extract_region(text)
     for part in (ward, town):
@@ -193,7 +217,12 @@ def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str
         for word in sorted(_WASTE_WORDS, key=len, reverse=True):
             text = text.replace(word, " ")
 
+    # 「も追加で」「それと」などの接続語は品名ではない。
+    for word in ADD_WORDS:
+        text = text.replace(word, " ")
+
     text = _QUESTION_TAIL.sub("", text)
+    text = _POLITE_TAIL.sub("", text)
     text = _LEADING.sub("", text)
     text = _TRAILING.sub("", text).strip()
 
@@ -205,7 +234,93 @@ def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str
             fragments.append(frag)
     if not fragments:
         return None
-    return max(fragments, key=len)
+
+    candidate = max(fragments, key=len)
+    # 助詞・丁寧語の残骸(「浅野1丁目です」→「す」)や指示語(「それ」)を検索キーに
+    # すると、LIKE検索が無関係な早見表の行を拾って根拠に混入する(STAGE05で実測)。
+    # 指示語の場合は品名を返さないことで、会話状態に既にある品目が保たれる。
+    if not is_plausible_item_name(candidate):
+        return None
+    return candidate
+
+
+# --- 町名の解決(STAGE05) --------------------------------------------------
+# `_TOWN` は「町・台・丁目」等の接尾辞に依存するため、「黒崎」「三ケ森」のように
+# 接尾辞を持たない町名を取りこぼす。語尾の活用を自前で推測する代わりに、
+# 候補を長い順にDBへ当てて実在するものを選ぶ(DBを町名辞書として使う)。
+# `collection_schedule` は (ward, town, waste_type) にインデックスがあり、
+# 1回の照会は点クエリなので、数回試しても実質コストは無い。
+_TOWN_FRAGMENT = re.compile(r"[一-龥ぁ-んァ-ヶーa-zA-Z0-9]{2,12}")
+_MAX_TOWN_PROBES = 24
+
+
+def _town_candidates(text: str, ward: str | None, exclude: "set[str]" = frozenset()) -> list[str]:
+    """町名になりうる文字列を、確からしい順に並べて返す。"""
+    text = _norm(text)
+    tail = text.split(ward, 1)[1] if ward and ward in text else text
+
+    ordered: list[str] = []
+
+    def push(cand: str) -> None:
+        cand = cand.strip()
+        if not cand or cand in ordered or cand in WARDS or cand in exclude:
+            return
+        if any(w.startswith(cand) for w in WARDS):
+            return
+        ordered.append(cand)
+
+    # 1段目: 接尾辞つき(「浅野1丁目」「本城台」)。最も確からしい。
+    for cand in _TOWN.findall(tail) or _TOWN.findall(text):
+        push(cand)
+
+    # 2段目: 素の断片とその前方一致(「黒崎です」→「黒崎で」→「黒崎」)。
+    bare: list[str] = []
+    for frag in _TOWN_FRAGMENT.findall(tail):
+        bare.append(frag)
+        bare.extend(frag[:n] for n in range(len(frag) - 1, 1, -1))
+    for cand in sorted(dict.fromkeys(bare), key=len, reverse=True):
+        push(cand)
+
+    return ordered[:_MAX_TOWN_PROBES]
+
+
+def _resolve_town(
+    ward: str, text: str, exclude: "set[str]" = frozenset()
+) -> "tuple[str | None, list[ScheduleRecord] | None]":
+    """区が分かっている前提で、本文から実在する町名を1つ決める。
+
+    戻り値は (町名, その町の収集日全件)。見つからなければ (None, None)。
+    ごみ種別での絞り込みは呼び出し側で行う(0件だったときに種別なしで引き直す
+    処理を、DBへの再照会なしで済ませるため)。
+    """
+    for cand in _town_candidates(text, ward, exclude):
+        rows = lookup_collection_schedule(ward, cand, None)
+        if rows:
+            return cand, rows
+    return None, None
+
+
+def extract_turn(prompt: str, image_item_name: str | None = None) -> TurnInput:
+    """1ターンぶんの発話からスロット候補を抜き出す(STAGE05)。
+
+    抽出は従来どおり文字列ヒューリスティクスで、ここでは会話状態を見ない。
+    「今の発話から何が読み取れたか」と「それを状態にどう畳み込むか」を分けて
+    おくと、畳み込み側(`app/rag/session_state.merge`)がDBもLLMも要らない
+    純関数のままテストできる。
+    """
+    text = _norm(prompt)
+    wants_schedule = asks_schedule(text)
+    ward, town = extract_region(text)
+    item = image_item_name or extract_item_name(text, strip_waste_words=wants_schedule)
+    return TurnInput(
+        text=text,
+        item=item,
+        ward=ward,
+        town=town,
+        waste_type=extract_waste_type(text) if wants_schedule else None,
+        asks_schedule=wants_schedule,
+        from_image=bool(image_item_name),
+    )
 
 
 # --- 検索 ------------------------------------------------------------------
@@ -232,23 +347,23 @@ def _search_item(item_name: str) -> tuple[list[ItemRecord], str | None]:
     return vector, ("vector" if vector else None)
 
 
-def _apply_timeline(ans: RoutedAnswer, item_name: str, today: "date | None" = None) -> None:
+def _apply_timeline(result: ItemResult, today: "date | None" = None) -> list[str]:
     """STAGE04 4-2: この品目に「これから出し方が変わる」予定があれば、旧ルール・
-    新ルール・切替日をまとめて context に足す。
+    新ルール・切替日を `ItemResult` に足し、引用URLを返す。
 
     データ層の `lookup_item_exact` は `is_current = 1` しか返さないので、これを
     足さないと変更予定の品目は新ルールしか LLM に届かず「片方だけで断定」して
     しまう(要件4-2 が禁じる状態)。
     """
-    tl = pending_change(item_name, today or date.today())
+    tl = pending_change(result.item_name, today or date.today())
     if tl is None:
-        return
+        return []
 
     ref = today or date.today()
     now_seg = tl.segment_on(ref)
     future = [s for s in tl.segments if s.valid_from and s.valid_from > ref]
 
-    lines = ["## この品目は出し方が変わります(旧・新の両方を必ず時系列で案内する)"]
+    lines = [f"## 「{result.item_name}」は出し方が変わります(旧・新の両方を必ず時系列で案内する)"]
     if now_seg is not None:
         until = now_seg.valid_until.isoformat() if now_seg.valid_until else "当面"
         lines.append(f"- 現在(〜{until}): {now_seg.disposal_method}")
@@ -260,59 +375,122 @@ def _apply_timeline(ans: RoutedAnswer, item_name: str, today: "date | None" = No
     for seg in future:
         lines.append(f"- {seg.valid_from.isoformat()} から: {seg.disposal_method}")
 
-    ans.context = (ans.context + "\n\n" + "\n".join(lines)).strip()
-    ans.sources = _dedupe(ans.sources + [s.source_url for s in tl.segments])
-    ans.timeline_change = True
+    result.timeline_change = True
+    result.timeline_lines = lines
+    return [s.source_url for s in tl.segments]
 
 
-def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAnswer:
+def _filter_by_waste_type(
+    schedules: list[ScheduleRecord], waste_type: str | None
+) -> list[ScheduleRecord]:
+    """ごみ種別が明示されていれば絞り込む。0件になるなら絞り込まない。
+
+    設計提案書 3-1 は「品名と地区を伝えると出し方と収集日まで案内できる」ことを
+    求めるので、種別が一致しないことを理由に収集日そのものを落とさない。
+    """
+    if not waste_type:
+        return schedules
+    narrowed = [s for s in schedules if _norm(s.waste_type) == _norm(waste_type)]
+    return narrowed or schedules
+
+
+def _blocking_route(
+    prompt: str,
+    image_item_name: str | None = None,
+    state: "DialogState | None" = None,
+) -> RoutedAnswer:
     """同期の検索処理。`handle_query` からスレッドで呼ばれる。
 
     `image_item_name` は画像分類パス(`classify_image_to_item_name`)が
     画像から抽出した品名。渡されていればプロンプトからのテキスト抽出より
     優先する(STAGE03 3-2: 画像は品名の代わりに渡されるものなので)。
+
+    `state` は前ターンまでの会話スロット(STAGE05)。`None` なら1ターン目として
+    扱うため、STAGE02/03 と同じ「1リクエスト内で完結する」呼び出しがそのまま
+    動く(既存のテスト・呼び出し側は無改修)。
+
+    検索は毎ターン**マージ後のスロット全体に対してやり直す**。会話履歴を事実の
+    出どころにしないことで、「検索結果に書かれている内容だけを使う」という
+    システムプロンプトの規則を緩めずに 5-1 を満たせる。
     """
+    turn = extract_turn(prompt, image_item_name)
+
+    # 地区だけを言い直したターン(「やっぱり八幡西区黒崎です」)は、品名抽出が
+    # 残りの断片(「やっぱり」「黒崎です」)を品名として拾ってしまう。町名解決と
+    # 同じく、決め打ちで語尾を判別する代わりに早見表に当てて確かめる:
+    # 地区を含むターンで、候補がどの検索段にも掛からなければ品名ではない。
+    # 地区を伴わないターンでは落とさない — 早見表に無い品物を尋ねられた場合は
+    # 「見つかりませんでした」と答える必要がある(設計提案書 3-7、要件4-3)。
+    prefetched: "dict[str, tuple[list[ItemRecord], str | None]]" = {}
+    if turn.item and not turn.from_image and (turn.ward or turn.town):
+        found = _search_item(turn.item)
+        # 採用するのは完全一致・部分一致まで。ベクトル段は「意味が近い別の品目」を
+        # 返すので、「黒崎です」のような地区の言い直しにも何かしら当たってしまう。
+        if found[1] in ("exact", "partial"):
+            prefetched[turn.item] = found
+        else:
+            turn = replace(turn, item=None)
+
+    state = merge_state(state, turn)
+
     ans = RoutedAnswer()
 
-    ward, town = extract_region(prompt)
-    ans.detected_ward, ans.detected_town = ward, town
+    # --- 早見表パス: 相談に出ている品目すべてを引き直す -----------------------
+    timeline_sources: list[str] = []
+    for name in state.items:
+        hits, stage = prefetched.get(name) or _search_item(name)
+        result = ItemResult(
+            item_name=name,
+            hits=hits,
+            match_stage=stage,
+            from_image=turn.from_image and name == turn.item,
+        )
+        timeline_sources += _apply_timeline(result)
+        ans.item_results.append(result)
 
-    wants_schedule = asks_schedule(prompt)
+    ans.item_hits = [h for r in ans.item_results for h in r.hits]
+    ans.item_match_stage = next(
+        (r.match_stage for r in reversed(ans.item_results) if r.match_stage), None
+    )
+    ans.timeline_change = any(r.timeline_change for r in ans.item_results)
 
-    item_name = image_item_name or extract_item_name(prompt, strip_waste_words=wants_schedule)
-    ans.detected_item = item_name
-    ans.item_from_image = bool(image_item_name)
-
-    if item_name:
-        ans.item_hits, ans.item_match_stage = _search_item(item_name)
-
-    if ward:
-        # ごみ種別が明示されていれば絞り込むが、0件なら種別なしで引き直す。
-        # 設計提案書 3-1 は「品名と地区を伝えると出し方と収集日まで案内できる」
-        # ことを求めるので、種別が一致しないことを理由に収集日を落とさない。
-        waste_type = extract_waste_type(prompt) if wants_schedule else None
-        schedules = lookup_collection_schedule(ward, town, waste_type)
-        if not schedules and waste_type:
-            schedules = lookup_collection_schedule(ward, town, None)
+    # --- 収集日パス --------------------------------------------------------
+    town = state.town
+    if state.ward:
+        schedules = lookup_collection_schedule(state.ward, town, None) if town else None
+        if not schedules:
+            # 町名が未確定、または前ターンの町名が引けない。今回の発話から引き直す。
+            resolved, schedules = _resolve_town(
+                state.ward, turn.text, exclude=set(state.items)
+            )
+            if schedules:
+                town = resolved
 
         if schedules:
-            ans.schedule_hits = schedules
+            ans.schedule_hits = _filter_by_waste_type(schedules, state.waste_type)
         elif not town:
             # 設計提案書 3-1: 区のみでは一意に定まらない。推測せず町名を要求する。
             ans.missing.append("町名")
         else:
-            ans.missing.append(f"{ward}{town}の収集日データ")
-    elif wants_schedule:
+            ans.missing.append(f"{state.ward}{town}の収集日データ")
+    elif state.wants_schedule:
         ans.missing.append("区名と町名")
+
+    # 解決できた町名は状態に書き戻す。次ターン以降は再解決なしで引ける。
+    state = replace(state, town=town)
+
+    ans.state = state
+    ans.detected_item = state.primary_item
+    ans.detected_ward, ans.detected_town = state.ward, state.town
+    ans.item_from_image = turn.from_image
 
     ans.found = bool(ans.item_hits or ans.schedule_hits)
     ans.sources = _dedupe(
         [r.source_url for r in ans.item_hits]
         + [r.source_url for r in ans.schedule_hits]
+        + timeline_sources
     )
     ans.context = _build_context(ans)
-    if item_name:
-        _apply_timeline(ans, item_name)
     return ans
 
 
@@ -333,6 +511,7 @@ _db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rag-lookup"
 async def handle_query(
     prompt: str,
     img_b64: str | None = None,
+    state: "DialogState | None" = None,
     engine=None,
     processor=None,
 ) -> RoutedAnswer:
@@ -341,6 +520,11 @@ async def handle_query(
     計画書では同期関数だったが、`server.py` は全体が async で動いており、
     SQLite・embedding・VLM呼び出しでイベントループを塞ぐと同時4リクエスト
     要件に影響するため async 化した(FANG と合意済みの変更点)。
+
+    `state` は同じ `session_id` の前ターンまでの会話スロット(STAGE05)。呼び出し
+    側は戻り値の `RoutedAnswer.state` を保存し、次のターンでそれを渡し直す。
+    タプルではなく `RoutedAnswer` に載せて返すのは、既存の呼び出し側の
+    アンパック形を変えないため。省略時は1ターン目として扱う。
 
     `engine`/`processor` は `server.py` が起動時に初期化する共有vLLMエンジン
     (STAGE03 3-2向け画像分類パス用)。呼び出し元がどちらも渡さない場合、または
@@ -353,7 +537,7 @@ async def handle_query(
 
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        _db_executor, _blocking_route, prompt, image_item_name
+        _db_executor, _blocking_route, prompt, image_item_name, state
     )
 
 
@@ -369,25 +553,61 @@ def _dedupe(urls: list[str]) -> list[str]:
     return out
 
 
+def _matching_item_labels(ans: RoutedAnswer, waste_type: str) -> list[str]:
+    """この収集日の行(ごみ種別)に該当する品目名を返す。
+
+    5-1 は「分別・出し方・収集日を組み合わせ」て案内することを求めている。
+    早見表の出し方(例「粗大ごみ」)と収集日の種別(例「粗大ごみ」)を突き合わせて
+    context 側で明示しないと、その町の全種別を並べたまま「どれがこの品物の日
+    なのか」の判断をLLMに任せることになる。
+
+    照合は返ってきた行の `waste_type` 文字列そのものに対して行い、種別語彙を
+    こちら側で決め打ちしない(データ層が持つ表記が唯一の正)。
+    """
+    wt = _norm(waste_type)
+    labels = []
+    for result in ans.item_results:
+        for rec in result.hits:
+            method = _norm(_attr(rec, "disposal_method", ""))
+            if wt and (wt in method or method in wt):
+                labels.append(result.item_name)
+                break
+    return labels
+
+
 def _build_context(ans: RoutedAnswer) -> str:
-    """検索結果をLLMに渡す平文に整形する。"""
+    """検索結果をLLMに渡す平文に整形する。
+
+    品目は1件とは限らない(5-2 の「追加」で1回の回答が複数品目を扱う)。
+    品目ごとに見出しを分け、ヒットしなかった品目も「該当なし」として残す
+    — 黙って落とすと、LLMが前ターンの記憶から補って断定する余地が生まれる。
+    """
     blocks: list[str] = []
 
-    if ans.item_hits:
-        lines = ["## 分別早見表の検索結果"]
-        for r in ans.item_hits:
-            lines.append(f"- 品名: {r.item_name}")
-            lines.append(f"  出し方: {r.disposal_method}")
-            if r.notes:
-                lines.append(f"  備考: {r.notes}")
+    for result in ans.item_results:
+        lines = [f"## 分別早見表の検索結果: {result.item_name}"]
+        if result.hits:
+            for r in result.hits:
+                lines.append(f"- 品名: {_attr(r, 'item_name', '')}")
+                lines.append(f"  出し方: {_attr(r, 'disposal_method', '')}")
+                notes = _attr(r, "notes", "")
+                if notes:
+                    lines.append(f"  備考: {notes}")
+        else:
+            lines.append("- 該当する品目は見つかりませんでした(推測で分別を断定しない)")
         blocks.append("\n".join(lines))
+
+        if result.timeline_lines:
+            blocks.append("\n".join(result.timeline_lines))
 
     if ans.schedule_hits:
         lines = ["## 収集日の検索結果"]
         for s in ans.schedule_hits:
             # weekday はカンマ区切り(例 "火,金")。読み上げやすい表記に直す。
             days = "・".join(d.strip() for d in s.weekday.split(",") if d.strip())
-            lines.append(f"- {s.ward}{s.town} / {s.waste_type}: {days}曜日")
+            labels = _matching_item_labels(ans, s.waste_type)
+            suffix = f" ← {'・'.join(labels)}はこの区分" if labels else ""
+            lines.append(f"- {s.ward}{s.town} / {s.waste_type}: {days}曜日{suffix}")
         blocks.append("\n".join(lines))
 
     return "\n\n".join(blocks)
@@ -423,10 +643,29 @@ _RULES_NO_CONTEXT = (
 )
 
 
+# STAGE05: マルチターンで前提が変わったときの組み立て方(5-2)。
+_RULE_MULTI_ITEM = (
+    "- 相談に出ている品物は複数ある({items})。それぞれについて分けて案内し、"
+    "前のターンで案内済みの品物も省略しない。\n"
+)
+
+_RULE_CORRECTED = (
+    "- 利用者は直前のやりとりで前提を訂正・変更した。訂正前の品物・地区に基づく"
+    "案内を繰り返さず、新しい前提で組み直して答える。\n"
+)
+
+_RULE_KNOWN_REGION = (
+    "- 利用者の地区は「{region}」と既に判明している。同じことを聞き返さない。\n"
+)
+
+
 def build_system_prompt(ans: RoutedAnswer) -> str:
     """`RoutedAnswer` からLLMへのシステムプロンプトを組み立てる。
 
     設計提案書 3-7(未識別時は憶測で断定しない)をここで強制する。
+    STAGE05 では、会話状態(`ans.state`)から「複数品目」「訂正があった」
+    「地区は判明済み」を明示的に指示に落とす。検索結果は毎ターン全スロットで
+    引き直されているので、「検索結果だけを使う」規則は緩めない。
     """
     parts = [_BASE_RULES]
 
@@ -435,9 +674,18 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
     else:
         parts.append(_RULES_NO_CONTEXT)
 
+    state = ans.state
+    if state is not None:
+        if len(state.items) > 1:
+            parts.append(_RULE_MULTI_ITEM.format(items="・".join(state.items)))
+        if state.corrected:
+            parts.append(_RULE_CORRECTED)
+        if state.has_region:
+            parts.append(_RULE_KNOWN_REGION.format(region=f"{state.ward}{state.town}"))
+
     if ans.timeline_change:
         parts.append(
-            "- この品目は将来出し方が変わる。「現在は〜。YYYY年MM月DD日からは〜」の"
+            "- 出し方が将来変わる品目がある。「現在は〜。YYYY年MM月DD日からは〜」の"
             "形で、旧ルールと新ルールの両方を時系列に沿って説明する。"
             "どちらか一方だけを答えて断定しない。\n"
         )
@@ -486,6 +734,19 @@ def describe_sources(ans: RoutedAnswer) -> dict:
             "town": ans.detected_town,
             "from_image": ans.item_from_image,
         },
+        # STAGE05: いま会話で保持しているスロット。5-1/5-2 が正しく効いているかを
+        # メンターがUI上で確認できるようにする(6-4 の「後から確認できる」にも効く)。
+        "slots": ans.state.describe() if ans.state is not None else None,
+        "item_results": [
+            {
+                "item_name": r.item_name,
+                "match_stage": r.match_stage,
+                "match_stage_label": MATCH_STAGE_LABELS.get(r.match_stage or ""),
+                "hits": len(r.hits),
+                "timeline_change": r.timeline_change,
+            }
+            for r in ans.item_results
+        ],
         "match_stage": ans.item_match_stage,
         "match_stage_label": MATCH_STAGE_LABELS.get(ans.item_match_stage or ""),
         "found": ans.found,

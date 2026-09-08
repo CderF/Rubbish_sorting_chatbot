@@ -438,12 +438,21 @@ function renderSources(host, src){
     body.appendChild(p);
   }
 
-  // 何を手がかりに検索したか
+  // 何を手がかりに検索したか。STAGE05 以降は「今の1文」ではなく会話全体で
+  // 保持しているスロット(src.slots)が検索の入力になるので、そちらを表示する。
   const d = src.detected || {};
+  const st = src.slots || {};
   const chips = [];
-  if (d.item)  chips.push((d.from_image ? '画像から抽出: ' : '品名: ') + d.item);
-  if (d.ward)  chips.push('区: ' + d.ward);
-  if (d.town)  chips.push('町名: ' + d.town);
+  const items = (st.items && st.items.length) ? st.items : (d.item ? [d.item] : []);
+  items.forEach((name, i) => {
+    const fromImg = d.from_image && i === items.length - 1;
+    chips.push((fromImg ? '画像から抽出: ' : '品名: ') + name);
+  });
+  if (st.ward || d.ward)  chips.push('区: ' + (st.ward || d.ward));
+  if (st.town || d.town)  chips.push('町名: ' + (st.town || d.town));
+  if (st.last_item_update === 'add')       chips.push('前ターンに追加');
+  if (st.last_item_update === 'replace')   chips.push('品名を訂正');
+  if (st.last_region_update === 'replace') chips.push('地区を変更');
   (src.missing || []).forEach(m => chips.push('不足: ' + m));
   if (chips.length){
     const meta = document.createElement('div');

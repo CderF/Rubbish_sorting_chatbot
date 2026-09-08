@@ -8,6 +8,8 @@
 from dataclasses import dataclass, field
 from typing import Protocol, TypedDict
 
+from app.rag.session_state import DialogState
+
 
 class ItemRecord(Protocol):
     """早見表1件分。データ層 `lookup_item_exact` / `lookup_item_partial` の戻り値。
@@ -52,6 +54,24 @@ class ChunkRecord(TypedDict):
 
 
 @dataclass
+class ItemResult:
+    """1つの品目に対する早見表パスの検索結果(STAGE05)。
+
+    STAGE02/03 は1リクエスト1品目だったので `RoutedAnswer` が品目の情報を
+    直接持っていたが、5-2「追加なら前の案内を保ったまま足す」で1回の回答が
+    複数品目を扱うようになったため、品目単位に切り出した。
+    """
+
+    item_name: str
+    hits: list[ItemRecord] = field(default_factory=list)
+    match_stage: str | None = None
+    from_image: bool = False
+    timeline_change: bool = False
+    timeline_lines: list[str] = field(default_factory=list)
+    """STAGE04 4-2 の「いつから何がどう変わるか」。品目ごとに持つ。"""
+
+
+@dataclass
 class RoutedAnswer:
     """`handle_query` の戻り値。LLMに渡す材料と、回答の組み立て方の指示をまとめる。
 
@@ -79,8 +99,20 @@ class RoutedAnswer:
     空でなければ、LLMには不足項目の再入力を促す回答を書かせる。
     """
 
+    item_results: list[ItemResult] = field(default_factory=list)
+    """相談中の品目それぞれの検索結果(STAGE05)。順序は登場順、末尾が最新。"""
+
     item_hits: list[ItemRecord] = field(default_factory=list)
+    """`item_results` の全ヒットを平坦化したもの。
+
+    STAGE02/03 からの互換フィールド。WebUIの根拠パネルと `format_citations`
+    が単一リストを前提にしているため残している。"""
+
     schedule_hits: list[ScheduleRecord] = field(default_factory=list)
+
+    state: "DialogState | None" = None
+    """このターン終了時点の会話スロット(STAGE05)。`server.py` がセッションに
+    保存し、次のターンで `handle_query` に渡し直す。"""
 
     detected_item: str | None = None
     """プロンプト(または画像)から抽出した品名。デバッグ・WebUI表示用。"""

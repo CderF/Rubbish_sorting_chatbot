@@ -55,6 +55,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from app.rag import knowledge, router  # noqa: E402  (sys.path 調整後に import)
+from app.rag.session_state import DialogState  # noqa: E402
 
 MODEL_NAME = "Qwen3-VL-8B-Instruct"
 # Where the downloaded weights live. Override per machine via MODEL_PATH so the
@@ -79,6 +80,11 @@ MAX_MODEL_LEN = 8192
 MAX_TOKENS = 1024
 # Keep at most this many sessions in memory (grader issues a new id per question).
 MAX_SESSIONS = 256
+# How many past chat messages to replay to the model (stage 5 conversations run
+# several turns; MAX_MODEL_LEN is 8192 and every turn also carries a freshly
+# built retrieval block in the system message). Facts come from that block, not
+# from the history, so trimming the tail costs accuracy nothing.
+MAX_HISTORY_MESSAGES = 8
 # Never return an empty body — that fails the question outright.
 EMPTY_FALLBACK = "申し訳ありません。回答を生成できませんでした。もう一度お試しください。"
 
@@ -91,6 +97,12 @@ _gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
 # session_id -> list of chat messages (multi-turn state, stages 5 / 6-3)
 sessions: "OrderedDict[str, list]" = OrderedDict()
+# session_id -> conversation slots (item / ward / town) for the retrieval side.
+# `sessions` is what the *model* sees; `states` is what the *search* sees. Both
+# are keyed and evicted together — a session that kept only one of the two would
+# either answer with a premise it can no longer justify, or silently forget the
+# item it is still talking about.
+states: "OrderedDict[str, DialogState]" = OrderedDict()
 _sessions_lock = asyncio.Lock()
 
 # Most recently completed request, shown on the WebUI (STAGE 1-2).
@@ -238,14 +250,16 @@ async def _parse_request(request: Request) -> tuple[str, str, str | None]:
 # --------------------------------------------------------------------------
 # retrieval (STAGE 02 / 03)
 # --------------------------------------------------------------------------
-async def _route_safely(prompt: str, img: str | None):
+async def _route_safely(prompt: str, img: str | None, state: DialogState | None):
     """検索パスを呼ぶ。失敗しても生成は止めない。
 
     RAG側の例外で 5xx を返すとステージ全体が中断してしまう(冒頭の契約メモ参照)
     ため、ここだけは意図的に握り潰し、素の生成にフォールバックする。
     """
     try:
-        return await router.handle_query(prompt, img, engine=engine, processor=processor)
+        return await router.handle_query(
+            prompt, img, state, engine=engine, processor=processor
+        )
     except Exception as exc:  # noqa: BLE001 — 生成の継続を最優先する
         print(f"[rag] handle_query failed, falling back to plain generation: {exc!r}",
               flush=True)
@@ -263,12 +277,13 @@ async def _stream_chat(
 
     turn = _build_messages(prompt, img)
     async with _sessions_lock:
-        history = sessions.get(session_id, [])
+        history = sessions.get(session_id, [])[-MAX_HISTORY_MESSAGES:]
+        state = states.get(session_id)
         messages = history + turn
 
     # 検索結果はシステムメッセージとして毎ターン先頭に差し込む。会話履歴には
     # 残さない(ターンごとに検索結果が変わるうえ、積み重なると文脈を圧迫するため)。
-    routed = await _route_safely(prompt, img)
+    routed = await _route_safely(prompt, img, state)
     if routed is not None:
         prompt_input = _build_prompt(
             [{"role": "system", "content": router.build_system_prompt(routed)}] + messages
@@ -299,6 +314,7 @@ async def _stream_chat(
     # 引用はLLMに書かせず、検索結果から確定したURLをここで本文に足す
     # (STAGE02 2-2「根拠を参照ページまで示せる」。採点側は delta を連結した
     #  文字列だけを見るため、WebUI表示のみに留めず本文に含める)。
+    answer_text = prev_text  # 履歴に残すのは引用を足す前の本文(下の保存処理を参照)
     citations = router.format_citations(routed) if routed is not None else ""
     if citations:
         prev_text += citations
@@ -325,15 +341,25 @@ async def _stream_chat(
             "schedule_hits": len(routed.schedule_hits),
             "missing": routed.missing,
             "sources": routed.sources,
+            "slots": None if routed.state is None else routed.state.describe(),
         },
     )
 
     # Persist the turn so the next request with this session_id continues it.
+    # The citation block is deliberately left out of the stored answer: it is
+    # rebuilt from the retrieval result on every turn, and keeping it would
+    # spend history budget on URLs the model must not write itself anyway.
     async with _sessions_lock:
-        sessions[session_id] = messages + [{"role": "assistant", "content": prev_text}]
+        sessions[session_id] = (
+            messages + [{"role": "assistant", "content": answer_text}]
+        )[-MAX_HISTORY_MESSAGES:]
         sessions.move_to_end(session_id)
+        if routed is not None and routed.state is not None:
+            states[session_id] = routed.state
+            states.move_to_end(session_id)
         while len(sessions) > MAX_SESSIONS:
-            sessions.popitem(last=False)
+            evicted, _ = sessions.popitem(last=False)
+            states.pop(evicted, None)
 
     yield "data: [DONE]\n\n"
 
