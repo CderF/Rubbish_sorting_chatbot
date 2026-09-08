@@ -25,7 +25,7 @@ Team B / Teamb4 (周 楚涵)
 | ファイル | 役割 |
 |---|---|
 | `app/stage04/notice_parser.py` | Markdown解析のみ。I/O・DB・ネットワークに触れない |
-| `app/stage04/store.py` | `app/data/db.py` の上に構築。`knowledge_sources` テーブルと、バージョン列の読み取り(`lookup_item_versions` / `version_window`)だけを追加する |
+| `app/stage04/store.py` | `app/data/db.py` の上に構築。`knowledge_sources` テーブルと、バージョン列の読み取り(`lookup_item_history` / `version_window`)だけを追加する |
 | `app/stage04/ingest.py` | `Notice` → `WasteItem` 変換、新旧リンク、`relink`、CLIエントリポイント |
 | `tests/stage04_ingest_test.py` | 単体テスト(パーサ・store・ingest・relink) |
 | `tests/stage04_eval.py` + `tests/fixtures/stage04_eval_cases.json` | 『質問 → 期待DB状態』評価(4-1/4-2、データ側)。`python -m tests.stage04_eval` でグレーダー風の表を出力 |
@@ -115,7 +115,7 @@ tl = store.item_timeline(conn, "スプレー缶")   # ← これ1本で足りる
 
 ### `item_timeline(conn, item_name) -> ItemTimeline` （推奨。本田さんはこれだけ使えばよい）
 
-`lookup_item_versions` + `version_window` を平坦化し、`notes` のパースや `is_current` /
+`lookup_item_history` + `version_window` を平坦化し、`notes` のパースや `is_current` /
 `superseded_by` の解釈を一切せずに「旧ルール → 新ルール」の時系列を扱えるようにしたもの。
 
 ```python
@@ -154,7 +154,7 @@ class ItemTimeline:
 
 ### 低レベル関数（`item_timeline` の内部。直接使ってもよい）
 
-- `lookup_item_versions(conn, item_name) -> list[WasteItem]` — 全バージョンを古い順。該当なしは空、例外なし。NFKC正規化済み
+- `lookup_item_history(conn, item_name) -> list[WasteItem]` — 全バージョンを古い順。該当なしは空、例外なし。NFKC正規化済み
 - `version_window(versions, index) -> (valid_from, valid_until)` — その版の有効期間。最新版の `valid_until` は `None`
 
 **なぜ別関数が必要か**: `app/data/lookup.py` の `lookup_item_exact` は `WHERE is_current = 1` を必ず付ける取り決め
@@ -166,7 +166,7 @@ class ItemTimeline:
 「今は燃えないごみ、2026年10月1日からは『かん・びん』の収集日」という2区間の案内になる。
 時系列の判定文言・プロンプトは本田さん担当。
 
-前身行がクロールに無くて `lookup_item_versions` が新行1件しか返さない品目でも、
+前身行がクロールに無くて `lookup_item_history` が新行1件しか返さない品目でも、
 その行の `notes` に「現行（早見表）の「◯◯」としての扱いは◯年◯月◯日まで有効。」が入っているので、
 旧分別と切替日は新行だけから取れる。
 
@@ -270,6 +270,6 @@ system prompt ルールを見て詰める。
 ## 10. チームへの確認事項
 
 1. **FANGさん**: `data_schema.md` §4 の `effective_from` は新行に書く解釈でよいか(「4.」参照)
-2. **FANGさん / 藤井さん**: `lookup_item_versions` を追加したこと。既存の `lookup_item_exact` 等の契約には手を触れていない
+2. **FANGさん / 藤井さん**: 全バージョン取得を `lookup_item_history`（FANGさん提案の名前）として追加。既存の `lookup_item_exact` 等の契約は不変
 3. **全員**: 配布ファイル由来の出典 `knowledge://…` の表記と、回答本文での見せ方
 4. **FANGさん**: クローラー結果と `お知らせ-4-2.md` の「現行」表記の食い違い(8件不一致・7件欠落)。クローラー側の問題か、お知らせが意図的にずらした採点データかを確認したい

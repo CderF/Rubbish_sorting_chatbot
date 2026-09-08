@@ -7,9 +7,10 @@ into the same DB the crawler builds. STAGE 04 only adds:
 * `knowledge_sources` — one row per ingested お知らせ section, carrying the fields
   the shared tables don't have (`content_hash` for idempotency, `source_type`,
   which `waste_items` row it produced). This means no change to Teamb2's schema.
-* `lookup_item_versions` / `version_window` — the read path requirement 4-2 needs.
-  `app/data/lookup.py` pins `WHERE is_current = 1` by agreement, so it can only
-  ever see the newest rule; these return the whole old→new chain instead.
+* `lookup_item_history` / `version_window` — the read path requirement 4-2 needs.
+  `app/data/lookup.py`'s `lookup_item_exact` pins `WHERE is_current = 1` by
+  agreement (issue #4), so it only ever sees the newest rule. `lookup_item_history`
+  is the separate function for the whole old→new chain (FANG's naming, PR #3).
 
 `valid_until` is not a column either: a rule runs until the day before its
 successor starts, derived in `version_window`.
@@ -161,7 +162,7 @@ def has_predecessor(conn: sqlite3.Connection, new_id: int) -> bool:
     return row is not None
 
 
-def lookup_item_versions(conn: sqlite3.Connection, item_name: str) -> "list[WasteItem]":
+def lookup_item_history(conn: sqlite3.Connection, item_name: str) -> "list[WasteItem]":
     """Every known version of one item, oldest first — the requirement 4-2 read
     path. No `WHERE is_current = 1`, unlike `app/data/lookup.py`: the caller gets
     the whole chain and decides what applies on a given date (see
@@ -183,7 +184,7 @@ def version_window(
     versions: "list[WasteItem]", index: int
 ) -> "tuple[date | None, date | None]":
     """(valid_from, valid_until) for `versions[index]` as returned by
-    `lookup_item_versions`. `valid_until` is derived — a rule runs until the day
+    `lookup_item_history`. `valid_until` is derived — a rule runs until the day
     before its successor starts; the last version has no end date.
     """
     valid_until = None
@@ -338,7 +339,7 @@ def knowledge_source_for_item(
 
 
 def item_timeline(conn: sqlite3.Connection, item_name: str) -> ItemTimeline:
-    """`lookup_item_versions` + `version_window`, flattened into an ordered list
+    """`lookup_item_history` + `version_window`, flattened into an ordered list
     of (rule, span) so the answer layer never has to parse `notes` or reason
     about `is_current` / `superseded_by`.
 
@@ -348,7 +349,7 @@ def item_timeline(conn: sqlite3.Connection, item_name: str) -> ItemTimeline:
                            its rule taken from `knowledge_sources.prior_disposal_method`
     * unknown item ....... found=False, no segments (caller falls back to 4-3)
     """
-    versions = lookup_item_versions(conn, item_name)
+    versions = lookup_item_history(conn, item_name)
     if not versions:
         return ItemTimeline(normalize_item_name(item_name), found=False, segments=())
 

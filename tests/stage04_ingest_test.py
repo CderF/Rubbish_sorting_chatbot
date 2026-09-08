@@ -151,7 +151,7 @@ def test_addition_notices_insert_standalone_rows(conn):
 
 def test_addition_row_carries_a_citable_source(conn):
     ingest_notice_file(ADDITIONS, conn, now=INGEST_AT)
-    versions = store.lookup_item_versions(conn, "ドローン")
+    versions = store.lookup_item_history(conn, "ドローン")
 
     assert len(versions) == 1
     item = versions[0]
@@ -181,9 +181,9 @@ def test_change_notices_supersede_the_existing_rows(seeded_conn):
     assert all(r["effective_from"] is None for r in old)
 
 
-def test_lookup_item_versions_returns_both_rules_oldest_first(seeded_conn):
+def test_lookup_item_history_returns_both_rules_oldest_first(seeded_conn):
     ingest_notice_file(CHANGES, seeded_conn, now=INGEST_AT)
-    versions = store.lookup_item_versions(seeded_conn, "スプレー缶")
+    versions = store.lookup_item_history(seeded_conn, "スプレー缶")
 
     assert len(versions) == 2
     old, new = versions
@@ -198,17 +198,17 @@ def test_lookup_item_versions_returns_both_rules_oldest_first(seeded_conn):
     assert "燃えないごみ" in new.notes  # what it used to be, kept for the answer
 
 
-def test_lookup_item_versions_ignores_the_is_current_flag(seeded_conn):
+def test_lookup_item_history_ignores_the_is_current_flag(seeded_conn):
     """The whole point of this function: `lookup_item_exact` pins is_current = 1
     and so can only see the future rule, which is what 4-2 must not do."""
     ingest_notice_file(CHANGES, seeded_conn, now=INGEST_AT)
     for item_name in (r["item_name"] for r in seed_rows()):
-        assert len(store.lookup_item_versions(seeded_conn, item_name)) == 2
+        assert len(store.lookup_item_history(seeded_conn, item_name)) == 2
 
 
 def test_version_window_derives_the_end_of_the_superseded_rule(seeded_conn):
     ingest_notice_file(CHANGES, seeded_conn, now=INGEST_AT)
-    versions = store.lookup_item_versions(seeded_conn, "乾電池")
+    versions = store.lookup_item_history(seeded_conn, "乾電池")
 
     old_from, old_until = store.version_window(versions, 0)
     new_from, new_until = store.version_window(versions, 1)
@@ -222,7 +222,7 @@ def test_version_window_derives_the_end_of_the_superseded_rule(seeded_conn):
 def test_query_is_nfkc_normalized(seeded_conn):
     ingest_notice_file(CHANGES, seeded_conn, now=INGEST_AT)
     # full-width alphanumerics / half-width kana must resolve to the same key
-    assert store.lookup_item_versions(seeded_conn, "  スプレー缶 ") != []
+    assert store.lookup_item_history(seeded_conn, "  スプレー缶 ") != []
 
 
 # --------------------------------------------------------------------------
@@ -259,8 +259,8 @@ def test_both_files_ingest_together(seeded_conn):
 
     # 15 seeded + 15 additions + 15 changes
     assert seeded_conn.execute("SELECT COUNT(*) FROM waste_items").fetchone()[0] == 45
-    assert len(store.lookup_item_versions(seeded_conn, "ホバーボード")) == 1
-    assert len(store.lookup_item_versions(seeded_conn, "スプレー缶")) == 2
+    assert len(store.lookup_item_history(seeded_conn, "ホバーボード")) == 1
+    assert len(store.lookup_item_history(seeded_conn, "スプレー缶")) == 2
 
 
 def test_knowledge_sources_lists_every_ingested_notice(conn):
@@ -311,7 +311,7 @@ def test_relink_connects_change_notices_after_the_crawler_runs(conn):
 
     assert len(result.linked) == 15
     assert result.still_unlinked == []
-    versions = store.lookup_item_versions(conn, "スプレー缶")
+    versions = store.lookup_item_history(conn, "スプレー缶")
     assert len(versions) == 2
     assert versions[0].disposal_method == "燃えないごみ"
     assert versions[0].is_current is False
@@ -366,7 +366,7 @@ def test_relink_via_cli(tmp_path, monkeypatch):
     assert rc == 0
 
     conn = store.connect(db_file)
-    assert len(store.lookup_item_versions(conn, "乾電池")) == 2
+    assert len(store.lookup_item_history(conn, "乾電池")) == 2
     conn.close()
 
 
@@ -400,7 +400,7 @@ def test_relink_flags_but_does_not_block_a_disposal_method_mismatch(conn):
 
     assert [n for n, _, _ in result.linked] == ["スプレー缶"]
     assert result.disputed == [("スプレー缶", "燃えないごみ", "家庭ごみ")]
-    versions = store.lookup_item_versions(conn, "スプレー缶")
+    versions = store.lookup_item_history(conn, "スプレー缶")
     assert len(versions) == 2  # link was still made
     # the notice's own account of the prior state is preserved on the new row
     assert "燃えないごみ" in versions[1].notes

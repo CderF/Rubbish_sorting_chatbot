@@ -127,7 +127,7 @@ def evaluate(conn, cases: dict, ingest_results, relink_result) -> EvalReport:
     # ---- 4-1 additions ----
     for c in cases["additions"]:
         name = c["item"]
-        vs = store.lookup_item_versions(conn, name)
+        vs = store.lookup_item_history(conn, name)
         if len(vs) != 1:
             r.expect(f"4-1 {name}", False, f"expected 1 version, got {len(vs)}")
             continue
@@ -146,7 +146,7 @@ def evaluate(conn, cases: dict, ingest_results, relink_result) -> EvalReport:
     # ---- 4-2 changes ----
     for c in cases["changes"]:
         name = c["item"]
-        vs = store.lookup_item_versions(conn, name)
+        vs = store.lookup_item_history(conn, name)
         ks = {
             row["anchor"]: row for row in store.list_knowledge_sources(conn)
         }.get(c["anchor"])
@@ -241,7 +241,7 @@ def evaluate(conn, cases: dict, ingest_results, relink_result) -> EvalReport:
     for c in cases["no_match"]:
         name = c["item"]
         try:
-            vs = store.lookup_item_versions(conn, name)
+            vs = store.lookup_item_history(conn, name)
             r.expect(f"no-match {name}", vs == [], f"expected [], got {len(vs)} rows")
         except Exception as e:  # noqa: BLE001 - the point is that it must not raise
             r.expect(f"no-match {name}", False, f"raised {type(e).__name__}: {e}")

@@ -7,7 +7,7 @@ Covers two assignment requirements:
 * **4-2** — a notice that changes an existing rule is inserted *alongside* the row
   it replaces: the new row carries `effective_from`, the old row is flagged
   `is_current = 0` with `superseded_by` pointing at the new one. Both stay
-  readable through `store.lookup_item_versions`, which is what lets the answer
+  readable through `store.lookup_item_history`, which is what lets the answer
   layer say what applies now, from when it changes, and to what — instead of
   asserting either rule on its own.
 
