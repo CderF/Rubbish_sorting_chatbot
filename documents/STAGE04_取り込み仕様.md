@@ -160,6 +160,7 @@ class TimelineSegment:
     synthesized: bool             # 行が無く、お知らせの記述から復元した区間か
     disputed: bool                # 早見表の行とお知らせの言う現行が食い違う
     hayamihyo_disposal_method: str | None  # disputed のとき、早見表側の値
+    matched_item_name: str | None # 早見表がより具体的な複合名で持つとき、その名前
 
 @dataclass(frozen=True)
 class ItemTimeline:
@@ -227,13 +228,25 @@ STAGE04で追加した3つ目のテーブル。共有2テーブルには無い�
 ## 8. 実行方法
 
 ```bash
-python -m app.data.db                                          # 先にクローラーで早見表DBを構築
-python -m app.stage04.ingest knowledge/incoming/お知らせ-4-1.md knowledge/incoming/お知らせ-4-2.md
-python -m app.stage04.ingest --relink                          # 早見表を後から入れた場合
+make knowledge     # crawl → ingest → relink → ベクトルインデックス再構築(全部)
 ```
 
-DBパスは `app/data/db.py` と共通(既定 `var/kitakyushu_waste.db`、`--db` か `DB_PATH` で上書き可)。
-同じファイルを二度流しても新規行は増えない(`content_hash` で判定)。
+個別に:
+
+```bash
+make crawl         # = python -m app.data.db
+make ingest        # = python -m app.stage04.ingest knowledge/incoming/*.md
+make relink        # = python -m app.stage04.ingest --relink
+make index         # = python -m app.rag.vector_store
+```
+
+**データ層(`app/data/`)や `knowledge/incoming/` を変えたら `make knowledge` を通す。**
+`ingest`+`relink` を飛ばすと 4-2(出し方の変更)が空になり、`index` を飛ばすと
+4-1 の追加品目が 4-3 の類似検索に出てこない。B1 では systemd の `ExecStartPre` が
+起動時に `ingest`+`relink`(冪等)だけは流し直す(クロールとインデックス再構築はしない)。
+
+DBパスは `app/data/db.py` と共通(既定 `var/kitakyushu_waste.db`、`DB_PATH` で上書き可)。
+同じお知らせを二度流しても新規行は増えない(`content_hash` で判定)。
 
 ```bash
 python -m pytest tests/stage04_ingest_test.py -v

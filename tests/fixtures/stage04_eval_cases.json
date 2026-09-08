@@ -10,7 +10,8 @@
     "  method が notice_prior と異なるケース(スプレー缶)は disputed 検出も確認する",
     "",
     "answer_must_contain / answer_must_not_be_only: 回答文評価(本田さん)用の期待値。",
-    "  tests.stage04_eval.evaluate_answers(conn, cases, answer_fn) が使う。未実装なら skip。"
+    "  tests.stage04_eval.evaluate_answers(conn, cases, answer_fn) が使う。未実装なら skip。",
+    "hayamihyo.stored_as: 早見表がこの品目を複合名で持つ場合の実際の item_name。設定すると seed 行をその名前で作り、部分一致リンク + matched_item_name を検証する。"
   ],
   "reference_date": "2026-09-08",
   "change_start": "2026-10-01",
@@ -476,7 +477,10 @@
         "電池類回収ボックス",
         "絶縁"
       ],
-      "hayamihyo": null,
+      "hayamihyo": {
+        "method": "電池類。回収ボックスへ。絶縁すれば家庭ごみにも出せる",
+        "stored_as": "乾電池(充電式でないもの)"
+      },
       "answer_must_contain": [
         "電池類。回収ボックスへ。絶縁すれば家庭ごみにも出せる",
         "2026",
