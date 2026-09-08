@@ -101,6 +101,37 @@
              line-height:1.5;background:rgba(184,134,11,.14);color:var(--warn);
              border:1px solid rgba(184,134,11,.35)}
 
+  /* ---- 回答の根拠パネル (STAGE02 2-2) ---- */
+  .srcbox{margin-top:9px;border:1px solid var(--border);border-radius:9px;background:var(--panel);
+          font-size:12.5px;overflow:hidden;max-width:min(760px,92%)}
+  .srchead{display:flex;align-items:center;gap:8px;padding:7px 11px;cursor:pointer;
+           user-select:none;color:var(--muted)}
+  .srchead:hover{color:var(--text)}
+  .srchead .caret{transition:transform .15s;display:inline-block;font-size:10px}
+  .srcbox.open .srchead .caret{transform:rotate(90deg)}
+  .srchead .stage{margin-left:auto;font-size:11px;padding:2px 8px;border-radius:10px;
+                  font-weight:600;white-space:nowrap}
+  .stage-exact{background:rgba(28,140,74,.15);color:var(--ok)}
+  .stage-partial{background:var(--accent-soft);color:var(--accent)}
+  .stage-vector{background:rgba(184,134,11,.16);color:var(--warn)}
+  .stage-none{background:rgba(127,127,127,.15);color:var(--muted)}
+  .srcbody{display:none;padding:0 11px 11px;border-top:1px solid var(--border)}
+  .srcbox.open .srcbody{display:block}
+  .srcnote{color:var(--muted);font-size:11.5px;line-height:1.6;margin:9px 0 0}
+  .srcsec{margin-top:11px}
+  .srcsec h4{margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;
+             color:var(--muted);font-weight:650}
+  .srcrec{border:1px solid var(--border);border-radius:7px;padding:8px 10px;margin-bottom:6px;
+          background:var(--bg)}
+  .srcrec .nm{font-weight:650;margin-bottom:3px}
+  .srcrec .kv{display:flex;gap:7px;line-height:1.6}
+  .srcrec .kv b{color:var(--muted);font-weight:500;flex-shrink:0;min-width:3.5em}
+  .srcrec .pg{margin-top:5px;font-size:11.5px}
+  .srcrec .pg a{color:var(--accent);word-break:break-all}
+  .srcmeta{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}
+  .srcmeta span{font-size:11px;padding:2px 8px;border-radius:10px;background:var(--bg);
+                border:1px solid var(--border);color:var(--muted)}
+
   /* ---- knowledge browser (STAGE02 2-3) ---- */
   .kbtn{border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:8px;
         padding:5px 11px;font-size:12px;cursor:pointer;font-family:inherit}
@@ -325,7 +356,105 @@ function addMessage(role, text, imgDataUrl){
   wrap.appendChild(col);
   $('messages').appendChild(wrap);
   $('messages').scrollTop = $('messages').scrollHeight;
+  span.sourceHost = col;   // 根拠パネルをこの下にぶら下げる
   return span;
+}
+
+/* ---------- 回答の根拠パネル (STAGE02 2-2) ----------
+   本文末尾の引用URLだけでは「どのレコードを、どの経路で引いたか」が分からない。
+   /ui/chat が返す sources イベントを、その回答の直下に折りたたみで表示する。 */
+const STAGE_NOTE = {
+  exact:   '早見表の品名と完全に一致しました。',
+  partial: '品名の一部が一致しました。質問した品目と違う行が混ざることがあります。',
+  vector:  '完全一致・部分一致がどちらも0件だったため、意味の近い品目を検索しました。'
+         + '質問した品目そのものではない行が含まれることがあります。'
+};
+
+function renderSources(host, src){
+  if (!host || !src) return;
+
+  const stage = src.match_stage || 'none';
+  const label = src.match_stage_label || (src.found ? '検索結果' : '該当なし');
+  const nItem = (src.items || []).length;
+  const nSched = (src.schedules || []).length;
+
+  const box = document.createElement('div');
+  box.className = 'srcbox';
+
+  const head = document.createElement('div');
+  head.className = 'srchead';
+  head.innerHTML = '<span class="caret">▶</span><span>根拠 '
+    + (nItem + nSched) + ' 件</span>'
+    + '<span class="stage stage-' + escapeHtml(stage) + '">' + escapeHtml(label) + '</span>';
+  head.onclick = () => box.classList.toggle('open');
+  box.appendChild(head);
+
+  const body = document.createElement('div');
+  body.className = 'srcbody';
+
+  if (STAGE_NOTE[src.match_stage]){
+    const note = document.createElement('p');
+    note.className = 'srcnote';
+    note.textContent = STAGE_NOTE[src.match_stage];
+    body.appendChild(note);
+  }
+
+  if (nItem){
+    const sec = document.createElement('div');
+    sec.className = 'srcsec';
+    sec.innerHTML = '<h4>分別早見表</h4>' + src.items.map(r =>
+      '<div class="srcrec">'
+      + '<div class="nm">' + escapeHtml(r.item_name || '') + '</div>'
+      + '<div class="kv"><b>出し方</b><span>' + escapeHtml(r.disposal_method || '') + '</span></div>'
+      + (r.notes ? '<div class="kv"><b>備考</b><span>' + escapeHtml(r.notes) + '</span></div>' : '')
+      + (r.source_url ? '<div class="pg"><a href="' + escapeHtml(r.source_url)
+          + '" target="_blank" rel="noopener noreferrer">'
+          + escapeHtml(r.source_page_title || r.source_url) + '</a></div>' : '')
+      + '</div>'
+    ).join('');
+    body.appendChild(sec);
+  }
+
+  if (nSched){
+    const sec = document.createElement('div');
+    sec.className = 'srcsec';
+    sec.innerHTML = '<h4>資源とごみの収集日</h4>' + src.schedules.map(r =>
+      '<div class="srcrec">'
+      + '<div class="nm">' + escapeHtml((r.ward || '') + (r.town || '')) + '</div>'
+      + '<div class="kv"><b>種別</b><span>' + escapeHtml(r.waste_type || '') + '</span></div>'
+      + '<div class="kv"><b>収集日</b><span>' + escapeHtml(r.weekday || '') + '</span></div>'
+      + (r.source_url ? '<div class="pg"><a href="' + escapeHtml(r.source_url)
+          + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(r.source_url) + '</a></div>' : '')
+      + '</div>'
+    ).join('');
+    body.appendChild(sec);
+  }
+
+  if (!nItem && !nSched){
+    const p = document.createElement('p');
+    p.className = 'srcnote';
+    p.textContent = '検索でヒットしたレコードはありません。'
+      + 'この回答は北九州市のデータに基づいていないため、内容を鵜呑みにしないでください。';
+    body.appendChild(p);
+  }
+
+  // 何を手がかりに検索したか
+  const d = src.detected || {};
+  const chips = [];
+  if (d.item)  chips.push((d.from_image ? '画像から抽出: ' : '品名: ') + d.item);
+  if (d.ward)  chips.push('区: ' + d.ward);
+  if (d.town)  chips.push('町名: ' + d.town);
+  (src.missing || []).forEach(m => chips.push('不足: ' + m));
+  if (chips.length){
+    const meta = document.createElement('div');
+    meta.className = 'srcmeta';
+    meta.innerHTML = chips.map(c => '<span>' + escapeHtml(c) + '</span>').join('');
+    body.appendChild(meta);
+  }
+
+  box.appendChild(body);
+  host.appendChild(box);
+  $('messages').scrollTop = $('messages').scrollHeight;
 }
 
 /* ---------- sending ---------- */
@@ -347,6 +476,7 @@ async function send(){
   const target = addMessage('bot', '');
   target.parentElement.classList.add('cursor');
   let raw = '';
+  let sources = null;
 
   try{
     const res = await fetch('/ui/chat', {
@@ -371,6 +501,8 @@ async function send(){
         try{
           const obj = JSON.parse(payloadStr);
           if (obj.delta) raw += obj.delta;
+          // /ui/chat だけが返す根拠イベント(採点用の /chat には流れない)
+          if (obj.sources){ sources = obj.sources; continue; }
         }catch(e){
           raw += payloadStr;
         }
@@ -379,6 +511,7 @@ async function send(){
       }
     }
     if (!raw) target.textContent = '(応答が空でした)';
+    renderSources(target.sourceHost, sources);
   }catch(err){
     target.textContent = '通信エラー: ' + err.message;
   }finally{
@@ -412,6 +545,13 @@ $('fileInput').onchange = e => {
 
 /* ---------- input behaviour ---------- */
 $('input').addEventListener('keydown', e => {
+  // 日本語入力の「変換確定のEnter」と「送信のEnter」を区別する。
+  // IMEで変換中に押したEnterも keydown を発火させるため、これを送信として
+  // 扱うと (1) 変換前のかな文字がそのまま送信され、(2) その直後にIMEが確定
+  // 文字を空になった入力欄へ書き戻すので、入力欄に文字が残ってしまう。
+  // isComposing が変換中を示す。keyCode 229 は同じ状況を示す古い指標で、
+  // isComposing を持たない環境向けの保険。
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }
 });
 $('input').addEventListener('input', e => {

@@ -73,13 +73,15 @@ def test_classify_item_match_is_name_based_not_tier_based(monkeypatch):
     assert _classify_item_match("電動スケートボード", [_rec("電動キックボード")]) == "analogy"
 
 
-def test_search_item_returns_a_plain_list(monkeypatch):
+def test_search_item_returns_hits_and_stage(monkeypatch):
+    # the stage is kept for the WebUI 根拠 panel (#12); the answer logic uses
+    # _classify_item_match instead.
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: _rec(n))
-    assert _search_item("テレビ") == [_rec("テレビ")]
+    assert _search_item("テレビ") == ([_rec("テレビ")], "exact")
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
     monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [])
-    assert _search_item("宇宙服") == []
+    assert _search_item("宇宙服") == ([], None)
 
 
 # --- the caveat is scoped to the item section (blocker 2) ------------

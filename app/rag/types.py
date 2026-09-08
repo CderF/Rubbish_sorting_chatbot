@@ -95,3 +95,17 @@ class RoutedAnswer:
 
     detected_ward: str | None = None
     detected_town: str | None = None
+
+    item_match_stage: str | None = None
+    """`item_hits` がどの検索段で得られたか。
+
+    早見表パスは 完全一致 -> 部分一致 -> ベクトル類似度 の3段フォールバック
+    (設計提案書 3-3)。どの段まで落ちたかで結果の確からしさが変わる:
+    完全一致は質問された品目そのもの、ベクトル類似度は「意味が近い別の品目」
+    が混ざりうる。WebUIの根拠表示でこれを区別するために保持する。
+
+    値は "exact" / "partial" / "vector" のいずれか。ヒット0件なら None。
+    """
+
+    item_from_image: bool = False
+    """`detected_item` が画像分類パス由来かどうか(STAGE03 3-2)。"""
