@@ -146,16 +146,16 @@ def handle_query(prompt: str, img_b64: str | None) -> RoutedAnswer:
 ### 4-2. 応用層(Teamb3 藤井誠人)
 
 **STAGE02**
-- [ ] 説明ページのクローリング+チャンク化
-- [ ] `intfloat/multilingual-e5-small` セットアップ + Chroma構築(`app/rag/vector_store.py`)
-- [ ] `vector_search_items` / `vector_search_explanations` 実装
-- [ ] 意図解析・ルーティングロジック初版(`app/rag/router.py`、当初はデータ層のスタブ関数でモック可)
-- [ ] `/chat` への統合(`app/server.py` 改修)、SSEレスポンスへの引用付与
-- [ ] WebUI: ナレッジ一覧・内容ビューア(2-3要件)
+- [x] 説明ページのクローリング+チャンク化(PR #9)
+- [x] `intfloat/multilingual-e5-small` セットアップ + Chroma構築(`app/rag/vector_store.py`、PR #9)
+- [x] `vector_search_items` / `vector_search_explanations` 実装(PR #9。`router.py` の3段目フォールバックへの実結合はまだ、`_search_item` は現状完全一致→部分一致の2段のまま)
+- [ ] 意図解析・ルーティングロジック初版(`app/rag/router.py`、当初はデータ層のスタブ関数でモック可)(PR #8で実装済み、マージ待ち)
+- [ ] `/chat` への統合(`app/server.py` 改修)、SSEレスポンスへの引用付与(PR #8で実装済み、マージ待ち)
+- [ ] WebUI: ナレッジ一覧・内容ビューア(2-3要件)(PR #8で実装済み、マージ待ち)
 
 **STAGE03**
-- [ ] `classify_image_to_item_name` 実装(`app/rag/image_classify.py`)
-- [ ] `router.py` に3-1(品名+地区統合)・3-2(画像分岐)ロジック追加
+- [x] `classify_image_to_item_name` 実装(`app/rag/image_classify.py`、PR #9。`router.py` の画像分岐への実結合はまだ)
+- [ ] `router.py` に3-1(品名+地区統合)・3-2(画像分岐)ロジック追加(3-1はPR #8で実装済み・マージ待ち、3-2の画像分岐は本項目のまま未着手)
 - [ ] WebUI: 画像アップロード入力欄の追加
 - [ ] 未識別時のフォールバック文言実装(3-7の原則、`documents/stage02&03_proposal.md` 3-7章参照)
 
