@@ -255,7 +255,9 @@ async def _route_safely(prompt: str, img: str | None):
 # --------------------------------------------------------------------------
 # streaming
 # --------------------------------------------------------------------------
-async def _stream_chat(session_id: str, prompt: str, img: str | None):
+async def _stream_chat(
+    session_id: str, prompt: str, img: str | None, with_sources: bool = False
+):
     request_id = f"{session_id}-{uuid.uuid4().hex[:8]}"
     sampling_params = SamplingParams(temperature=0.3, max_tokens=MAX_TOKENS)
 
@@ -302,6 +304,13 @@ async def _stream_chat(session_id: str, prompt: str, img: str | None):
         prev_text += citations
         yield f"data: {json.dumps({'delta': citations}, ensure_ascii=False)}\n\n"
 
+    # 根拠の詳細(どのレコードを、どの検索段で引いたか)は WebUI だけに流す。
+    # 採点サーバーは delta を連結した文字列で採点するため、/chat のストリームに
+    # 余計なイベントを混ぜない(仕様は data: {"delta": ...} のみ)。
+    if with_sources and routed is not None:
+        payload = {"sources": router.describe_sources(routed)}
+        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
     end = time.perf_counter()
     last_timing.update(
         first_token_s=round((first_token_at or end) - start, 3),
@@ -329,9 +338,11 @@ async def _stream_chat(session_id: str, prompt: str, img: str | None):
     yield "data: [DONE]\n\n"
 
 
-def _sse(session_id: str, prompt: str, img: str | None) -> StreamingResponse:
+def _sse(
+    session_id: str, prompt: str, img: str | None, with_sources: bool = False
+) -> StreamingResponse:
     return StreamingResponse(
-        _stream_chat(session_id, prompt, img),
+        _stream_chat(session_id, prompt, img, with_sources),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -349,9 +360,13 @@ async def chat(request: Request):
 
 @app.post("/ui/chat")
 async def ui_chat(request: Request, _=Depends(require_login)):
-    """Same generation path as /chat, for the password-protected WebUI."""
+    """Same generation path as /chat, for the password-protected WebUI.
+
+    WebUI にだけ、回答の根拠(引いたレコードと検索経路)を追加のSSEイベントで
+    返す。採点用の /chat は仕様どおり delta のみ。
+    """
     session_id, prompt, img = await _parse_request(request)
-    return _sse(session_id, prompt, img)
+    return _sse(session_id, prompt, img, with_sources=True)
 
 
 # --------------------------------------------------------------------------
