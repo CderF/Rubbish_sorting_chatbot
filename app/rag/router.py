@@ -64,10 +64,10 @@ def using_stubs() -> bool:
 
 
 # --- STAGE04 (要件4-2: 出し方の変更) の解決 -------------------------------
-# app/stage04/lookup.py は PR #5。未マージ環境でも router.py が import できる
+# app/notices/lookup.py は PR #5。未マージ環境でも router.py が import できる
 # よう、無い場合は「変更なし」を返すフォールバックに留める。
 try:
-    from app.stage04.lookup import pending_change  # type: ignore[import-not-found]
+    from app.notices.lookup import pending_change  # type: ignore[import-not-found]
 except ImportError:
     def pending_change(item_name: str, as_of):  # noqa: ARG001
         return None

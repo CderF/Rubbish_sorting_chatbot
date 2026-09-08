@@ -15,9 +15,9 @@ from pathlib import Path
 import pytest
 
 from app.data.schema import WasteItem
-from app.stage04 import store
-from app.stage04.ingest import ingest_notice_file, relink
-from app.stage04.notice_parser import parse_notice_file
+from app.notices import store
+from app.notices.ingest import ingest_notice_file, relink
+from app.notices.notice_parser import parse_notice_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 KNOWLEDGE = REPO_ROOT / "knowledge" / "incoming"
@@ -351,7 +351,7 @@ def test_relink_never_makes_notices_supersede_each_other(conn):
 
 
 def test_relink_via_cli(tmp_path, monkeypatch):
-    from app.stage04 import ingest as ingest_mod
+    from app.notices import ingest as ingest_mod
 
     db_file = tmp_path / "kb.db"
     conn = store.connect(db_file)
