@@ -842,6 +842,14 @@ def _shared_run_len(a: str, b: str) -> int:
 # のときだけ手がかりとして採る。
 _KANA_ONLY_RE = re.compile(r"^[ぁ-ん]+$")
 _PAREN_TAIL_RE = re.compile(r"[(（].*$")
+_KANJI_RE = re.compile(r"[一-龥々]")
+# 末尾一致(上位語)判定で、品名の本体ではない「サイズ・動力・用途」の接頭語。
+# これらを剥がした残りに内容語(漢字2つ以上)が残るなら、末尾一致でも別品目。
+_STRENGTH_PREFIX_MODS = (
+    "電動", "電気", "手動", "充電式", "コードレス", "ワイヤレス", "ポータブル",
+    "携帯用", "携帯", "家庭用", "業務用", "小型", "大型", "ミニ", "卓上",
+    "折り畳み式", "折りたたみ式", "使い捨て", "使い捨ての",
+)
 
 
 def _base_name(s: str) -> str:
@@ -865,7 +873,24 @@ def _relation_strength(query: str, cand: str) -> int:
     c = _base_name(cand)
     if not q or not c or len(c) < 2:
         return 0
-    if q == c or q.endswith(c) or c.endswith(q):
+    if q == c or c.endswith(q):
+        return 2
+    if q.endswith(c):
+        # 「時計」「電池」「電球」「傘」等、2文字までの語は広い分別カテゴリ
+        # そのものなので末尾一致で十分信頼できる。
+        if len(c) <= 2:
+            return 2
+        # 3文字以上の末尾一致は、修飾語を剥がした残りに漢字が2つ以上あるなら
+        # 「上位カテゴリ」ではなく別品目を指す内容語(「電動鼻毛カッター」の
+        # 「鼻毛」、「電動歯間洗浄器」の「歯間」)。分別の根拠には弱い。
+        prefix = q[: -len(c)]
+        for mod in sorted(_STRENGTH_PREFIX_MODS, key=len, reverse=True):
+            if prefix.startswith(mod):
+                prefix = prefix[len(mod) :]
+                break
+        prefix = prefix.strip("のなというごと 　")
+        if len(_KANJI_RE.findall(prefix)) >= 2:
+            return 1
         return 2
     run = _shared_run_len(q, c)
     if run < 2:
