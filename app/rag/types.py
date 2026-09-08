@@ -68,6 +68,10 @@ class RoutedAnswer:
     found: bool = False
     """いずれかの検索パスがヒットしたか。False なら憶測を禁じる指示を出す。"""
 
+    timeline_change: bool = False
+    """STAGE04 4-2: この品目は将来出し方が変わる。旧・新・切替日を時系列で
+    案内させ、どちらか一方だけで断定させない。"""
+
     missing: list[str] = field(default_factory=list)
     """回答に不足している入力項目(例: ["町名"])。
 

@@ -228,9 +228,12 @@ tl = lookup.item_timeline(item_name)              # ItemTimeline（found=False �
 tl = lookup.pending_change(item_name, date.today())  # 切替が今日以降にあるときだけ ItemTimeline、なければ None
 ```
 
-### `router.py` への1ブロック追加(藤井さん・本田さん向け、未適用)
+### `router.py` への 4-2 反映 — **PR #5 で実装済み**
 
-`_blocking_route` の `ans.item_hits` を埋めた直後に:
+`_blocking_route` の末尾で `_apply_timeline(ans, item_name)` を呼び、`pending_change` が
+タイムラインを返したら context に「現在: 旧 / YYYY-MM-DD から: 新」ブロックを足し、
+`ans.timeline_change` を立て、`build_system_prompt` が時系列ルールを1行追加する。
+参考(実装の要点):
 
 ```python
 from app.stage04.lookup import pending_change
@@ -247,8 +250,8 @@ if tl is not None:
     ans.sources = _dedupe(ans.sources + [s.source_url for s in tl.segments])
 ```
 
-system prompt 側に「適用期間が複数あるときは時系列で説明し、片方だけで断定しない」
-の一文を足す(`build_system_prompt` の `_RULES_WITH_CONTEXT`)。回答文言の詰めは本田さん。
+回答文言のトーン調整(自然な言い回し)は本田さんが `_apply_timeline` の出力文と
+system prompt ルールを見て詰める。
 
 ### WebUI ナレッジ一覧 — 対応済み
 
@@ -258,8 +261,9 @@ system prompt 側に「適用期間が複数あるときは時系列で説明し
 
 ## 9. まだやっていないこと(担当境界)
 
-- **`app/rag/router.py` への1ブロック追加(§8-2)は未適用。** これを入れると 4-2 が `/chat` に反映される。
-  `app/stage04/lookup.py` まで用意済みなので、藤井さん側は import 1行 + 1ブロックで済む。回答文言は本田さん。
+- **4-3(類似品物の但し書き)は未対応。** `_search_item` がヒット段階(exact/partial/similar)を
+  `RoutedAnswer` に立て、`build_system_prompt` に「similar のときは『類似する◯◯に準じると…。
+  確実な分別は市に確認を』と書く」規則を足す。`_search_item` の1行変更が要るので藤井さんと相談。
 - 4-3(早見表に無い品目の類似品物フォールバック) — 本田さん担当
 - 早見表・収集日クローラー(issue #4) — Teamb2担当
 

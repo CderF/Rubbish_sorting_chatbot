@@ -128,3 +128,55 @@ def test_notice_source_detail_shows_each_notice(db):
     assert "スプレー缶" in names and "乾電池" in names
     spray = next(row for row in detail["rows"] if row[0] == "スプレー缶")
     assert spray[2] == "2026-10-01"  # 適用開始
+
+
+# --- app/rag/router.py : 4-2 が /chat に反映される ------------------------
+def test_router_surfaces_both_rules_for_a_pending_change(db):
+    from app.rag import router
+    from app.rag.router import _blocking_route, build_system_prompt
+
+    importlib.reload(router)
+    from app.rag.router import _blocking_route, build_system_prompt
+
+    ans = _blocking_route("スプレー缶はどう捨てますか")
+
+    assert ans.timeline_change is True
+    assert "現在(〜2026-09-30): 燃えないごみ" in ans.context     # 旧ルール(お知らせの記述)
+    assert "2026-10-01 から:" in ans.context                    # 切替日 + 新ルール
+    assert "かん・びん" in ans.context                           # 新ルール本文
+    assert "家庭ごみ" in ans.context                             # disputed: 早見表側も注記
+    assert "knowledge://お知らせ-4-2.md#お知らせ-01-スプレー缶" in ans.sources
+    assert "どちらか一方だけを答えて断定しない" in build_system_prompt(ans)
+
+
+def test_router_leaves_unchanged_items_alone(db):
+    from app.rag import router
+
+    importlib.reload(router)
+    from app.rag.router import _blocking_route
+
+    for prompt in ("ホバーボードはどう捨てますか", "テレビの捨て方"):
+        ans = _blocking_route(prompt)
+        assert ans.timeline_change is False
+        assert "出し方が変わります" not in ans.context
+
+
+def test_router_imports_without_stage04_lookup(monkeypatch):
+    """PR #5 未マージ環境でも router.py が壊れないこと(guarded import)。"""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "app.stage04.lookup":
+            raise ImportError("simulated: PR #5 not merged")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    import importlib
+
+    import app.rag.router as router
+
+    importlib.reload(router)
+    assert router.pending_change("スプレー缶", date(2026, 9, 8)) is None
+    importlib.reload(router)  # restore the real import for other tests

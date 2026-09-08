@@ -13,6 +13,7 @@ import asyncio
 import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 
 from app.rag.types import ItemRecord, RoutedAnswer, ScheduleRecord
 
@@ -60,6 +61,16 @@ except ImportError:
 def using_stubs() -> bool:
     """データ層がまだダミーかどうか。WebUI の警告表示に使う。"""
     return _USING_STUBS
+
+
+# --- STAGE04 (要件4-2: 出し方の変更) の解決 -------------------------------
+# app/stage04/lookup.py は PR #5。未マージ環境でも router.py が import できる
+# よう、無い場合は「変更なし」を返すフォールバックに留める。
+try:
+    from app.stage04.lookup import pending_change  # type: ignore[import-not-found]
+except ImportError:
+    def pending_change(item_name: str, as_of):  # noqa: ARG001
+        return None
 
 
 # --- 意図解析(v1: 文字列ヒューリスティック) --------------------------------
@@ -214,6 +225,39 @@ def _search_item(item_name: str) -> list[ItemRecord]:
     return vector_search_items(item_name, top_k=3)
 
 
+def _apply_timeline(ans: RoutedAnswer, item_name: str, today: "date | None" = None) -> None:
+    """STAGE04 4-2: この品目に「これから出し方が変わる」予定があれば、旧ルール・
+    新ルール・切替日をまとめて context に足す。
+
+    データ層の `lookup_item_exact` は `is_current = 1` しか返さないので、これを
+    足さないと変更予定の品目は新ルールしか LLM に届かず「片方だけで断定」して
+    しまう(要件4-2 が禁じる状態)。
+    """
+    tl = pending_change(item_name, today or date.today())
+    if tl is None:
+        return
+
+    ref = today or date.today()
+    now_seg = tl.segment_on(ref)
+    future = [s for s in tl.segments if s.valid_from and s.valid_from > ref]
+
+    lines = ["## この品目は出し方が変わります(旧・新の両方を必ず時系列で案内する)"]
+    if now_seg is not None:
+        until = now_seg.valid_until.isoformat() if now_seg.valid_until else "当面"
+        lines.append(f"- 現在(〜{until}): {now_seg.disposal_method}")
+        if now_seg.disputed and now_seg.hayamihyo_disposal_method:
+            lines.append(
+                f"  (早見表には「{now_seg.hayamihyo_disposal_method}」と記載。"
+                "お知らせの内容を優先する)"
+            )
+    for seg in future:
+        lines.append(f"- {seg.valid_from.isoformat()} から: {seg.disposal_method}")
+
+    ans.context = (ans.context + "\n\n" + "\n".join(lines)).strip()
+    ans.sources = _dedupe(ans.sources + [s.source_url for s in tl.segments])
+    ans.timeline_change = True
+
+
 def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAnswer:
     """同期の検索処理。`handle_query` からスレッドで呼ばれる。
 
@@ -259,6 +303,8 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         + [r.source_url for r in ans.schedule_hits]
     )
     ans.context = _build_context(ans)
+    if item_name:
+        _apply_timeline(ans, item_name)
     return ans
 
 
@@ -370,6 +416,13 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
         parts.append(_RULES_WITH_CONTEXT)
     else:
         parts.append(_RULES_NO_CONTEXT)
+
+    if ans.timeline_change:
+        parts.append(
+            "- この品目は将来出し方が変わる。「現在は〜。YYYY年MM月DD日からは〜」の"
+            "形で、旧ルールと新ルールの両方を時系列に沿って説明する。"
+            "どちらか一方だけを答えて断定しない。\n"
+        )
 
     if ans.missing:
         parts.append(
