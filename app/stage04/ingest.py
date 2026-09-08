@@ -42,6 +42,16 @@ from app.data.schema import WasteItem
 from app.stage04 import store
 from app.stage04.notice_parser import Notice, parse_notice_file
 
+# 語順違い(使い捨てライター→ライター)は LIKE では拾えないので、任意でベクトル
+# 検索(issue #7)を使う。未インストール/インデックス未構築でも動くようフォール
+# バック。vector_search_items は現状スコアを返さないため、ヒットしても自動リンク
+# せず人手レビュー行き(RelinkResult.vector_candidates)にとどめる。
+try:
+    from app.rag.vector_store import vector_search_items  # type: ignore[import-not-found]
+except ImportError:
+    def vector_search_items(query: str, top_k: int = 3):  # noqa: ARG001
+        return []
+
 SOURCE_TYPE = "notice"
 
 
@@ -103,6 +113,9 @@ class RelinkResult:
     still_unlinked: "list[str]" = field(default_factory=list)
     partial_links: "list[tuple[str, str]]" = field(default_factory=list)
     ambiguous: "list[tuple[str, tuple[str, ...]]]" = field(default_factory=list)
+    # vector search found candidates for a name LIKE can't reach; NOT linked
+    # (no similarity score yet) — for human review. (notice_name, candidate names).
+    vector_candidates: "list[tuple[str, tuple[str, ...]]]" = field(default_factory=list)
     # linked, but the crawled 早見表 row's disposal_method does not corroborate
     # the notice's stated 現行 treatment — surfaced, not blocked.
     disputed: "list[tuple[str, str, str]]" = field(default_factory=list)
@@ -120,6 +133,11 @@ class RelinkResult:
         for name, cands in self.ambiguous:
             line += (
                 f"\n  曖昧: お知らせ「{name}」→ 複数該当（{'、'.join(cands)}）。人手で確認"
+            )
+        for name, cands in self.vector_candidates:
+            line += (
+                f"\n  ベクトル候補: お知らせ「{name}」→ {'、'.join(cands)}"
+                "（スコア未対応のため自動リンクせず。人手で確認）"
             )
         for name, notice_says, crawl_says in self.disputed:
             line += (
@@ -259,21 +277,34 @@ def ingest_notice_file(
     )
 
 
-def relink(conn: sqlite3.Connection) -> RelinkResult:
+def relink(conn: sqlite3.Connection, *, use_vector: bool = False) -> RelinkResult:
     """Link change-notices that had no predecessor at ingest time to the 早見表
     row that now exists (e.g. after `app/data/crawler.py` populated it).
 
     Safe to run repeatedly: rows that are already linked are skipped by
-    `store.unlinked_change_sources`.
+    `store.unlinked_change_sources`. With `use_vector=True`, names that exact +
+    LIKE can't reach (語順違い: 使い捨てライター→ライター) are looked up with
+    `vector_search_items`; the hits are reported in `vector_candidates` for a
+    human — never auto-linked, since there is no similarity score to threshold on.
     """
     result = RelinkResult()
     for row in store.unlinked_change_sources(conn):
-        new_id = row["produced_item_id"]
-        match = store.find_current_predecessor(
-            conn, row["item_name"], exclude_id=new_id
-        )
+        name, new_id = row["item_name"], row["produced_item_id"]
+        match = store.find_current_predecessor(conn, name, exclude_id=new_id)
+
+        if match.item is None and not match.candidates and use_vector:
+            hits = [
+                h.item_name
+                for h in vector_search_items(name, top_k=3)
+                if not h.source_url.startswith(store.KNOWLEDGE_SCHEME)
+            ]
+            if hits:
+                result.vector_candidates.append((name, tuple(hits)))
+                result.still_unlinked.append(name)
+                continue
+
         _record_link(
-            result, row["item_name"], row["prior_disposal_method"], match, new_id, conn
+            result, name, row["prior_disposal_method"], match, new_id, conn
         )
     conn.commit()
     return result
@@ -288,6 +319,12 @@ def main(argv: "list[str] | None" = None) -> int:
         "--relink",
         action="store_true",
         help="取り込み済みの変更通知を、いま存在する早見表レコードにリンクし直す",
+    )
+    parser.add_argument(
+        "--vector",
+        action="store_true",
+        help="--relink 時、LIKE で拾えない品名をベクトル検索で候補出しする"
+        "（自動リンクはしない）",
     )
     parser.add_argument(
         "--db",
@@ -309,7 +346,7 @@ def main(argv: "list[str] | None" = None) -> int:
                 return 1
             print(ingest_notice_file(path, conn).summary())
         if args.relink:
-            print(relink(conn).summary())
+            print(relink(conn, use_vector=args.vector).summary())
     finally:
         conn.close()
     return 0

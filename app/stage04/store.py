@@ -20,7 +20,6 @@ Target runtime is the B1 server's Python 3.10 — no 3.11+ syntax.
 
 from __future__ import annotations
 
-import re
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
@@ -125,28 +124,8 @@ def insert_waste_item(conn: sqlite3.Connection, item: WasteItem) -> int:
     return int(cur.lastrowid)
 
 
-# 早見表は品目を複合名で持つことがある(例: 乾電池(充電式でないもの)、
-# テレビ(ブラウン管式・液晶式・プラズマ式)、ライター)。お知らせは短い一般名
-# (乾電池、テレビ、使い捨てライター)で書かれるので、完全一致だけでは前身を
-# 取りこぼす。括弧内の限定と末尾の「等」「類」を落とした「基底名」で突き合わせる。
-_QUALIFIER_RE = re.compile(r"[（(][^（）()]*[）)]|[　\s]*(?:等|類|など)$")
-
-
-def _base_name(name: str) -> str:
-    prev = None
-    out = name
-    while out != prev:
-        prev, out = out, _QUALIFIER_RE.sub("", out).strip()
-    return out
-
-
-def _name_relates(notice_name: str, hayamihyo_name: str) -> bool:
-    """お知らせの一般名と早見表の(複合)名が同じ品目を指していそうか。"""
-    n = notice_name
-    h = _base_name(hayamihyo_name)
-    if len(n) < 2 or len(h) < 2:
-        return False
-    return n == h or n in h or h in n
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 @dataclass(frozen=True)
@@ -154,10 +133,11 @@ class PredecessorMatch:
     """`find_current_predecessor` の結果。
 
     * `item` あり + `exact` — 完全一致
-    * `item` あり + not `exact` — 複合名などへの部分一致(1件だけ)。回答側は
-      「乾電池(充電式でないもの)については〜」のように限定を付けられる
+    * `item` あり + not `exact` — 部分一致(LIKE)が1件だけ。早見表が複合名で持つ
+      ケース(お知らせ「乾電池」→ 早見表「乾電池(充電式でないもの)」)。回答側は
+      `TimelineSegment.matched_item_name` で限定を付けられる
     * `item` なし + `candidates` — 部分一致が複数。自動リンクせず人手判断
-    * すべて空 — 前身なし
+    * すべて空 — 前身なし(語順違い等。`relink(use_vector=True)` でベクトル候補を出せる)
     """
 
     item: "WasteItem | None" = None
@@ -169,25 +149,31 @@ def find_current_predecessor(
     conn: sqlite3.Connection, item_name: str, exclude_id: "int | None" = None
 ) -> PredecessorMatch:
     """The 早見表 row a change notice supersedes: still current, and NOT itself a
-    distributed-file row (so notices don't supersede each other). Exact
-    `item_name` first, then a unique base-name match for compound 早見表 names.
+    distributed-file row (so notices don't supersede each other).
+
+    完全一致 → 部分一致(NFKC 正規化 + LIKE、`app/data/lookup.py` の
+    `lookup_item_partial` と同じ方式。呼び出し側の接続で実行するだけ)。
+    部分一致が複数なら曖昧としてリンクしない(お知らせ「乾電池」が早見表の
+    充電式/非充電式のどちらを指すか通知文だけでは決まらない、等)。
+    語順が違うケース(使い捨てライター→ライター)は LIKE では拾えない ―― これは
+    ベクトル検索の担当(`relink(use_vector=True)`)。
     """
     norm = normalize_item_name(item_name)
-    rows = [
-        r
-        for r in conn.execute(
-            "SELECT * FROM waste_items WHERE is_current = 1 "
-            "AND source_url NOT LIKE ? ORDER BY id",
-            (KNOWLEDGE_SCHEME + "%",),
-        ).fetchall()
-        if exclude_id is None or r["id"] != exclude_id
-    ]
 
-    for r in rows:
-        if r["item_name"] == norm:
-            return PredecessorMatch(item=_row_to_item(r), exact=True)
+    exact = conn.execute(
+        "SELECT * FROM waste_items WHERE item_name = ? AND is_current = 1 "
+        "AND source_url NOT LIKE ? AND id IS NOT ?",
+        (norm, KNOWLEDGE_SCHEME + "%", exclude_id),
+    ).fetchone()
+    if exact:
+        return PredecessorMatch(item=_row_to_item(exact), exact=True)
 
-    partial = [r for r in rows if _name_relates(norm, r["item_name"])]
+    partial = conn.execute(
+        "SELECT * FROM waste_items "
+        "WHERE item_name LIKE ? ESCAPE '\\' AND is_current = 1 "
+        "AND source_url NOT LIKE ? AND id IS NOT ? ORDER BY id",
+        (f"%{_like_escape(norm)}%", KNOWLEDGE_SCHEME + "%", exclude_id),
+    ).fetchall()
     if len(partial) == 1:
         return PredecessorMatch(item=_row_to_item(partial[0]), exact=False)
     if len(partial) > 1:

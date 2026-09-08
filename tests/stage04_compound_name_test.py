@@ -1,9 +1,12 @@
 """早見表が品目を複合名で持つケース(FANG の PR #6 検証結果)。
 
-例: お知らせ「乾電池」/「使い捨てライター」/「テレビ」に対し、早見表は
+お知らせ「乾電池」/「使い捨てライター」/「テレビ」に対し、早見表は
 `乾電池(充電式でないもの)` / `ライター` / `テレビ(ブラウン管式・液晶式・プラズマ式)`。
-完全一致だけだと前身を取りこぼすので、基底名で突き合わせて部分一致リンクする。
-チェーンは `item_name` ではなく `superseded_by` で辿る。
+
+前身の突き合わせ:
+  完全一致 → 部分一致(NFKC + LIKE、app/data/lookup.lookup_item_partial と同方式)
+  → 語順違い(使い捨てライター→ライター)はベクトル検索(任意、候補出しのみ)
+チェーンは `item_name` ではなく `superseded_by` リンクで辿る。
 """
 
 from __future__ import annotations
@@ -11,13 +14,14 @@ from __future__ import annotations
 import datetime as dt
 from datetime import date, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from app.data.schema import WasteItem
+from app.stage04 import ingest as ingest_mod
 from app.stage04 import store
 from app.stage04.ingest import ingest_notice_file, relink
-from app.stage04.store import _base_name, _name_relates
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CHANGES = REPO_ROOT / "knowledge" / "incoming" / "お知らせ-4-2.md"
@@ -32,7 +36,7 @@ def conn():
     c.close()
 
 
-def _hayamihyo(conn, item_name: str, method: str) -> int:
+def _hayamihyo(conn, item_name: str, method: str = "家庭ごみ") -> int:
     return store.insert_waste_item(
         conn,
         WasteItem(
@@ -47,43 +51,17 @@ def _hayamihyo(conn, item_name: str, method: str) -> int:
     )
 
 
-# --- name helpers -------------------------------------------------------
-@pytest.mark.parametrize(
-    "raw,base",
-    [
-        ("乾電池(充電式でないもの)", "乾電池"),
-        ("テレビ（ブラウン管式・液晶式・プラズマ式）", "テレビ"),
-        ("ライター", "ライター"),
-        ("使い捨てカイロ等", "使い捨てカイロ"),
-        ("充電式電池（ニカド・ニッケル水素・リチウムイオン）類", "充電式電池"),
-    ],
-)
-def test_base_name_strips_qualifiers(raw, base):
-    assert _base_name(raw) == base
-
-
-def test_name_relates_matches_compound_and_prefixed_names():
-    assert _name_relates("乾電池", "乾電池(充電式でないもの)")
-    assert _name_relates("テレビ", "テレビ(ブラウン管式・液晶式・プラズマ式)")
-    assert _name_relates("使い捨てライター", "ライター")
-    # genuinely different items must NOT auto-relate
-    assert not _name_relates("蛍光管", "蛍光灯")
-    assert not _name_relates("傘", "日傘")  # len(base) guard on the 1-char side
-
-
-# --- ingest / relink linking -----------------------------------------
-def test_ingest_links_a_notice_to_its_compound_name_predecessor(conn):
-    _hayamihyo(conn, "乾電池(充電式でないもの)", "家庭ごみ")
-    _hayamihyo(conn, "ライター", "資源化物")
+# --- exact + LIKE predecessor matching --------------------------------
+def test_like_match_links_a_notice_to_its_compound_name_predecessor(conn):
+    _hayamihyo(conn, "乾電池(充電式でないもの)", "電池類")
+    _hayamihyo(conn, "スプレー缶", "燃えないごみ")  # exact-match control
 
     result = ingest_notice_file(CHANGES, conn, now=INGEST_AT)
 
     assert ("乾電池", "乾電池(充電式でないもの)") in result.partial_links
-    assert ("使い捨てライター", "ライター") in result.partial_links
+    assert ("スプレー缶", "乾電池(充電式でないもの)") not in result.partial_links  # exact, no flag
+    assert any(n == "スプレー缶" for n, _, _ in result.linked)
     assert "乾電池" not in result.unlinked
-    assert "使い捨てライター" not in result.unlinked
-    # exact-match items are still linked without the partial flag
-    _hayamihyo(conn, "スプレー缶", "家庭ごみ")  # (no-op: already ingested run)
 
 
 def test_history_follows_the_supersede_link_across_a_name_change(conn):
@@ -92,40 +70,40 @@ def test_history_follows_the_supersede_link_across_a_name_change(conn):
 
     tl = store.item_timeline(conn, "乾電池")  # queried by the short name
     assert tl.found and len(tl.segments) == 2
-
     old, new = tl.segments
-    assert old.synthesized is False                      # a real row, not reconstructed
+    assert old.synthesized is False
     assert old.matched_item_name == "乾電池(充電式でないもの)"
     assert old.valid_until == date(2026, 9, 30)
     assert new.from_notice is True and new.valid_from == date(2026, 10, 1)
     assert tl.changes_after(date(2026, 9, 8)) == (date(2026, 10, 1),)
 
 
-def test_ambiguous_base_name_is_reported_not_linked(conn):
-    # two 早見表 rows both reduce to base "乾電池"
-    _hayamihyo(conn, "乾電池(充電式でないもの)", "家庭ごみ")
+def test_multiple_like_matches_are_ambiguous_not_linked(conn):
+    _hayamihyo(conn, "乾電池(充電式でないもの)")
     _hayamihyo(conn, "乾電池(ボタン電池を除く)", "電池類")
 
     result = ingest_notice_file(CHANGES, conn, now=INGEST_AT)
 
     amb = dict(result.ambiguous)
-    assert "乾電池" in amb
     assert set(amb["乾電池"]) == {"乾電池(充電式でないもの)", "乾電池(ボタン電池を除く)"}
     assert not any(n == "乾電池" for n, _, _ in result.linked)
-    # not linked to a specific row; `relink` retries it later (a more precise
-    # crawl, or a human, decides which variant applies). item_timeline still
-    # reconstructs the prior rule from the notice itself (synthesized).
+    # notice self-describes its prior state, so the timeline still has 2 segments
     tl = store.item_timeline(conn, "乾電池")
     assert len(tl.segments) == 2 and tl.segments[0].synthesized is True
-    assert tl.segments[0].matched_item_name is None
 
 
-def test_relink_also_does_compound_name_matching(conn):
-    # notices ingested before the crawler -> all unlinked
+def test_genuinely_different_names_stay_unlinked(conn):
+    # LIKE '%蛍光管%' does not match '蛍光灯'
+    _hayamihyo(conn, "蛍光灯")
+    result = ingest_notice_file(CHANGES, conn, now=INGEST_AT)
+    assert "蛍光管" in result.unlinked
+    assert not any(n == "蛍光管" for n, _, _ in result.partial_links)
+
+
+def test_relink_also_does_like_matching(conn):
     r1 = ingest_notice_file(CHANGES, conn, now=INGEST_AT)
     assert "乾電池" in r1.unlinked
 
-    # crawler lands, with the compound name
     _hayamihyo(conn, "乾電池(充電式でないもの)", "電池類")
     conn.commit()
 
@@ -133,3 +111,40 @@ def test_relink_also_does_compound_name_matching(conn):
     assert ("乾電池", "乾電池(充電式でないもの)") in r2.partial_links
     assert "乾電池" not in r2.still_unlinked
     assert len(store.item_timeline(conn, "乾電池").segments) == 2
+
+
+# --- word-order differences: vector candidates (opt-in, never auto-linked) ---
+def test_reverse_order_names_are_unlinked_without_vector(conn):
+    # お知らせ「使い捨てライター」, 早見表「ライター」: LIKE '%使い捨てライター%' misses
+    _hayamihyo(conn, "ライター", "資源化物")
+    result = ingest_notice_file(CHANGES, conn, now=INGEST_AT)
+    assert "使い捨てライター" in result.unlinked
+    assert not any(n == "使い捨てライター" for n, _, _ in result.partial_links)
+
+
+def test_relink_vector_reports_candidates_but_does_not_link(conn, monkeypatch):
+    _hayamihyo(conn, "ライター", "資源化物")
+    ingest_notice_file(CHANGES, conn, now=INGEST_AT)  # 使い捨てライター unlinked
+
+    def fake_vector(query, top_k=3):
+        if "ライター" in query:
+            return [SimpleNamespace(item_name="ライター", source_url="https://x/y.html")]
+        return []
+
+    monkeypatch.setattr(ingest_mod, "vector_search_items", fake_vector)
+
+    result = relink(conn, use_vector=True)
+
+    assert ("使い捨てライター", ("ライター",)) in result.vector_candidates
+    assert "使い捨てライター" in result.still_unlinked          # NOT auto-linked
+    assert not any(n == "使い捨てライター" for n, _, _ in result.linked)
+    assert len(store.item_timeline(conn, "使い捨てライター").segments) == 2  # notice-only, synthesized
+
+
+def test_vector_is_off_by_default(conn, monkeypatch):
+    _hayamihyo(conn, "ライター", "資源化物")
+    ingest_notice_file(CHANGES, conn, now=INGEST_AT)
+    called = []
+    monkeypatch.setattr(ingest_mod, "vector_search_items", lambda *a, **k: called.append(1) or [])
+    relink(conn)  # no use_vector
+    assert called == []
