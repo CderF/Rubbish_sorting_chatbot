@@ -35,6 +35,7 @@ app/server.py              FastAPI + vLLM 本体
 app/webui.html             WebUI(チャット・画像添付・VRAM/速度表示)
 deploy/rag-chatbot.service systemd ユニット
 tests/spec_test.py         採点サーバー仕様への適合テスト
+tools/preview_ui.py        WebUIをローカルで実機確認する開発用サーバー(本番では使わない)
 documents/                 各STAGEの調査・構築記録
 requirements.txt           直接依存(バージョン固定)
 .env.example               必要な環境変数のテンプレート
@@ -42,6 +43,22 @@ requirements.txt           直接依存(バージョン固定)
 
 **リポジトリに入っていないもの**: モデル重み(17GB)、`venv`(7.8GB)、`/etc/rag-chatbot.env`(パスワード)、
 ログ・コンパイルキャッシュ、課題PDF(社外秘のため意図的に除外)。
+
+### WebUI をローカルで確認する
+
+L4のVRAMは本番のvLLMがほぼ使い切っており、2つ目のエンジンは起動できない。
+`tools/preview_ui.py` は vLLM と GPU 監視だけをダミーに差し替えて `app/server.py` を
+そのまま起動するので、UI・`/knowledge`・引用付与・SSE は本番と同じコードで確認できる
+(回答文だけ固定のダミーが流れる)。
+
+```bash
+python3 tools/preview_ui.py            # 127.0.0.1:8090
+python3 tools/preview_ui.py --port 9000
+```
+
+VS Code Remote-SSH なら PORTS パネルに転送が現れる。SSH 直結なら
+`ssh -L 8090:localhost:8090 <ホスト>` でトンネルを張る。ログインパスワードは起動時に表示される。
+デモ用のDBは `/tmp` に作るのでリポジトリも本番のDBも汚さない。
 
 ---
 
