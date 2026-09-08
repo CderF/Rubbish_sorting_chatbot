@@ -16,8 +16,8 @@ from __future__ import annotations
 import threading
 from datetime import date
 
-from app.stage04 import store
-from app.stage04.store import ItemTimeline
+from app.notices import store
+from app.notices.store import ItemTimeline
 
 _local = threading.local()
 

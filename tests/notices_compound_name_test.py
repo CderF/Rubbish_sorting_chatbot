@@ -19,9 +19,9 @@ from types import SimpleNamespace
 import pytest
 
 from app.data.schema import WasteItem
-from app.stage04 import ingest as ingest_mod
-from app.stage04 import store
-from app.stage04.ingest import ingest_notice_file, relink
+from app.notices import ingest as ingest_mod
+from app.notices import store
+from app.notices.ingest import ingest_notice_file, relink
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CHANGES = REPO_ROOT / "knowledge" / "incoming" / "お知らせ-4-2.md"

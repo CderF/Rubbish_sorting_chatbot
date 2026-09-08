@@ -24,11 +24,11 @@ Team B / Teamb4 (周 楚涵)
 
 | ファイル | 役割 |
 |---|---|
-| `app/stage04/notice_parser.py` | Markdown解析のみ。I/O・DB・ネットワークに触れない |
-| `app/stage04/store.py` | `app/data/db.py` の上に構築。`knowledge_sources` テーブルと、バージョン列の読み取り(`lookup_item_history` / `version_window`)だけを追加する |
-| `app/stage04/ingest.py` | `Notice` → `WasteItem` 変換、新旧リンク、`relink`、CLIエントリポイント |
-| `tests/stage04_ingest_test.py` | 単体テスト(パーサ・store・ingest・relink) |
-| `tests/stage04_eval.py` + `tests/fixtures/stage04_eval_cases.json` | 『質問 → 期待DB状態』評価(4-1/4-2、データ側)。`python -m tests.stage04_eval` でグレーダー風の表を出力 |
+| `app/notices/notice_parser.py` | Markdown解析のみ。I/O・DB・ネットワークに触れない |
+| `app/notices/store.py` | `app/data/db.py` の上に構築。`knowledge_sources` テーブルと、バージョン列の読み取り(`lookup_item_history` / `version_window`)だけを追加する |
+| `app/notices/ingest.py` | `Notice` → `WasteItem` 変換、新旧リンク、`relink`、CLIエントリポイント |
+| `tests/notices_ingest_test.py` | 単体テスト(パーサ・store・ingest・relink) |
+| `tests/notices_eval.py` + `tests/fixtures/notices_eval_cases.json` | 『質問 → 期待DB状態』評価(4-1/4-2、データ側)。`python -m tests.notices_eval` でグレーダー風の表を出力 |
 | `tests/fixtures/hayamihyo_seed.json` | **テスト専用**の擬似早見表15件。本番投入禁止 |
 
 `app/data/` 配下(Teamb2担当)のファイルは一切変更していない。`app/data/schema.py` の `WasteItem` を
@@ -110,7 +110,7 @@ Team B / Teamb4 (周 楚涵)
 `IngestResult.unlinked` に品名を列挙する。クローラー実行後に:
 
 ```bash
-python -m app.stage04.ingest --relink
+python -m app.notices.ingest --relink
 ```
 
 を実行すると、`knowledge_sources` に記録した変更通知のうち前身が未接続のものを、
@@ -138,7 +138,7 @@ python -m app.stage04.ingest --relink
 
 ```python
 from datetime import date
-from app.stage04 import store
+from app.notices import store
 
 conn = store.connect()                       # 共用DB（var/kitakyushu_waste.db、DB_PATH で上書き可）
 tl = store.item_timeline(conn, "スプレー缶")   # ← これ1本で足りる想定
@@ -228,15 +228,15 @@ STAGE04で追加した3つ目のテーブル。共有2テーブルには無い�
 
 ```bash
 python -m app.data.db                                          # 先にクローラーで早見表DBを構築
-python -m app.stage04.ingest knowledge/incoming/お知らせ-4-1.md knowledge/incoming/お知らせ-4-2.md
-python -m app.stage04.ingest --relink                          # 早見表を後から入れた場合
+python -m app.notices.ingest knowledge/incoming/お知らせ-4-1.md knowledge/incoming/お知らせ-4-2.md
+python -m app.notices.ingest --relink                          # 早見表を後から入れた場合
 ```
 
 DBパスは `app/data/db.py` と共通(既定 `var/kitakyushu_waste.db`、`--db` か `DB_PATH` で上書き可)。
 同じファイルを二度流しても新規行は増えない(`content_hash` で判定)。
 
 ```bash
-python -m pytest tests/stage04_ingest_test.py -v
+python -m pytest tests/notices_ingest_test.py -v
 ```
 
 テストはすべてインメモリSQLite上で完結し、GPU・L4サーバー・ネットワークを必要としない。
@@ -246,14 +246,14 @@ python -m pytest tests/stage04_ingest_test.py -v
 PR #6〜#10 がマージされ、`app/rag/router.py`(藤井さん)・`app/rag/knowledge.py`
 (WebUI 2-3)が main にある。STAGE04 側はそこに次の形で噛み合う。
 
-### router 向けの読み取り API — `app/stage04/lookup.py`
+### router 向けの読み取り API — `app/notices/lookup.py`
 
 `app/data/lookup.py` と同じ作法(接続引数なし・スレッドローカル接続・`query_only`・
 未検出でも例外なし)。違いは **`is_current = 1` で絞らない**こと(4-2 は旧ルールも要る)。
 
 ```python
 from datetime import date
-from app.stage04 import lookup
+from app.notices import lookup
 
 tl = lookup.item_timeline(item_name)              # ItemTimeline（found=False なら 4-3 へ）
 tl = lookup.pending_change(item_name, date.today())  # 切替が今日以降にあるときだけ ItemTimeline、なければ None
@@ -267,7 +267,7 @@ tl = lookup.pending_change(item_name, date.today())  # 切替が今日以降に�
 参考(実装の要点):
 
 ```python
-from app.stage04.lookup import pending_change
+from app.notices.lookup import pending_change
 
 tl = pending_change(item_name, date.today())
 if tl is not None:

@@ -26,7 +26,7 @@ STAGE 04(動的なナレッジ拡張)の担当分けと、STAGE 02/03 の実装�
 
 - 採点中に配布されるお知らせファイル(今回は Markdown 2 本、各 15 件)を解析し、`waste_items` に取り込む。
 - 早見表に無い品目(ホバーボード等)は単独レコードとして `INSERT`。
-- 実装: `app/stage04/{notice_parser,ingest,store}.py`(PR #5)。
+- 実装: `app/notices/{notice_parser,ingest,store}.py`(PR #5)。
 
 ### 4-2 旧根拠と新お知らせが併存する場合、断定せず「いつから・何が・どう変わるか」を示す
 
@@ -47,7 +47,7 @@ STAGE 04(動的なナレッジ拡張)の担当分けと、STAGE 02/03 の実装�
 ## 2. STAGE 02/03 のマージ前でも進められること
 
 1. データ側(周): クローラー(FANG さん PR #6)の上に **差分検知 + relink** を実装する。`data_schema.md` §4 が「更新検知・差分抽出のロジックは STAGE04 側で新規実装」と明記している通り。
-2. 回答側(本田さん): `store.item_timeline()` / `app/stage04/lookup.pending_change()` の戻り値に対する **時系列回答関数を純関数として** 書ける。DB・LLM・サーバー不要。詳細は [[STAGE04_取り込み仕様.md]] の「引き渡し契約」。
+2. 回答側(本田さん): `store.item_timeline()` / `app/notices/lookup.pending_change()` の戻り値に対する **時系列回答関数を純関数として** 書ける。DB・LLM・サーバー不要。詳細は [[STAGE04_取り込み仕様.md]] の「引き渡し契約」。
 3. 評価ケース(質問 → 期待回答)は実装非依存でいま書ける。
 
 ---
@@ -83,20 +83,20 @@ STAGE 04 は STAGE 02/03 の検索層の**外側**に足す。当初の「4 点�
 | `content_hash` | 共有 schema には無し。**STAGE 04 独自の `knowledge_sources` テーブルに持たせる**(PR #5、FANG さん了承済み) | 冪等性キー。共有カラムと独立 |
 | `published_at` | 現状不要(配布お知らせに公示日が明記されていない)。必要になれば `knowledge_sources` に独立追加 | |
 
-STAGE 04 が追加するのは `knowledge_sources` テーブル1つだけ(`app/stage04/store.py`、PR #5)。
+STAGE 04 が追加するのは `knowledge_sources` テーブル1つだけ(`app/notices/store.py`、PR #5)。
 
 ### ② 検索関数
 
 - **全バージョン取得は別関数**。`lookup_item_exact` / `lookup_item_partial`(issue #4)は藤井さんが依存する契約なのでシグネチャを変えない。
-  → `app/stage04/store.py` に `lookup_item_history(conn, item_name) -> list[WasteItem]`(FANG さん提案の名前)として実装済み(PR #5)。`is_current` で絞らず全バージョンを古い順で返す。
-  回答側は通常これを直接使わず、平坦化した `store.item_timeline()` / `app/stage04/lookup.pending_change()` を使う。
+  → `app/notices/store.py` に `lookup_item_history(conn, item_name) -> list[WasteItem]`(FANG さん提案の名前)として実装済み(PR #5)。`is_current` で絞らず全バージョンを古い順で返す。
+  回答側は通常これを直接使わず、平坦化した `store.item_timeline()` / `app/notices/lookup.pending_change()` を使う。
 - **説明ページ検索**は当初 `search_descriptions` としていたが、issue #7 で `vector_search_explanations(query, top_k)` として仕様化済み(藤井さん担当、未実装)。**名前を合わせて再利用**する。
 - **ナレッジソース一覧(manifest)**: `app/data/db.py` の `list_sources()`(クロール済みページ)が近い役割を持つ。STAGE 04 は取り込んだお知らせ用に `store.list_knowledge_sources()` を持つ。統一ビューが必要なら `list_sources()` を拡張する形で FANG さんと相談。
 
 ### ③ ナレッジファイルの配置とインデックス — 確定
 
 - 構造化 DB: `app/data/db.py` の `var/kitakyushu_waste.db`(`DB_PATH` で上書き可)。**STAGE 04 の取り込みも同じ DB に書く**(`store.py` が `app/data/db.py` を土台にする)。
-- 取り込み順序: クローラーより先にお知らせを取り込んでも `INSERT` はされ、前身リンクだけ保留になる。クローラー実行後に `python -m app.stage04.ingest --relink` で接続。
+- 取り込み順序: クローラーより先にお知らせを取り込んでも `INSERT` はされ、前身リンクだけ保留になる。クローラー実行後に `python -m app.notices.ingest --relink` で接続。
 - ベクトルストアへの新規お知らせの反映(再 embedding)は、藤井さんの `app/rag/vector_store.py`(issue #7)完成後に連携方法を決める。
 
 ### ④ 回答内の出典フォーマット — 未決(STAGE 02 と共通の宿題)
