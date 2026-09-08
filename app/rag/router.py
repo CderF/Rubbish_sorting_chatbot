@@ -619,6 +619,12 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
             if hit_name and hit_name not in timeline_candidates:
                 timeline_candidates.append(hit_name)
         _apply_timeline(ans, timeline_candidates)
+
+    # timeline 判定のあとで確定する。カイロ等、いったん analogy でも版本鎖で
+    # 同一品目と分かって item_match が exact に上書きされたケースは canned に
+    # しない(_apply_timeline 内で analogy_unreliable は無視される)。
+    if ans.item_match == "analogy" and ans.analogy_unreliable:
+        ans.canned_response = _ANALOGY_UNRELIABLE_REPLY
     return ans
 
 
@@ -916,8 +922,18 @@ _RULES_NO_CONTEXT = (
 )
 
 # 4-3 確度ゲート(_analogy_is_reliable)で弾いたとき用。意味の近い候補は
-# あるが質問品と語彙的に関連づかず、区分の根拠にできないケース。類推で
-# 断定させず、確認を促す(採点フィードバック: 根拠の薄い類推での断定を減点)。
+# あるが質問品と語彙的に関連づかず、区分の根拠にできないケース。
+#
+# プロンプトで「断定するな」と指示しても、小型モデルは context が無いと
+# 自前の知識で「電動自転車かもしれない」等を書き足してしまう(採点フィード
+# バックの実例)。そこで RoutedAnswer.canned_response に固定文を載せ、
+# サーバー側で LLM 生成そのものをスキップする。下の _RULES_* は
+# canned_response が使われなかった場合(サーバーが未対応等)の保険。
+_ANALOGY_UNRELIABLE_REPLY = (
+    "早見表に個別の記載がなく、類似する品目についても十分に根拠を確認できない"
+    "ため、分別を断定できません。お手数ですが、北九州市の公式ページまたは"
+    "窓口で確認してください。"
+)
 _RULES_ANALOGY_UNRELIABLE = (
     "- 早見表に個別の記載がなく、意味の近い品目も質問品と種類が一致する確証が"
     "ないため、類似品からの類推で分別区分を断定してはならない。\n"

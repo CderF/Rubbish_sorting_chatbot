@@ -269,6 +269,29 @@ async def _stream_chat(
     # 検索結果はシステムメッセージとして毎ターン先頭に差し込む。会話履歴には
     # 残さない(ターンごとに検索結果が変わるうえ、積み重なると文脈を圧迫するため)。
     routed = await _route_safely(prompt, img)
+
+    # 確定回答(4-3 確度ゲート等): LLM に言い換え・脚色・補足をさせず、
+    # そのまま1フレームで返す。engine.generate は通さない。
+    if routed is not None and routed.canned_response:
+        text = routed.canned_response
+        yield f"data: {json.dumps({'delta': text}, ensure_ascii=False)}\n\n"
+        async with _sessions_lock:
+            sessions[session_id] = messages + [
+                {"role": "assistant", "content": text}
+            ]
+            sessions.move_to_end(session_id)
+            while len(sessions) > MAX_SESSIONS:
+                sessions.popitem(last=False)
+        last_timing.update(
+            first_token_s=0.0, total_s=0.0, tokens=0, session_id=session_id,
+            retrieval={"item": routed.detected_item, "canned": True},
+        )
+        if with_sources:
+            payload = {"sources": router.describe_sources(routed)}
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
     if routed is not None:
         prompt_input = _build_prompt(
             [{"role": "system", "content": router.build_system_prompt(routed)}] + messages
