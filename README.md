@@ -152,7 +152,23 @@ tail -50 ~/server.log                    # 起動失敗時
 ### 更新の流れ
 
 ```bash
-cd ~/app && git pull && sudo systemctl restart rag-chatbot.service
+cd ~/app && make deploy        # git pull → make knowledge → restart
+```
+
+`make deploy` は `make knowledge`(クロール → お知らせ取り込み → relink → ベクトル
+インデックス再構築)を挟む。**データ層(`app/data/`)や `knowledge/incoming/` を変えた
+場合は必ずこれを通す。** コードだけの変更なら `git pull && sudo systemctl restart
+rag-chatbot.service` でよいが、その場合も systemd の `ExecStartPre` が起動時に
+お知らせの取り込み(冪等)だけは流し直す。
+
+個別ターゲット:
+
+```bash
+make crawl      # 早見表・収集日を再クロール(遅い・サイトに負荷)
+make ingest     # 配布お知らせを waste_items に取り込み
+make relink     # 変更通知を早見表レコードにリンク
+make index      # Chroma ベクトルインデックスを現在の行から再構築
+make knowledge  # 上記4つ全部
 ```
 
 ---

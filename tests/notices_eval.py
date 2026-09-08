@@ -94,11 +94,12 @@ def build_eval_db(conn, cases: dict) -> "tuple[list[IngestResult], object]":
         haya = change["hayamihyo"]
         if haya is None:
             continue
+        seed_name = haya.get("stored_as", change["item"])
         store.insert_waste_item(
             conn,
             WasteItem(
-                item_name=change["item"],
-                item_name_raw=change["item"],
+                item_name=seed_name,
+                item_name_raw=seed_name,
                 disposal_method=haya["method"],
                 notes="",
                 source_url=SEED_URL,
@@ -206,6 +207,23 @@ def evaluate(conn, cases: dict, ingest_results, relink_result) -> EvalReport:
             ks is not None and ks["prior_disposal_method"] == c["notice_prior"],
             f"knowledge_sources.prior_disposal_method={ks and ks['prior_disposal_method']!r}",
         )
+
+        stored_as = (c["hayamihyo"] or {}).get("stored_as")
+        if stored_as:
+            ingest_partial = {
+                n for res in ingest_results for n, _ in res.partial_links
+            }
+            segs = store.item_timeline(conn, name).segments
+            old_seg = segs[0] if len(segs) == 2 else None
+            r.expect(
+                f"4-2 {name} (compound name)",
+                name in ingest_partial
+                and old_seg is not None
+                and old_seg.matched_item_name == stored_as
+                and old_seg.synthesized is False,
+                f"partial={name in ingest_partial} "
+                f"matched={old_seg and old_seg.matched_item_name!r}",
+            )
 
     # ---- item_timeline (the answer layer's entry point) ----
     ref = date.fromisoformat(cases["reference_date"])
