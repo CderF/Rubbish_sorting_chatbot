@@ -16,7 +16,7 @@ import pytest
 
 from app.data.schema import WasteItem
 from app.stage04 import store
-from app.stage04.ingest import ingest_notice_file
+from app.stage04.ingest import ingest_notice_file, relink
 from app.stage04.notice_parser import parse_notice_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -275,3 +275,143 @@ def test_knowledge_sources_lists_every_ingested_notice(conn):
     }
     assert all(s["source_type"] == "notice" for s in sources)
     assert all(s["content_hash"] for s in sources)
+
+
+# --------------------------------------------------------------------------
+# relink — connecting change-notices to the 早見表 once the crawler has run
+# --------------------------------------------------------------------------
+def _add_hayamihyo_row(conn, item_name: str, disposal_method: str) -> int:
+    """Simulate a row the real crawler (app/data/crawler.py) would produce."""
+    return store.insert_waste_item(
+        conn,
+        WasteItem(
+            item_name=item_name,
+            item_name_raw=item_name,
+            disposal_method=disposal_method,
+            notes="",
+            source_url="https://www.city.kitakyushu.lg.jp/contents/924_10041.html",
+            source_page_title="ごみの分別早見表（さ行）",
+            crawled_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
+            is_current=True,
+        ),
+    )
+
+
+def test_relink_connects_change_notices_after_the_crawler_runs(conn):
+    # notices ingested first, 早見表 still empty -> all unlinked
+    ingest_notice_file(CHANGES, conn, now=INGEST_AT)
+    assert all(r["is_current"] == 1 for r in conn.execute("SELECT * FROM waste_items"))
+
+    # crawler runs later
+    for row in seed_rows():
+        _add_hayamihyo_row(conn, row["item_name"], row["disposal_method"])
+    conn.commit()
+
+    result = relink(conn)
+
+    assert len(result.linked) == 15
+    assert result.still_unlinked == []
+    versions = store.lookup_item_versions(conn, "スプレー缶")
+    assert len(versions) == 2
+    assert versions[0].disposal_method == "燃えないごみ"
+    assert versions[0].is_current is False
+    assert versions[0].superseded_by == versions[1].id
+    assert versions[1].effective_from == CHANGE_START
+
+
+def test_relink_is_a_noop_when_everything_is_already_linked(seeded_conn):
+    ingest_notice_file(CHANGES, seeded_conn, now=INGEST_AT)  # links during ingest
+    result = relink(seeded_conn)
+    assert result.linked == []
+    assert result.still_unlinked == []
+
+
+def test_relink_reports_items_with_no_hayamihyo_entry(conn):
+    ingest_notice_file(CHANGES, conn, now=INGEST_AT)
+    _add_hayamihyo_row(conn, "スプレー缶", "燃えないごみ")  # only one of the 15
+    conn.commit()
+
+    result = relink(conn)
+
+    assert [name for name, _, _ in result.linked] == ["スプレー缶"]
+    assert len(result.still_unlinked) == 14
+    assert "乾電池" in result.still_unlinked
+
+
+def test_relink_never_makes_notices_supersede_each_other(conn):
+    """Only real 早見表 rows (non-knowledge:// source_url) are eligible
+    predecessors, so ingesting the same change twice from different files does
+    not chain notice-onto-notice."""
+    ingest_notice_file(CHANGES, conn, now=INGEST_AT)
+    result = relink(conn)  # nothing crawled yet
+    assert result.linked == []
+    # the 15 change rows are all still current, none superseded by another notice
+    rows = conn.execute("SELECT * FROM waste_items").fetchall()
+    assert all(r["is_current"] == 1 and r["superseded_by"] is None for r in rows)
+
+
+def test_relink_via_cli(tmp_path, monkeypatch):
+    from app.stage04 import ingest as ingest_mod
+
+    db_file = tmp_path / "kb.db"
+    conn = store.connect(db_file)
+    store.init_schema(conn)
+    ingest_notice_file(CHANGES, conn, now=INGEST_AT)
+    for row in seed_rows():
+        _add_hayamihyo_row(conn, row["item_name"], row["disposal_method"])
+    conn.commit()
+    conn.close()
+
+    rc = ingest_mod.main(["--relink", "--db", str(db_file)])
+    assert rc == 0
+
+    conn = store.connect(db_file)
+    assert len(store.lookup_item_versions(conn, "乾電池")) == 2
+    conn.close()
+
+
+def test_reingest_then_relink_completes_the_chain(conn):
+    """The documented recovery path: ingest before the crawler, crawl, then
+    re-run — the re-run skips the row but relink finishes the link."""
+    first = ingest_notice_file(CHANGES, conn, now=INGEST_AT)
+    assert len(first.unlinked) == 15
+
+    for row in seed_rows():
+        _add_hayamihyo_row(conn, row["item_name"], row["disposal_method"])
+    conn.commit()
+
+    second = ingest_notice_file(CHANGES, conn, now=INGEST_AT)
+    assert second.record_count == 0 and len(second.skipped) == 15  # idempotent
+
+    result = relink(conn)
+    assert len(result.linked) == 15
+
+
+def test_relink_flags_but_does_not_block_a_disposal_method_mismatch(conn):
+    """The distributed file's stated 現行 treatment may disagree with the crawl
+    (or the crawl may be incomplete). relink still links on item identity and
+    reports the discrepancy rather than dropping the link."""
+    ingest_notice_file(CHANGES, conn, now=INGEST_AT)
+    # crawl says スプレー缶 is 家庭ごみ; the notice says its 現行 was 燃えないごみ
+    _add_hayamihyo_row(conn, "スプレー缶", "家庭ごみ")
+    conn.commit()
+
+    result = relink(conn)
+
+    assert [n for n, _, _ in result.linked] == ["スプレー缶"]
+    assert result.disputed == [("スプレー缶", "燃えないごみ", "家庭ごみ")]
+    versions = store.lookup_item_versions(conn, "スプレー缶")
+    assert len(versions) == 2  # link was still made
+    # the notice's own account of the prior state is preserved on the new row
+    assert "燃えないごみ" in versions[1].notes
+
+
+def test_prior_disposal_method_is_persisted(conn):
+    ingest_notice_file(CHANGES, conn, now=INGEST_AT)
+    rows = {
+        r["title"].split("】")[1].split("の")[0] if "】" in (r["title"] or "") else r["anchor"]: r
+        for r in store.list_knowledge_sources(conn)
+    }
+    by_anchor = {r["anchor"]: r for r in store.list_knowledge_sources(conn)}
+    assert by_anchor["お知らせ-01-スプレー缶"]["prior_disposal_method"] == "燃えないごみ"
+    assert by_anchor["お知らせ-15-乾電池"]["prior_disposal_method"].startswith("電池類。")

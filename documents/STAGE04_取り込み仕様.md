@@ -1,7 +1,7 @@
 # STAGE 04 — お知らせ取り込み仕様
 
 Team B / Teamb4 (周 楚涵)
-作成日: 2026-09-08
+作成日: 2026-09-08（PR #6 のデータ層マージを受けて更新）
 
 関連: [[data_schema.md]](データスキーマ定義書) / [[STAGE04_分担提案.md]](STAGE04 分担) / [[CONTEXT.md]](ドメイン用語集)
 
@@ -25,16 +25,17 @@ Team B / Teamb4 (周 楚涵)
 | ファイル | 役割 |
 |---|---|
 | `app/stage04/notice_parser.py` | Markdown解析のみ。I/O・DB・ネットワークに触れない |
-| `app/stage04/store.py` | SQLite接続、DDL、`waste_items` の読み書き、`knowledge_sources` 管理 |
-| `app/stage04/ingest.py` | `Notice` → `WasteItem` 変換とバージョン列の接続、CLIエントリポイント |
+| `app/stage04/store.py` | `app/data/db.py` の上に構築。`knowledge_sources` テーブルと、バージョン列の読み取り(`lookup_item_versions` / `version_window`)だけを追加する |
+| `app/stage04/ingest.py` | `Notice` → `WasteItem` 変換、新旧リンク、`relink`、CLIエントリポイント |
 | `tests/stage04_ingest_test.py` | オフラインテスト20件(GPU・サーバー不要) |
 | `tests/fixtures/hayamihyo_seed.json` | **テスト専用**の擬似早見表15件。本番投入禁止 |
 
 `app/data/` 配下(Teamb2担当)のファイルは一切変更していない。`app/data/schema.py` の `WasteItem` を
 そのまま再利用しており、独自モデルは作っていない。
 
-`store.py` の `waste_items` / `collection_schedule` のDDLは `data_schema.md` の転記で、
-`CREATE TABLE IF NOT EXISTS` のため、issue #4 の `app/data/db.py` が入っても衝突せず先に作った方が有効になる。
+`store.py` は `app/data/db.py`(PR #6 / issue #4、Teamb2)の `connect()` / `init_db()` / スキーマ / DBパスを
+そのまま使う。取り込み先はクローラーが作る DB と同一(既定 `var/kitakyushu_waste.db`、`DB_PATH` で上書き可)。
+独自に持つのは `knowledge_sources` テーブルだけ。`waste_items` / `collection_schedule` のDDLは重複させていない。
 
 ## 3. フィールドマッピング
 
@@ -73,11 +74,33 @@ Team B / Teamb4 (周 楚涵)
 `valid_until` カラムは追加していない。**後継行の `effective_from` − 1日** で導出できるため、
 スキーマ変更なしで済む。`store.version_window(versions, i)` がこれを返す。
 
-### 前身が見つからない場合
+### 前身が見つからない場合と `relink`
 
-早見表クローラー(issue #4)が未完成の現時点では、変更通知15件すべてが前身なしになる。
-その場合も新行は通常どおり `INSERT` し、`IngestResult.unlinked` に品名を列挙して可視化する。
-クローラー完成後に同じファイルを再取り込みすれば、そのときリンクが張られる。
+早見表クローラーより先に取り込んだ場合、前身が無いので新行を `INSERT` するだけになり、
+`IngestResult.unlinked` に品名を列挙する。クローラー実行後に:
+
+```bash
+python -m app.stage04.ingest --relink
+```
+
+を実行すると、`knowledge_sources` に記録した変更通知のうち前身が未接続のものを、
+いま存在する早見表レコード(`source_url` が `knowledge://` でない `is_current = 1` 行)に接続する。
+`relink` は何度実行しても安全(接続済みはスキップ)。再取り込み(ファイル自体は冪等スキップ)でも同じ効果。
+
+### 早見表の「現行」表記がお知らせと食い違う場合
+
+実サイトをクロールした早見表(864件)と、`お知らせ-4-2.md` が「現行（早見表）の…扱い」として
+述べる分別が一致しないことがある(例: スプレー缶 → クロールは「家庭ごみ」、お知らせは「燃えないごみ」)。
+また7品目(蛍光管・保冷剤・使い捨てライター・カセットテープ・使い捨てカイロ・使用済みの花火・乾電池)は
+現在のクロール結果に存在しない。
+
+対応:
+- リンクは**品名(item_name)の一致で張る**。分別表記の一致は要求しない
+- 食い違いは `IngestResult.disputed` / `RelinkResult.disputed` に列挙して可視化する(リンクはブロックしない)
+- お知らせが述べる旧分別は新行の `notes` と `knowledge_sources.prior_disposal_method` に保存するので、
+  前身行がクロールに無くても、回答側は新行だけから「旧: 〜、新: 〜」を組み立てられる
+- クローラー側(PR #6、Teamb2)の取りこぼし/表記は別途 FANG さんと突き合わせる。STAGE04 の取り込みは
+  「欠落」も「不一致」も破綻せず処理する
 
 ## 5. 引き渡し契約(本田さん向け)
 
@@ -103,6 +126,10 @@ valid_from, valid_until = store.version_window(versions, 0)  # その版の有�
 現在日付が2026-09-08、切替が2026-10-01なので、スプレー缶なら
 「今は燃えないごみ、2026年10月1日からは『かん・びん』の収集日」という2区間の案内になる。
 時系列の判定文言・プロンプトは本田さん担当。
+
+前身行がクロールに無くて `lookup_item_versions` が新行1件しか返さない品目でも、
+その行の `notes` に「現行（早見表）の「◯◯」としての扱いは◯年◯月◯日まで有効。」が入っているので、
+旧分別と切替日は新行だけから取れる。
 
 ## 6. 出典の表記
 
@@ -130,10 +157,12 @@ STAGE04で追加した3つ目のテーブル。共有2テーブルには無い�
 ## 8. 実行方法
 
 ```bash
-python -m app.stage04.ingest knowledge/incoming/お知らせ-4-1.md --db data/knowledge.db
-python -m app.stage04.ingest knowledge/incoming/お知らせ-4-2.md --db data/knowledge.db
+python -m app.data.db                                          # 先にクローラーで早見表DBを構築
+python -m app.stage04.ingest knowledge/incoming/お知らせ-4-1.md knowledge/incoming/お知らせ-4-2.md
+python -m app.stage04.ingest --relink                          # 早見表を後から入れた場合
 ```
 
+DBパスは `app/data/db.py` と共通(既定 `var/kitakyushu_waste.db`、`--db` か `DB_PATH` で上書き可)。
 同じファイルを二度流しても新規行は増えない(`content_hash` で判定)。
 
 ```bash
@@ -155,3 +184,4 @@ python -m pytest tests/stage04_ingest_test.py -v
 1. **FANGさん**: `data_schema.md` §4 の `effective_from` は新行に書く解釈でよいか(「4.」参照)
 2. **FANGさん / 藤井さん**: `lookup_item_versions` を追加したこと。既存の `lookup_item_exact` 等の契約には手を触れていない
 3. **全員**: 配布ファイル由来の出典 `knowledge://…` の表記と、回答本文での見せ方
+4. **FANGさん**: クローラー結果と `お知らせ-4-2.md` の「現行」表記の食い違い(8件不一致・7件欠落)。クローラー側の問題か、お知らせが意図的にずらした採点データかを確認したい
