@@ -16,11 +16,11 @@ The answer-text evaluation (本田さん) is built on top of this, not here.
 
 Run standalone for a grader-style table::
 
-    python -m tests.stage04_eval
+    python -m tests.notices_eval
 
 or as a test::
 
-    pytest tests/stage04_eval_test.py
+    pytest tests/notices_eval_test.py
 """
 
 from __future__ import annotations
@@ -33,11 +33,11 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from app.data.schema import WasteItem
-from app.stage04 import store
-from app.stage04.ingest import IngestResult, ingest_notice_file, relink
+from app.notices import store
+from app.notices.ingest import IngestResult, ingest_notice_file, relink
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CASES_PATH = Path(__file__).resolve().parent / "fixtures" / "stage04_eval_cases.json"
+CASES_PATH = Path(__file__).resolve().parent / "fixtures" / "notices_eval_cases.json"
 SEED_URL = "fixture://test-only"
 SEED_CRAWLED_AT = datetime(2026, 9, 1, tzinfo=timezone.utc)
 INGEST_AT = datetime(2026, 9, 8, 3, 0, 0, tzinfo=timezone.utc)
@@ -94,11 +94,12 @@ def build_eval_db(conn, cases: dict) -> "tuple[list[IngestResult], object]":
         haya = change["hayamihyo"]
         if haya is None:
             continue
+        seed_name = haya.get("stored_as", change["item"])
         store.insert_waste_item(
             conn,
             WasteItem(
-                item_name=change["item"],
-                item_name_raw=change["item"],
+                item_name=seed_name,
+                item_name_raw=seed_name,
                 disposal_method=haya["method"],
                 notes="",
                 source_url=SEED_URL,
@@ -206,6 +207,23 @@ def evaluate(conn, cases: dict, ingest_results, relink_result) -> EvalReport:
             ks is not None and ks["prior_disposal_method"] == c["notice_prior"],
             f"knowledge_sources.prior_disposal_method={ks and ks['prior_disposal_method']!r}",
         )
+
+        stored_as = (c["hayamihyo"] or {}).get("stored_as")
+        if stored_as:
+            ingest_partial = {
+                n for res in ingest_results for n, _ in res.partial_links
+            }
+            segs = store.item_timeline(conn, name).segments
+            old_seg = segs[0] if len(segs) == 2 else None
+            r.expect(
+                f"4-2 {name} (compound name)",
+                name in ingest_partial
+                and old_seg is not None
+                and old_seg.matched_item_name == stored_as
+                and old_seg.synthesized is False,
+                f"partial={name in ingest_partial} "
+                f"matched={old_seg and old_seg.matched_item_name!r}",
+            )
 
     # ---- item_timeline (the answer layer's entry point) ----
     ref = date.fromisoformat(cases["reference_date"])

@@ -2,7 +2,7 @@
 
 Covers the two seams STAGE 04 plugs into after issues #6-#10 landed:
 
-* `app/stage04/lookup.py` — the connection-free, is_current-agnostic read API the
+* `app/notices/lookup.py` — the connection-free, is_current-agnostic read API the
   router calls (mirrors `app/data/lookup.py`'s contract).
 * `app/rag/knowledge.py` — the WebUI's source list (STAGE02 2-3): ingested お知らせ
   must appear as one entry per file, and must not leak into the crawled-page
@@ -21,8 +21,8 @@ from pathlib import Path
 import pytest
 
 from app.data.schema import WasteItem
-from app.stage04 import store
-from app.stage04.ingest import ingest_notice_file
+from app.notices import store
+from app.notices.ingest import ingest_notice_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ADDITIONS = REPO_ROOT / "knowledge" / "incoming" / "お知らせ-4-1.md"
@@ -59,9 +59,9 @@ def db(tmp_path, monkeypatch):
     return path
 
 
-# --- app/stage04/lookup.py -------------------------------------------------
+# --- app/notices/lookup.py -------------------------------------------------
 def test_conn_free_lookup_returns_the_full_timeline(db):
-    from app.stage04 import lookup
+    from app.notices import lookup
 
     importlib.reload(lookup)  # drop any thread-local conn from a prior test
     tl = lookup.item_timeline("スプレー缶")
@@ -70,7 +70,7 @@ def test_conn_free_lookup_returns_the_full_timeline(db):
 
 
 def test_pending_change_gates_on_an_upcoming_switch(db):
-    from app.stage04 import lookup
+    from app.notices import lookup
 
     importlib.reload(lookup)
     assert lookup.pending_change("スプレー缶", TODAY) is not None      # 4-2 applies
@@ -81,7 +81,7 @@ def test_pending_change_gates_on_an_upcoming_switch(db):
 
 
 def test_conn_free_lookup_is_read_only(db):
-    from app.stage04 import lookup
+    from app.notices import lookup
 
     importlib.reload(lookup)
     lookup.item_timeline("テレビ")
@@ -161,14 +161,14 @@ def test_router_leaves_unchanged_items_alone(db):
         assert "出し方が変わります" not in ans.context
 
 
-def test_router_imports_without_stage04_lookup(monkeypatch):
+def test_router_imports_without_notices_lookup(monkeypatch):
     """PR #5 未マージ環境でも router.py が壊れないこと(guarded import)。"""
     import builtins
 
     real_import = builtins.__import__
 
     def fake_import(name, *a, **k):
-        if name == "app.stage04.lookup":
+        if name == "app.notices.lookup":
             raise ImportError("simulated: PR #5 not merged")
         return real_import(name, *a, **k)
 

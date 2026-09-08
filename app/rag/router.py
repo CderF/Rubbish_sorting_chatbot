@@ -73,10 +73,10 @@ def using_stubs() -> bool:
 
 
 # --- STAGE04 (要件4-2: 出し方の変更) の解決 -------------------------------
-# app/stage04/lookup.py は PR #5。未マージ環境でも router.py が import できる
+# app/notices/lookup.py は PR #5。未マージ環境でも router.py が import できる
 # よう、無い場合は「変更なし」を返すフォールバックに留める。
 try:
-    from app.stage04.lookup import pending_change  # type: ignore[import-not-found]
+    from app.notices.lookup import pending_change  # type: ignore[import-not-found]
 except ImportError:
     def pending_change(item_name: str, as_of):  # noqa: ARG001
         return None
@@ -328,14 +328,11 @@ def _search_item(item_name: str) -> tuple[list[ItemRecord], str | None]:
     """完全一致 → 部分一致 → ベクトル類似度 の順にフォールバックする(早見表パス)。
 
     ベクトル類似度は前2段がどちらも0件のときだけ発火する(issue #7)。
-    `vector_search_items` はChroma未構築でも例外を投げず空リストを返すので、
-    ここでの呼び出しに追加のガードは要らない。
+    `vector_search_items` はChroma未構築・関連ヒットなしのいずれも空リストを返す。
 
-    戻り値は (ヒット, どの段で当たったか)。段を返すのは、ベクトル由来の結果が
-    「質問された品目そのもの」とは限らないため。たとえば「アルミ缶」は早見表の
-    表記が「アルミかん」なので完全一致・部分一致とも外れ、ベクトル段まで落ちて
-    「油よけ(アルミ製)」のような別品目が混ざる。WebUIの根拠表示で区別できる
-    ようにしておく。
+    戻り値は (ヒット, どの段で当たったか)。段(`item_match_stage`)は WebUI の
+    根拠表示用。回答ロジックが使う「質問の品名そのものか、似た別品目か」の
+    判定は別で、呼び出し側の `_classify_item_match`(名前一致ベース)で行う。
     """
     exact = lookup_item_exact(item_name)
     if exact:
@@ -345,6 +342,19 @@ def _search_item(item_name: str) -> tuple[list[ItemRecord], str | None]:
         return partial, "partial"
     vector = vector_search_items(item_name, top_k=3)
     return vector, ("vector" if vector else None)
+
+
+def _classify_item_match(item_name: str, hits: list[ItemRecord]) -> str:
+    """"exact" / "analogy" / "none"。どの段でヒットしたかではなく、返ってきた
+    行の名前が質問の品名と実際に一致しているかで決める(PR #14 レビュー)。
+    partial(`LIKE '%クエリ%'`)は「テレビ」→「テレビ台」のように別品目を返す
+    ので analogy 側になる。"""
+    if not hits:
+        return "none"
+    q = _norm(item_name)
+    if any(_norm(getattr(h, "item_name", "")) == q for h in hits):
+        return "exact"
+    return "analogy"
 
 
 def _apply_timeline(result: ItemResult, today: "date | None" = None) -> list[str]:
@@ -443,6 +453,7 @@ def _blocking_route(
             item_name=name,
             hits=hits,
             match_stage=stage,
+            item_match=_classify_item_match(name, hits),
             from_image=turn.from_image and name == turn.item,
         )
         timeline_sources += _apply_timeline(result)
@@ -453,6 +464,11 @@ def _blocking_route(
         (r.match_stage for r in reversed(ans.item_results) if r.match_stage), None
     )
     ans.timeline_change = any(r.timeline_change for r in ans.item_results)
+    # 要件4-3 の断り書きは、1件でも類推が混じっていれば出す(PR #14)。
+    matches = {r.item_match for r in ans.item_results}
+    ans.item_match = (
+        "analogy" if "analogy" in matches else ("exact" if "exact" in matches else "none")
+    )
 
     # --- 収集日パス --------------------------------------------------------
     town = state.town
@@ -585,7 +601,11 @@ def _build_context(ans: RoutedAnswer) -> str:
     blocks: list[str] = []
 
     for result in ans.item_results:
-        lines = [f"## 分別早見表の検索結果: {result.item_name}"]
+        if result.item_match == "analogy":
+            # 要件4-3: ヒットはあるが質問された品名そのものではない(PR #14)。
+            lines = [f"## 早見表に「{result.item_name}」の個別記載なし ― 類似する品目の情報"]
+        else:
+            lines = [f"## 分別早見表の検索結果: {result.item_name}"]
         if result.hits:
             for r in result.hits:
                 lines.append(f"- 品名: {_attr(r, 'item_name', '')}")
@@ -603,11 +623,11 @@ def _build_context(ans: RoutedAnswer) -> str:
     if ans.schedule_hits:
         lines = ["## 収集日の検索結果"]
         for s in ans.schedule_hits:
-            # weekday はカンマ区切り(例 "火,金")。読み上げやすい表記に直す。
-            days = "・".join(d.strip() for d in s.weekday.split(",") if d.strip())
+            # weekday は実データでは既に完全な表記("火曜日・金曜日"、月次の粗大ごみ
+            # なら "第2木曜日" 等)なので、ここで「曜日」を足さない(PR #20)。
             labels = _matching_item_labels(ans, s.waste_type)
             suffix = f" ← {'・'.join(labels)}はこの区分" if labels else ""
-            lines.append(f"- {s.ward}{s.town} / {s.waste_type}: {days}曜日{suffix}")
+            lines.append(f"- {s.ward}{s.town} / {s.waste_type}: {s.weekday}{suffix}")
         blocks.append("\n".join(lines))
 
     return "\n\n".join(blocks)
@@ -690,6 +710,15 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
             "どちらか一方だけを答えて断定しない。\n"
         )
 
+    if ans.item_match == "analogy":
+        parts.append(
+            "- 『類似する品目の情報』欄の品目は、質問された品名そのものではなく"
+            "早見表にある別の品目である。その欄に書かれている実際の品目名を挙げて"
+            "「類似する『(その品目名)』に準じると〜」の形で案内し、断定しない。"
+            "個別の記載がないため、正確な分別は北九州市の公式ページや窓口で"
+            "確認するよう必ず添える。収集日など他の欄の情報はこの限りではない。\n"
+        )
+
     if ans.missing:
         parts.append(
             f"- 収集日を答えるには{'・'.join(ans.missing)}が必要である。"
@@ -742,6 +771,7 @@ def describe_sources(ans: RoutedAnswer) -> dict:
                 "item_name": r.item_name,
                 "match_stage": r.match_stage,
                 "match_stage_label": MATCH_STAGE_LABELS.get(r.match_stage or ""),
+                "item_match": r.item_match,
                 "hits": len(r.hits),
                 "timeline_change": r.timeline_change,
             }

@@ -58,7 +58,7 @@ STAGE02/03で構築する構造化DB(SQLite)の2テーブルを定義する。ST
 | `ward` | TEXT | NOT NULL | 区名(例: "門司区") |
 | `town` | TEXT | NOT NULL | 町名・丁目(例: "中町1丁目") |
 | `waste_type` | TEXT | NOT NULL | ごみ種別(家庭ごみ/プラスチック/資源ごみ/粗大ごみ 等、ページに準拠した表記) |
-| `weekday` | TEXT | NOT NULL | 収集曜日。複数曜日の場合はカンマ区切り(例: `"月,木"`) |
+| `weekday` | TEXT | NOT NULL | 収集曜日。ページの表記をそのまま格納した完全な文字列(例: `"火曜日・金曜日"`、月次の粗大ごみは `"第2木曜日"` 等)。カンマ区切りの裸の曜日ではない — 利用側で「曜日」を追加で足さないこと(実際の不具合: STAGE03採点で二重表記"第2木曜日曜日"になっていた) |
 | `source_url` | TEXT | NOT NULL | 参照元ページURL |
 | `crawled_at` | TEXT | NOT NULL | 取得日時(ISO8601、`waste_items`と同形式) |
 | `is_current` | INTEGER(BOOL) | NOT NULL | 最新版フラグ。STAGE02/03では常に `1` |
@@ -75,7 +75,7 @@ STAGE02/03で構築する構造化DB(SQLite)の2テーブルを定義する。ST
   "ward": "門司区",
   "town": "中町1丁目",
   "waste_type": "家庭ごみ",
-  "weekday": "火,金",
+  "weekday": "火曜日・金曜日",
   "source_url": "https://www.city.kitakyushu.lg.jp/contents/924_10102.html",
   "crawled_at": "2026-09-08T01:10:00Z",
   "is_current": 1,

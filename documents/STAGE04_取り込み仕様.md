@@ -24,11 +24,11 @@ Team B / Teamb4 (周 楚涵)
 
 | ファイル | 役割 |
 |---|---|
-| `app/stage04/notice_parser.py` | Markdown解析のみ。I/O・DB・ネットワークに触れない |
-| `app/stage04/store.py` | `app/data/db.py` の上に構築。`knowledge_sources` テーブルと、バージョン列の読み取り(`lookup_item_history` / `version_window`)だけを追加する |
-| `app/stage04/ingest.py` | `Notice` → `WasteItem` 変換、新旧リンク、`relink`、CLIエントリポイント |
-| `tests/stage04_ingest_test.py` | 単体テスト(パーサ・store・ingest・relink) |
-| `tests/stage04_eval.py` + `tests/fixtures/stage04_eval_cases.json` | 『質問 → 期待DB状態』評価(4-1/4-2、データ側)。`python -m tests.stage04_eval` でグレーダー風の表を出力 |
+| `app/notices/notice_parser.py` | Markdown解析のみ。I/O・DB・ネットワークに触れない |
+| `app/notices/store.py` | `app/data/db.py` の上に構築。`knowledge_sources` テーブルと、バージョン列の読み取り(`lookup_item_history` / `version_window`)だけを追加する |
+| `app/notices/ingest.py` | `Notice` → `WasteItem` 変換、新旧リンク、`relink`、CLIエントリポイント |
+| `tests/notices_ingest_test.py` | 単体テスト(パーサ・store・ingest・relink) |
+| `tests/notices_eval.py` + `tests/fixtures/notices_eval_cases.json` | 『質問 → 期待DB状態』評価(4-1/4-2、データ側)。`python -m tests.notices_eval` でグレーダー風の表を出力 |
 | `tests/fixtures/hayamihyo_seed.json` | **テスト専用**の擬似早見表15件。本番投入禁止 |
 
 `app/data/` 配下(Teamb2担当)のファイルは一切変更していない。`app/data/schema.py` の `WasteItem` を
@@ -110,7 +110,7 @@ Team B / Teamb4 (周 楚涵)
 `IngestResult.unlinked` に品名を列挙する。クローラー実行後に:
 
 ```bash
-python -m app.stage04.ingest --relink
+python -m app.notices.ingest --relink
 ```
 
 を実行すると、`knowledge_sources` に記録した変更通知のうち前身が未接続のものを、
@@ -138,7 +138,7 @@ python -m app.stage04.ingest --relink
 
 ```python
 from datetime import date
-from app.stage04 import store
+from app.notices import store
 
 conn = store.connect()                       # 共用DB（var/kitakyushu_waste.db、DB_PATH で上書き可）
 tl = store.item_timeline(conn, "スプレー缶")   # ← これ1本で足りる想定
@@ -160,6 +160,7 @@ class TimelineSegment:
     synthesized: bool             # 行が無く、お知らせの記述から復元した区間か
     disputed: bool                # 早見表の行とお知らせの言う現行が食い違う
     hayamihyo_disposal_method: str | None  # disputed のとき、早見表側の値
+    matched_item_name: str | None # 早見表がより具体的な複合名で持つとき、その名前
 
 @dataclass(frozen=True)
 class ItemTimeline:
@@ -227,16 +228,28 @@ STAGE04で追加した3つ目のテーブル。共有2テーブルには無い�
 ## 8. 実行方法
 
 ```bash
-python -m app.data.db                                          # 先にクローラーで早見表DBを構築
-python -m app.stage04.ingest knowledge/incoming/お知らせ-4-1.md knowledge/incoming/お知らせ-4-2.md
-python -m app.stage04.ingest --relink                          # 早見表を後から入れた場合
+make knowledge     # crawl → ingest → relink → ベクトルインデックス再構築(全部)
 ```
 
-DBパスは `app/data/db.py` と共通(既定 `var/kitakyushu_waste.db`、`--db` か `DB_PATH` で上書き可)。
-同じファイルを二度流しても新規行は増えない(`content_hash` で判定)。
+個別に:
 
 ```bash
-python -m pytest tests/stage04_ingest_test.py -v
+make crawl         # = python -m app.data.db
+make ingest        # = python -m app.notices.ingest knowledge/incoming/*.md
+make relink        # = python -m app.notices.ingest --relink
+make index         # = python -m app.rag.vector_store
+```
+
+**データ層(`app/data/`)や `knowledge/incoming/` を変えたら `make knowledge` を通す。**
+`ingest`+`relink` を飛ばすと 4-2(出し方の変更)が空になり、`index` を飛ばすと
+4-1 の追加品目が 4-3 の類似検索に出てこない。B1 では systemd の `ExecStartPre` が
+起動時に `ingest`+`relink`(冪等)だけは流し直す(クロールとインデックス再構築はしない)。
+
+DBパスは `app/data/db.py` と共通(既定 `var/kitakyushu_waste.db`、`DB_PATH` で上書き可)。
+同じお知らせを二度流しても新規行は増えない(`content_hash` で判定)。
+
+```bash
+python -m pytest tests/notices_ingest_test.py -v
 ```
 
 テストはすべてインメモリSQLite上で完結し、GPU・L4サーバー・ネットワークを必要としない。
@@ -246,14 +259,14 @@ python -m pytest tests/stage04_ingest_test.py -v
 PR #6〜#10 がマージされ、`app/rag/router.py`(藤井さん)・`app/rag/knowledge.py`
 (WebUI 2-3)が main にある。STAGE04 側はそこに次の形で噛み合う。
 
-### router 向けの読み取り API — `app/stage04/lookup.py`
+### router 向けの読み取り API — `app/notices/lookup.py`
 
 `app/data/lookup.py` と同じ作法(接続引数なし・スレッドローカル接続・`query_only`・
 未検出でも例外なし)。違いは **`is_current = 1` で絞らない**こと(4-2 は旧ルールも要る)。
 
 ```python
 from datetime import date
-from app.stage04 import lookup
+from app.notices import lookup
 
 tl = lookup.item_timeline(item_name)              # ItemTimeline（found=False なら 4-3 へ）
 tl = lookup.pending_change(item_name, date.today())  # 切替が今日以降にあるときだけ ItemTimeline、なければ None
@@ -267,7 +280,7 @@ tl = lookup.pending_change(item_name, date.today())  # 切替が今日以降に�
 参考(実装の要点):
 
 ```python
-from app.stage04.lookup import pending_change
+from app.notices.lookup import pending_change
 
 tl = pending_change(item_name, date.today())
 if tl is not None:
@@ -292,10 +305,15 @@ system prompt ルールを見て詰める。
 
 ## 9. まだやっていないこと(担当境界)
 
-- **4-3(類似品物の但し書き)は未対応。** `_search_item` がヒット段階(exact/partial/similar)を
-  `RoutedAnswer` に立て、`build_system_prompt` に「similar のときは『類似する◯◯に準じると…。
-  確実な分別は市に確認を』と書く」規則を足す。`_search_item` の1行変更が要るので藤井さんと相談。
-- 4-3(早見表に無い品目の類似品物フォールバック) — 本田さん担当
+- **4-3(類似品目の断り書き)は実装済み(PR #14)。** `_classify_item_match` が
+  「返ってきた行の名前が質問の品名と一致するか」で `ans.item_match` を
+  `exact` / `analogy` / `none` に分類し(どの検索段でヒットしたかでは判定しない)、
+  `analogy` のとき `_build_context` が早見表セクションを「早見表に個別記載なし ―
+  類似する品目の情報」に張り替え、`build_system_prompt` が「その欄の実際の品目名を
+  挙げて『類似する◯◯に準じると〜』、正確には市に確認、収集日など他の欄はこの限りでない」
+  規則を出す。無関係なヒットを弾くための距離しきい値を
+  `vector_store._ITEM_MATCH_MAX_DISTANCE` に置いた(実データで要調整)。
+  **残:回答文言のトーン調整と、しきい値の実データチューニング — 本田さん。**
 - 早見表・収集日クローラー(issue #4) — Teamb2担当
 
 ## 10. チームへの確認事項

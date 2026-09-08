@@ -65,11 +65,12 @@ def seeded_db():
             _item("ペットボトル", "資源化ごみ", "キャップとラベルを外す"),
         ],
         [
-            _schedule("小倉北区", "浅野1丁目", "家庭ごみ", "月,木"),
-            _schedule("小倉北区", "浅野1丁目", "粗大ごみ", "第2水"),
-            _schedule("小倉北区", "篠崎1丁目", "家庭ごみ", "火,金"),
-            _schedule("八幡西区", "黒崎", "家庭ごみ", "水,土"),
-            _schedule("八幡西区", "黒崎", "粗大ごみ", "第4金"),
+            # weekday は実データの表記そのまま(PR #20: ここに「曜日」を足さない)
+            _schedule("小倉北区", "浅野1丁目", "家庭ごみ", "月曜日・木曜日"),
+            _schedule("小倉北区", "浅野1丁目", "粗大ごみ", "第2水曜日"),
+            _schedule("小倉北区", "篠崎1丁目", "家庭ごみ", "火曜日・金曜日"),
+            _schedule("八幡西区", "黒崎", "家庭ごみ", "水曜日・土曜日"),
+            _schedule("八幡西区", "黒崎", "粗大ごみ", "第4金曜日"),
         ],
     )
     conn.close()
@@ -106,7 +107,7 @@ def test_bare_town_name_without_a_suffix_resolves():
     ans = _blocking_route("八幡西区黒崎の家庭ごみの収集日は?")
 
     assert ans.detected_town == "黒崎"
-    assert "水・土曜日" in ans.context
+    assert "水曜日・土曜日" in ans.context
     assert not ans.missing
 
 

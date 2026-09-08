@@ -25,8 +25,8 @@ SHA-256) but retries the link.
 
 Usage::
 
-    python -m app.stage04.ingest knowledge/incoming/お知らせ-4-1.md
-    python -m app.stage04.ingest --relink        # after the crawler has run
+    python -m app.notices.ingest knowledge/incoming/お知らせ-4-1.md
+    python -m app.notices.ingest --relink        # after the crawler has run
 """
 
 from __future__ import annotations
@@ -39,8 +39,8 @@ from datetime import datetime
 from pathlib import Path
 
 from app.data.schema import WasteItem
-from app.stage04 import store
-from app.stage04.notice_parser import Notice, parse_notice_file
+from app.notices import store
+from app.notices.notice_parser import Notice, parse_notice_file
 
 # 語順違い(使い捨てライター→ライター)は LIKE では拾えないので、任意でベクトル
 # 検索(issue #7)を使う。未インストール/インデックス未構築でも動くようフォール
