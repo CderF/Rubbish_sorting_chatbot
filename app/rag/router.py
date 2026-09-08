@@ -401,9 +401,11 @@ def _build_context(ans: RoutedAnswer) -> str:
     if ans.schedule_hits:
         lines = ["## 収集日の検索結果"]
         for s in ans.schedule_hits:
-            # weekday はカンマ区切り(例 "火,金")。読み上げやすい表記に直す。
-            days = "・".join(d.strip() for d in s.weekday.split(",") if d.strip())
-            lines.append(f"- {s.ward}{s.town} / {s.waste_type}: {days}曜日")
+            # weekday は実データでは既に完全な表記("火曜日・金曜日"、月次の粗大ごみ
+            # なら "第2木曜日" 等)。カンマ区切りの裸の曜日という想定
+            # (documents/data_schema.md の旧サンプル記述、実データとは不一致だった)
+            # で「曜日」を追加で足すと "第2木曜日曜日" のような二重表記になっていた。
+            lines.append(f"- {s.ward}{s.town} / {s.waste_type}: {s.weekday}")
         blocks.append("\n".join(lines))
 
     return "\n\n".join(blocks)
