@@ -404,3 +404,64 @@ def test_build_trace_record_shape():
     # JSON 化できること(server がそのまま書き出す)
     import json as _j
     _j.dumps(rec, ensure_ascii=False)
+
+
+# --- natural grader phrasing must still resolve the item (trace回帰) -----
+def test_question_tail_strips_natural_phrasings():
+    from app.rag.router import _item_name_candidates as C
+
+    for q, want in [
+        ("スプレー缶はどう捨てればいいですか？", "スプレー缶"),
+        ("ホバーボードはどこで回収してもらえますか？", "ホバーボード"),
+        ("蛍光管はどこに出せばいいですか？", "蛍光管"),
+        ("VRゴーグルの処分方法を教えてください。", "VRゴーグル"),
+        ("電動一輪車を回収してもらう方法を教えてください。", "電動一輪車"),
+    ]:
+        cands, _ = C(q)
+        assert cands[0] == want, (q, cands)
+
+    # 品名側に「捨て」「ごみ」を含む語を消さない
+    cands, _ = C("カイロ(使い捨て)はどう捨てますか")
+    assert cands[0] == "カイロ(使い捨て)"
+
+
+def test_junk_modifiers_strip_size_shape_prefixes():
+    from app.rag.router import _clean_fragment as F
+
+    assert F("小型のドローン") == "ドローン"
+    assert F("家庭用の小型精米機") == "精米機"
+    assert F("三輪の電動キャリーカート") == "電動キャリーカート"
+    assert F("折り畳み式の電動車椅子") == "電動車椅子"
+
+
+def test_resolve_named_hit_boundary_rules():
+    from app.rag.router import _resolve_named_hit as RH
+
+    # 文頭 / 助詞の直後 → 完全一致とみなす
+    assert RH("ホバーボードはどこで回収", [_rec("ホバーボード")]).item_name == "ホバーボード"
+    assert RH("小型のドローンはどう", [_rec("ドローン")]).item_name == "ドローン"
+    # 語の一部(直前が漢字・かな) → 別品目=類推、拾わない
+    assert RH("電動スケートボードはどう捨てますか", [_rec("スケートボード")]) is None
+    assert RH("ワイヤレスイヤホンはどう", [_rec("イヤホン")]) is None
+    # 主辞(名前の終端が最も右)を採る
+    got = RH("電動一輪車用の充電ケーブルだけを処分したい",
+             [_rec("充電ケーブル"), _rec("電動一輪車"), _rec("ケーブル")])
+    assert got.item_name == "充電ケーブル"
+
+
+def test_blocking_route_recovers_item_from_polluted_candidate(monkeypatch):
+    # 「スプレー缶はどう捨てればいいですか」→ 候補が汚れて vector に落ちるが、
+    # ヒット名「スプレー缶」が原文にあるので exact に復帰し timeline を引く。
+    monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
+    monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    monkeypatch.setattr(
+        router, "vector_search_items",
+        lambda q, top_k=3: [_rec("スプレー缶"), _rec("殺虫剤スプレー缶")],
+    )
+    monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
+
+    ans = router._blocking_route("スプレー缶はどう捨てればいいですか？")
+    assert ans.item_match == "exact"
+    assert ans.detected_item == "スプレー缶"
+    assert ans.analogy_unreliable is False
+    assert ans.canned_response is None
