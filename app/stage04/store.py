@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import sqlite3
 import unicodedata
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -264,3 +265,143 @@ def list_knowledge_sources(conn: sqlite3.Connection) -> "list[dict[str, Any]]":
         "SELECT * FROM knowledge_sources ORDER BY source_file, anchor"
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------
+# item_timeline — a flat old→new view for the answer layer (requirement 4-2)
+# --------------------------------------------------------------------------
+@dataclass(frozen=True)
+class TimelineSegment:
+    """One rule and the span it applies to.
+
+    `valid_from = None` means "from the baseline" (no known start); `valid_until
+    = None` means "still in force". `synthesized` marks a segment that has no row
+    of its own — it was reconstructed from a notice's account of the prior 早見表
+    treatment, used when the crawler never had (or has since lost) that row.
+    """
+
+    disposal_method: str
+    valid_from: "date | None"
+    valid_until: "date | None"
+    source_url: str
+    from_notice: bool
+    synthesized: bool = False
+    # set when the 早見表 row and a notice's stated 現行 disagree: `disposal_method`
+    # holds the notice's account (authoritative "before"), `hayamihyo_disposal_method`
+    # the crawled row's differing value.
+    disputed: bool = False
+    hayamihyo_disposal_method: "str | None" = None
+
+
+@dataclass(frozen=True)
+class ItemTimeline:
+    item_name: str
+    found: bool
+    segments: "tuple[TimelineSegment, ...]"
+
+    @property
+    def current_segment(self) -> "TimelineSegment | None":
+        """The rule with no end date (the latest one)."""
+        for seg in reversed(self.segments):
+            if seg.valid_until is None:
+                return seg
+        return self.segments[-1] if self.segments else None
+
+    @property
+    def change_dates(self) -> "tuple[date, ...]":
+        """Every switch-over date (the `valid_from` of each non-first segment)."""
+        return tuple(
+            seg.valid_from for seg in self.segments[1:] if seg.valid_from is not None
+        )
+
+    def segment_on(self, when: date) -> "TimelineSegment | None":
+        """Which rule applies on `when`."""
+        for seg in self.segments:
+            if (seg.valid_from is None or seg.valid_from <= when) and (
+                seg.valid_until is None or when <= seg.valid_until
+            ):
+                return seg
+        return None
+
+    def changes_after(self, when: date) -> "tuple[date, ...]":
+        """Switch-over dates strictly after `when` — non-empty ⇒ 4-2 applies."""
+        return tuple(d for d in self.change_dates if d > when)
+
+
+def knowledge_source_for_item(
+    conn: sqlite3.Connection, produced_item_id: int
+) -> "sqlite3.Row | None":
+    return conn.execute(
+        "SELECT * FROM knowledge_sources WHERE produced_item_id = ? LIMIT 1",
+        (produced_item_id,),
+    ).fetchone()
+
+
+def item_timeline(conn: sqlite3.Connection, item_name: str) -> ItemTimeline:
+    """`lookup_item_versions` + `version_window`, flattened into an ordered list
+    of (rule, span) so the answer layer never has to parse `notes` or reason
+    about `is_current` / `superseded_by`.
+
+    * 4-1 addition ....... 1 open-ended segment
+    * 4-2, predecessor ... 2+ segments, real rows on both sides
+    * 4-2, no predecessor  2 segments — the older one `synthesized=True`,
+                           its rule taken from `knowledge_sources.prior_disposal_method`
+    * unknown item ....... found=False, no segments (caller falls back to 4-3)
+    """
+    versions = lookup_item_versions(conn, item_name)
+    if not versions:
+        return ItemTimeline(normalize_item_name(item_name), found=False, segments=())
+
+    segments: "list[TimelineSegment]" = []
+
+    first = versions[0]
+    first_from_notice = first.source_url.startswith(KNOWLEDGE_SCHEME)
+    if len(versions) == 1 and first_from_notice and first.effective_from is not None:
+        # A change notice landed with no 早見表 row to supersede. Rebuild the
+        # prior segment from the notice's own account of it.
+        ks = knowledge_source_for_item(conn, first.id) if first.id else None
+        prior = ks["prior_disposal_method"] if ks else None
+        if prior:
+            segments.append(
+                TimelineSegment(
+                    disposal_method=prior,
+                    valid_from=None,
+                    valid_until=first.effective_from - timedelta(days=1),
+                    source_url=first.source_url,
+                    from_notice=True,
+                    synthesized=True,
+                )
+            )
+
+    for i, v in enumerate(versions):
+        vf, vu = version_window(versions, i)
+        from_notice = v.source_url.startswith(KNOWLEDGE_SCHEME)
+        method, disputed, hayamihyo_method = v.disposal_method, False, None
+        successor = versions[i + 1] if i + 1 < len(versions) else None
+        if not from_notice and successor is not None:
+            ks = (
+                knowledge_source_for_item(conn, successor.id)
+                if successor.id
+                and successor.source_url.startswith(KNOWLEDGE_SCHEME)
+                else None
+            )
+            notice_prior = ks["prior_disposal_method"] if ks else None
+            if notice_prior and notice_prior not in v.disposal_method:
+                # the お知らせ is a targeted statement about this item's prior
+                # rule; prefer it over a possibly stale / mis-parsed 早見表 row.
+                method, disputed, hayamihyo_method = notice_prior, True, v.disposal_method
+        segments.append(
+            TimelineSegment(
+                disposal_method=method,
+                valid_from=vf,
+                valid_until=vu,
+                source_url=v.source_url,
+                from_notice=from_notice,
+                disputed=disputed,
+                hayamihyo_disposal_method=hayamihyo_method,
+            )
+        )
+
+    return ItemTimeline(
+        normalize_item_name(item_name), found=True, segments=tuple(segments)
+    )

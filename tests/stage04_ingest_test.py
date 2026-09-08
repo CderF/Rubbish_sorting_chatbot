@@ -415,3 +415,60 @@ def test_prior_disposal_method_is_persisted(conn):
     by_anchor = {r["anchor"]: r for r in store.list_knowledge_sources(conn)}
     assert by_anchor["お知らせ-01-スプレー缶"]["prior_disposal_method"] == "燃えないごみ"
     assert by_anchor["お知らせ-15-乾電池"]["prior_disposal_method"].startswith("電池類。")
+
+
+# --------------------------------------------------------------------------
+# item_timeline — the flat old→new view for the answer layer
+# --------------------------------------------------------------------------
+def test_item_timeline_linked_pair(seeded_conn):
+    ingest_notice_file(CHANGES, seeded_conn, now=INGEST_AT)
+    tl = store.item_timeline(seeded_conn, "スプレー缶")
+
+    assert tl.found is True
+    assert len(tl.segments) == 2
+    old, new = tl.segments
+    assert old.synthesized is False
+    assert old.disposal_method == "燃えないごみ"
+    assert (old.valid_from, old.valid_until) == (None, PRIOR_END)
+    assert new.from_notice is True
+    assert (new.valid_from, new.valid_until) == (CHANGE_START, None)
+    assert tl.change_dates == (CHANGE_START,)
+    assert tl.segment_on(date(2026, 9, 8)).disposal_method == "燃えないごみ"
+    assert "かん・びん" in tl.segment_on(date(2026, 10, 2)).disposal_method
+    assert tl.changes_after(date(2026, 9, 8)) == (CHANGE_START,)
+    assert tl.changes_after(date(2026, 11, 1)) == ()
+
+
+def test_item_timeline_synthesizes_prior_when_crawler_lacks_the_row(conn):
+    ingest_notice_file(CHANGES, conn, now=INGEST_AT)  # empty DB, nothing to link
+    tl = store.item_timeline(conn, "乾電池")
+
+    assert len(tl.segments) == 2
+    old, new = tl.segments
+    assert old.synthesized is True
+    assert old.disposal_method.startswith("電池類。")
+    assert (old.valid_from, old.valid_until) == (None, PRIOR_END)
+    assert new.synthesized is False and new.valid_from == CHANGE_START
+    assert tl.segment_on(date(2026, 9, 8)).synthesized is True
+    assert tl.changes_after(date(2026, 9, 8)) == (CHANGE_START,)
+
+
+def test_item_timeline_addition_is_one_open_segment(conn):
+    ingest_notice_file(ADDITIONS, conn, now=INGEST_AT)
+    tl = store.item_timeline(conn, "ホバーボード")
+
+    assert tl.found is True
+    assert len(tl.segments) == 1
+    seg = tl.segments[0]
+    assert (seg.valid_from, seg.valid_until) == (None, None)
+    assert seg.from_notice is True and seg.synthesized is False
+    assert tl.change_dates == ()
+    assert tl.changes_after(date(2026, 9, 8)) == ()
+
+
+def test_item_timeline_unknown_item(conn):
+    tl = store.item_timeline(conn, "宇宙服")
+    assert tl.found is False
+    assert tl.segments == ()
+    assert tl.current_segment is None
+    assert tl.segment_on(date(2026, 9, 8)) is None

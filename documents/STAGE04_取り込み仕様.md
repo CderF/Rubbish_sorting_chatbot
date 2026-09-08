@@ -106,18 +106,56 @@ python -m app.stage04.ingest --relink
 ## 5. 引き渡し契約(本田さん向け)
 
 ```python
+from datetime import date
 from app.stage04 import store
 
-conn = store.connect("data/knowledge.db")
-versions = store.lookup_item_versions(conn, "スプレー缶")   # 古い順、is_current で絞らない
-valid_from, valid_until = store.version_window(versions, 0)  # その版の有効期間
+conn = store.connect()                       # 共用DB（var/kitakyushu_waste.db、DB_PATH で上書き可）
+tl = store.item_timeline(conn, "スプレー缶")   # ← これ1本で足りる想定
 ```
 
-- `lookup_item_versions(conn, item_name) -> list[WasteItem]`
-  同一品名の**全バージョン**を古い順(`effective_from` が `NULL` の早見表ベースライン → 日付昇順)で返す。
-  該当なしは空リスト、例外は投げない。クエリ側もNFKC正規化する。
-- `version_window(versions, index) -> (valid_from, valid_until)`
-  `versions[index]` の有効期間。最新版の `valid_until` は `None`。
+### `item_timeline(conn, item_name) -> ItemTimeline` （推奨。本田さんはこれだけ使えばよい）
+
+`lookup_item_versions` + `version_window` を平坦化し、`notes` のパースや `is_current` /
+`superseded_by` の解釈を一切せずに「旧ルール → 新ルール」の時系列を扱えるようにしたもの。
+
+```python
+@dataclass(frozen=True)
+class TimelineSegment:
+    disposal_method: str
+    valid_from: date | None      # None = ベースライン（開始日不明）
+    valid_until: date | None      # None = 現在も有効
+    source_url: str
+    from_notice: bool             # 配布お知らせ由来か
+    synthesized: bool             # 行が無く、お知らせの記述から復元した区間か
+    disputed: bool                # 早見表の行とお知らせの言う現行が食い違う
+    hayamihyo_disposal_method: str | None  # disputed のとき、早見表側の値
+
+@dataclass(frozen=True)
+class ItemTimeline:
+    item_name: str
+    found: bool                    # False ⇒ DBに無い ⇒ 呼び出し側は 4-3 へ
+    segments: tuple[TimelineSegment, ...]   # 時系列順
+
+    current_segment          # valid_until が None の区間（最新ルール）
+    change_dates             # 切替日のタプル
+    segment_on(when)         # その日に適用される区間
+    changes_after(when)      # when より後の切替日。空でなければ 4-2 が該当
+```
+
+パターン別の戻り:
+
+| ケース | `segments` |
+|---|---|
+| 4-1 追加(ホバーボード等) | 1区間、`valid_from = valid_until = None` |
+| 4-2 前身あり(スプレー缶等) | 2区間以上、両側とも実レコード |
+| 4-2 前身なし(乾電池・蛍光管等) | 2区間。古い方は `synthesized = True`、分別は `knowledge_sources.prior_disposal_method` から復元 |
+| 4-2 かつ早見表と食い違い(スプレー缶等) | 古い区間の `disposal_method` はお知らせの言う現行(`disputed = True`、早見表側の値は `hayamihyo_disposal_method`)。**お知らせを正とする** |
+| DBに無い | `found = False`、`segments = ()` |
+
+### 低レベル関数（`item_timeline` の内部。直接使ってもよい）
+
+- `lookup_item_versions(conn, item_name) -> list[WasteItem]` — 全バージョンを古い順。該当なしは空、例外なし。NFKC正規化済み
+- `version_window(versions, index) -> (valid_from, valid_until)` — その版の有効期間。最新版の `valid_until` は `None`
 
 **なぜ別関数が必要か**: `app/data/lookup.py` の `lookup_item_exact` は `WHERE is_current = 1` を必ず付ける取り決め
 (`data_schema.md` §3)なので、構造上いつでも新規則しか見えない。これは要件4-2が禁じている

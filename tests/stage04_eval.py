@@ -207,6 +207,36 @@ def evaluate(conn, cases: dict, ingest_results, relink_result) -> EvalReport:
             f"knowledge_sources.prior_disposal_method={ks and ks['prior_disposal_method']!r}",
         )
 
+    # ---- item_timeline (the answer layer's entry point) ----
+    ref = date.fromisoformat(cases["reference_date"])
+    for c in cases["additions"]:
+        tl = store.item_timeline(conn, c["item"])
+        r.expect(
+            f"timeline 4-1 {c['item']}",
+            tl.found and len(tl.segments) == 1
+            and tl.segments[0].valid_from is None and tl.segments[0].valid_until is None
+            and tl.changes_after(ref) == (),
+            f"found={tl.found} segs={len(tl.segments)}",
+        )
+    for c in cases["changes"]:
+        tl = store.item_timeline(conn, c["item"])
+        seg_now = tl.segment_on(ref)
+        r.expect(
+            f"timeline 4-2 {c['item']}",
+            tl.found
+            and len(tl.segments) == 2
+            and tl.changes_after(ref) == (change_start,)
+            and seg_now is not None
+            and c["notice_prior"] in seg_now.disposal_method
+            and tl.segment_on(change_start).from_notice
+            and (tl.segments[0].synthesized == (c["hayamihyo"] is None)),
+            f"segs={len(tl.segments)} now={seg_now and seg_now.disposal_method[:20]!r} "
+            f"changes_after={tl.changes_after(ref)} synth0={tl.segments and tl.segments[0].synthesized}",
+        )
+    for c in cases["no_match"]:
+        tl = store.item_timeline(conn, c["item"])
+        r.expect(f"timeline no-match {c['item']}", tl.found is False and tl.segments == (), "")
+
     # ---- no match (4-3 trigger) ----
     for c in cases["no_match"]:
         name = c["item"]
@@ -238,3 +268,41 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --------------------------------------------------------------------------
+# answer-text evaluation (本田さん) — plug an answer function in here
+# --------------------------------------------------------------------------
+def evaluate_answers(conn, cases: dict, answer_fn) -> EvalReport:
+    """`answer_fn(conn, item_name, today) -> str` produces the user-facing
+    answer; this checks it against the `answer_must_*` keys in the cases file.
+
+    Not wired into CI yet — call it from a test once the answer function exists.
+    """
+    r = EvalReport()
+    today = date.fromisoformat(cases["reference_date"])
+
+    def check(case_id: str, text: str, c: dict) -> None:
+        for s in c.get("answer_must_contain", []):
+            r.expect(f"{case_id} contains {s!r}", s in text, f"answer={text!r}")
+        any_ok = c.get("answer_must_contain_any")
+        if any_ok:
+            r.expect(f"{case_id} any of {any_ok}", any(s in text for s in any_ok), f"answer={text!r}")
+        only = c.get("answer_must_not_be_only")
+        if only:
+            stripped = text
+            for s in only:
+                stripped = stripped.replace(s, "")
+            r.expect(
+                f"{case_id} not only {only}",
+                stripped.strip() != "" and len(stripped) < len(text),
+                "answer restates only the prior rule",
+            )
+
+    for c in cases["additions"]:
+        check(f"ans 4-1 {c['item']}", answer_fn(conn, c["item"], today), c)
+    for c in cases["changes"]:
+        check(f"ans 4-2 {c['item']}", answer_fn(conn, c["item"], today), c)
+    for c in cases["no_match"]:
+        check(f"ans no-match {c['item']}", answer_fn(conn, c["item"], today), c)
+    return r
