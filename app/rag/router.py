@@ -219,7 +219,9 @@ def _clean_fragment(frag: str) -> str:
     return frag.strip()
 
 
-def _item_name_candidates(prompt: str, strip_waste_words: bool | None = None) -> list[str]:
+def _item_name_candidates(
+    prompt: str, strip_waste_words: bool | None = None
+) -> tuple[list[str], str | None]:
     """質問文から品名候補を複数抜き出す(長い順、重複除去)。
 
     正規化はデータ層が内部で行う契約なので、ここでは行わず素の文字列を返す。
@@ -231,10 +233,19 @@ def _item_name_candidates(prompt: str, strip_waste_words: bool | None = None) ->
     ケースに備え、断片を1つに絞らず全て候補として返す。`_search_item` 側で
     主候補→残りの順に完全一致・部分一致を試してから、最後にベクトル検索へ
     フォールバックする。
+
+    戻り値は (完全一致・部分一致用の候補リスト, ベクトル検索用のクエリ)。
+    後者は前者と別に持つ: 「古いシャツ」→「古着」のように、`_clean_fragment`
+    で落とす修飾語("古い")が embedding的には強い手がかりになるケースがある
+    (実測: `vector_search_items("古いシャツ")` は1位が「古着」だが、
+    修飾語を落とした `vector_search_items("シャツ")` では「古着」が3位まで
+    後退し、"靴下"では上位3件から完全に消える)。完全一致・部分一致は文字列
+    一致なので雑音になる修飾語を落とした方が良いが、ベクトル検索はむしろ
+    修飾語込みの元の文のほうが精度が高いため、使い分ける。
     """
     text = _norm(prompt)
     if not text:
-        return []
+        return [], None
 
     if strip_waste_words is None:
         strip_waste_words = asks_schedule(text)
@@ -255,26 +266,34 @@ def _item_name_candidates(prompt: str, strip_waste_words: bool | None = None) ->
     text = _LEADING.sub("", text)
     text = _TRAILING.sub("", text).strip()
 
-    # 記号・空白で切り、断片ごとに修飾語を落として候補化する。
-    fragments: list[str] = []
+    # 記号・空白で切り、断片ごとに修飾語を落として候補化する
+    # (raw_fragments は修飾語を落とす前の断片。ベクトル検索クエリの選定用)。
+    raw_fragments: list[str] = []
+    candidates: list[str] = []
     for frag in re.split(r"[\s、。「」()（）]+", text):
         frag = _TRAILING.sub("", _LEADING.sub("", frag))
-        frag = _clean_fragment(frag)
-        if frag and frag not in fragments:
-            fragments.append(frag)
-    fragments.sort(key=len, reverse=True)
-    return fragments
+        if not frag:
+            continue
+        raw_fragments.append(frag)
+        cleaned = _clean_fragment(frag)
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+    candidates.sort(key=len, reverse=True)
+    vector_query = max(raw_fragments, key=len) if raw_fragments else None
+    return candidates, vector_query
 
 
 def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str | None:
     """質問文から品名らしき部分(主候補のみ)を取り出す。"""
-    candidates = _item_name_candidates(prompt, strip_waste_words)
+    candidates, _ = _item_name_candidates(prompt, strip_waste_words)
     return candidates[0] if candidates else None
 
 
 # --- 検索 ------------------------------------------------------------------
 def _search_item(
-    item_name: str, extra_candidates: list[str] | None = None
+    item_name: str,
+    extra_candidates: list[str] | None = None,
+    vector_query: str | None = None,
 ) -> tuple[list[ItemRecord], str | None]:
     """完全一致 → 部分一致 → ベクトル類似度 の順にフォールバックする(早見表パス)。
 
@@ -285,6 +304,15 @@ def _search_item(
     未回答になっていた実例が根拠)。ベクトル類似度は主候補・全候補の完全一致・
     部分一致がすべて0件のときだけ発火する(issue #7)。`vector_search_items` は
     Chroma未構築・関連ヒットなしのいずれも空リストを返す。
+
+    `vector_query` を渡された場合、ベクトル検索にはそちらを使い `item_name` は
+    使わない。完全一致・部分一致は文字列一致なので「古い」等の修飾語は雑音
+    だが、ベクトル検索は逆に修飾語込みの方が精度が高いケースがある(「古着」
+    は文字通り「古」＋「着」なので、「古いシャツ」のように修飾語が残っている
+    方が embedding 的に強い手がかりになる。実測: `vector_search_items` は
+    "古いシャツ"だと1位が「古着」、修飾語を落とした"シャツ"だと3位まで
+    後退する)。呼び出し側(`_blocking_route`)は修飾語を落とす前の原文断片を
+    `vector_query` として渡す。省略時は `item_name` を使う(後方互換)。
 
     戻り値は (ヒット, どの段で当たったか)。段(`item_match_stage`)は WebUI の
     根拠表示用。回答ロジックが使う「質問の品名そのものか、似た別品目か」の
@@ -305,7 +333,7 @@ def _search_item(
         partial = lookup_item_partial(cand)[:5]
         if partial:
             return partial, "partial"
-    vector = vector_search_items(item_name, top_k=3)
+    vector = vector_search_items(vector_query or item_name, top_k=3)
     return vector, ("vector" if vector else None)
 
 
@@ -370,15 +398,19 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     wants_schedule = asks_schedule(prompt)
 
     if image_item_name:
-        item_candidates = [image_item_name]
+        item_candidates, vector_query = [image_item_name], None
     else:
-        item_candidates = _item_name_candidates(prompt, strip_waste_words=wants_schedule)
+        item_candidates, vector_query = _item_name_candidates(
+            prompt, strip_waste_words=wants_schedule
+        )
     item_name = item_candidates[0] if item_candidates else None
     ans.detected_item = item_name
     ans.item_from_image = bool(image_item_name)
 
     if item_name:
-        ans.item_hits, ans.item_match_stage = _search_item(item_name, item_candidates[1:])
+        ans.item_hits, ans.item_match_stage = _search_item(
+            item_name, item_candidates[1:], vector_query
+        )
         ans.item_match = _classify_item_match(item_name, ans.item_hits)
 
     if ward:
