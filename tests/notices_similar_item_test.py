@@ -465,3 +465,42 @@ def test_blocking_route_recovers_item_from_polluted_candidate(monkeypatch):
     assert ans.detected_item == "スプレー缶"
     assert ans.analogy_unreliable is False
     assert ans.canned_response is None
+
+
+# --- _analogy_pick: 主辞・語彙関連で選ぶ(trace回帰) --------------------
+def test_analogy_pick_uses_query_relation():
+    from app.rag.router import _analogy_pick
+
+    # 「ミキサー」⊂「ハンドミキサー」を、距離順先頭の「ハンドクリーナー」より優先
+    hits = [_rec("ハンドクリーナー"), _rec("使い捨てカイロ"), _rec("ミキサー")]
+    assert _analogy_pick(hits, "ハンドミキサー").item_name == "ミキサー"
+
+    # 「時計」⊂「目覚まし時計」
+    hits = [_rec("湿気取りの容器(使い捨て)"), _rec("使い捨てカイロ"), _rec("時計")]
+    assert _analogy_pick(hits, "目覚まし時計").item_name == "時計"
+
+    # 共通連続「掃除」で「掃除機」を拾う(部分文字列でなくても)
+    hits = [_rec("使い捨てカイロ"), _rec("湿気取りの容器(使い捨て)"), _rec("掃除機")]
+    assert _analogy_pick(hits, "お掃除ロボット").item_name == "掃除機"
+
+    # 末尾一致(主辞)を優先: 「電動爪切り」→「缶切り」>「電動芝刈り機」
+    hits = [_rec("電動芝刈り機"), _rec("使い捨てカイロ"), _rec("缶切り")]
+    assert _analogy_pick(hits, "電動爪切り").item_name == "缶切り"
+
+
+def test_analogy_pick_filters_notice_records():
+    from app.rag.router import _analogy_pick
+
+    hits = [
+        _rec_src("USB卓上扇風機", "knowledge://お知らせ-4-1.md#x"),
+        _rec("ポータブルプレーヤー"),
+    ]
+    # knowledge:// のイベント回収告知は 4-3 の根拠に使わない
+    assert _analogy_pick(hits, "卓上扇風機").item_name == "ポータブルプレーヤー"
+
+
+def test_analogy_pick_no_query_keeps_first_non_notice():
+    from app.rag.router import _analogy_pick
+
+    hits = [_rec_src("VRゴーグル", "knowledge://x"), _rec("ヘッドホン")]
+    assert _analogy_pick(hits).item_name == "ヘッドホン"
