@@ -1,0 +1,30 @@
+{
+  "_README": [
+    "テスト専用の擬似「早見表」データです。本番DBに投入してはいけません。",
+    "出典がありません: source_url は fixture://test-only 固定で、北九州市のページを参照していません。",
+    "値の出どころは お知らせ-4-2.md 自身が述べている『現行（早見表）の…扱い』であり、",
+    "早見表ページをクロールした結果ではありません。",
+    "目的は、クローラー(issue #4, Teamb2)が未完成の段階でも STAGE04 の 4-2 新旧バージョン列を",
+    "エンドツーエンドで検証できるようにすることです。クローラー完成後はこのfixtureを捨て、",
+    "実データに差し替えてください。",
+    "disposal_method は notice_parser が抽出する prior_disposal_method と突き合わせるため、",
+    "通知本文の表記をそのまま入れています(乾電池のように実際の早見表なら出し方と備考に分かれるものも1列に入れています)。"
+  ],
+  "rows": [
+    {"item_name": "スプレー缶",       "disposal_method": "燃えないごみ",                                    "source_page_title": "ごみの分別早見表（さ行）"},
+    {"item_name": "蛍光管",          "disposal_method": "家庭ごみ",                                       "source_page_title": "ごみの分別早見表（か行）"},
+    {"item_name": "保冷剤",          "disposal_method": "資源化物",                                       "source_page_title": "ごみの分別早見表（は行）"},
+    {"item_name": "傘",             "disposal_method": "粗大ごみ",                                       "source_page_title": "ごみの分別早見表（か行）"},
+    {"item_name": "カセットボンベ",     "disposal_method": "燃えないごみ",                                    "source_page_title": "ごみの分別早見表（か行）"},
+    {"item_name": "魔法びん",         "disposal_method": "資源化物",                                       "source_page_title": "ごみの分別早見表（ま行）"},
+    {"item_name": "使い捨てライター",    "disposal_method": "資源化物",                                       "source_page_title": "ごみの分別早見表（た行）"},
+    {"item_name": "カセットテープ",     "disposal_method": "資源化物",                                       "source_page_title": "ごみの分別早見表（か行）"},
+    {"item_name": "フロッピーディスク",   "disposal_method": "小型電子機器回収ボックス",                            "source_page_title": "ごみの分別早見表（は行）"},
+    {"item_name": "使い捨てカイロ",     "disposal_method": "燃えないごみ",                                    "source_page_title": "ごみの分別早見表（た行）"},
+    {"item_name": "紙おむつ",         "disposal_method": "資源化物",                                       "source_page_title": "ごみの分別早見表（か行）"},
+    {"item_name": "ボールペン",        "disposal_method": "小物金属回収ボックス",                               "source_page_title": "ごみの分別早見表（は行）"},
+    {"item_name": "使用済みの花火",     "disposal_method": "そのまま家庭ごみに出してよい",                          "source_page_title": "ごみの分別早見表（さ行）"},
+    {"item_name": "ヘアピン",         "disposal_method": "家庭ごみ",                                       "source_page_title": "ごみの分別早見表（は行）"},
+    {"item_name": "乾電池",          "disposal_method": "電池類。回収ボックスへ。絶縁すれば家庭ごみにも出せる",       "source_page_title": "ごみの分別早見表（か行）"}
+  ]
+}

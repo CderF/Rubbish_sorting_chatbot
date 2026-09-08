@@ -40,7 +40,20 @@ documents/課題.pdf
 # Renamed copy of the same confidential PDF; never tracked, keep it that way.
 documents/北九州ゴミ分類Chatbot課題.pdf
 
+# --- data artefacts (STAGE 02-04) ----------------------------------------
+# var/ + *.db (above) hold the crawler's SQLite DB and STAGE 04 ingest output —
+# generated from knowledge/incoming/ + the crawl, not source. knowledge/incoming/
+# itself IS tracked: the distributed お知らせ files are ingest inputs.
+*.sqlite
+*.sqlite3
+chroma/
+.chroma/
+
 # --- os / editor -----------------------------------------------------------
 .DS_Store
 .vscode/
 .idea/
+
+# local scratch — earlier drafts kept on disk, not part of the repo
+/Claude outputs/
+/stage1/

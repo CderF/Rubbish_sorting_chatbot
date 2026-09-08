@@ -35,3 +35,6 @@ beautifulsoup4==4.15.0
 # at `pip install` time and pin torch explicitly to vllm's version if needed.
 chromadb==1.5.9
 sentence-transformers==6.0.1
+
+# tests only (tests/*_test.py run offline, no GPU needed)
+pytest==9.1.1

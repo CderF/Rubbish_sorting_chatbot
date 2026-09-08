@@ -6,6 +6,10 @@
 
 DBがまだ存在しない段階でも例外を投げず「0件」を返す。データ層の完成に伴って
 自動的に中身が埋まるため、WebUI側の改修は不要。
+
+STAGE04 で取り込んだ配布お知らせ(`knowledge_sources` テーブル)も、クロール
+ページと並べて一覧に出す。早見表に混ぜて `waste_items` に入っているため、
+そちらの集計からは `knowledge://` 出典を除外して二重表示を防ぐ。
 """
 
 import hashlib
@@ -78,6 +82,78 @@ def _tables(conn: sqlite3.Connection) -> set[str]:
     return {r["name"] for r in rows}
 
 
+
+def _notice_sources(conn: sqlite3.Connection) -> list[dict]:
+    """STAGE04: one entry per ingested お知らせ file (`knowledge_sources`)."""
+    if "knowledge_sources" not in _tables(conn):
+        return []
+    rows = conn.execute(
+        """
+        SELECT source_file,
+               COUNT(*)        AS n,
+               MAX(ingested_at) AS ingested_at
+          FROM knowledge_sources
+         GROUP BY source_file
+         ORDER BY source_file
+        """
+    ).fetchall()
+    return [
+        {
+            "id": _source_id("knowledge_sources", r["source_file"]),
+            "kind": "knowledge_notice",
+            "kind_label": "配布お知らせ(STAGE04)",
+            "title": r["source_file"],
+            "url": f"knowledge://{r['source_file']}",
+            "record_count": r["n"],
+            "crawled_at": r["ingested_at"],
+        }
+        for r in rows
+    ]
+
+
+def _notice_source_detail(conn: sqlite3.Connection, source_id: str) -> dict | None:
+    if "knowledge_sources" not in _tables(conn):
+        return None
+    files = conn.execute(
+        "SELECT DISTINCT source_file FROM knowledge_sources"
+    ).fetchall()
+    for row in files:
+        source_file = row["source_file"]
+        if _source_id("knowledge_sources", source_file) != source_id:
+            continue
+        recs = conn.execute(
+            """
+            SELECT ks.anchor, ks.title,
+                   wi.item_name, wi.disposal_method, wi.effective_from
+              FROM knowledge_sources ks
+              LEFT JOIN waste_items wi ON wi.id = ks.produced_item_id
+             WHERE ks.source_file = ?
+             ORDER BY ks.id
+             LIMIT ?
+            """,
+            (source_file, MAX_RECORDS + 1),
+        ).fetchall()
+        truncated = len(recs) > MAX_RECORDS
+        return {
+            "id": source_id,
+            "kind": "knowledge_notice",
+            "kind_label": "配布お知らせ(STAGE04)",
+            "url": f"knowledge://{source_file}",
+            "headers": ["品名", "お知らせ", "適用開始", "反映後の内容"],
+            "rows": [
+                [
+                    r["item_name"] or r["anchor"],
+                    r["title"],
+                    r["effective_from"] or "",
+                    r["disposal_method"] or "",
+                ]
+                for r in recs[:MAX_RECORDS]
+            ],
+            "truncated": truncated,
+        }
+    return None
+
+
 def list_sources() -> dict:
     """取り込み済みの参照元ページを一覧で返す。
 
@@ -93,6 +169,10 @@ def list_sources() -> dict:
         sources: list[dict] = []
         total = 0
 
+        for src in _notice_sources(conn):
+            total += src["record_count"]
+            sources.append(src)
+
         for table, spec in _KINDS.items():
             if table not in present:
                 continue
@@ -104,6 +184,7 @@ def list_sources() -> dict:
                        MAX(crawled_at)  AS crawled_at
                   FROM {table}
                  WHERE is_current = 1
+                   AND source_url NOT LIKE 'knowledge://%'
                  GROUP BY source_url
                  ORDER BY page_title, source_url
                 """
@@ -139,12 +220,17 @@ def get_source(source_id: str) -> dict | None:
         return None
 
     try:
+        notice = _notice_source_detail(conn, source_id)
+        if notice is not None:
+            return notice
+
         present = _tables(conn)
         for table, spec in _KINDS.items():
             if table not in present:
                 continue
             urls = conn.execute(
-                f"SELECT DISTINCT source_url FROM {table} WHERE is_current = 1"
+                f"SELECT DISTINCT source_url FROM {table} "
+                f"WHERE is_current = 1 AND source_url NOT LIKE 'knowledge://%'"
             ).fetchall()
             for row in urls:
                 url = row["source_url"]

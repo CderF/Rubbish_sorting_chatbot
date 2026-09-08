@@ -1,0 +1,513 @@
+{
+  "_README": [
+    "STAGE 04 の『問題 → 期待DB状態』評価ケース(データ側)。",
+    "回答文そのものの評価は本田さん担当で、このファイルの上に別途組む。",
+    "実行: python -m tests.stage04_eval  /  pytest tests/stage04_eval_test.py",
+    "",
+    "各 change ケースの hayamihyo:",
+    "  {\"method\": \"...\"} = その分別で早見表シード行を作る(前身あり経路)",
+    "  null                = 早見表に無い(前身なし経路。乾電池・蛍光管は実クロールにも無い)",
+    "  method が notice_prior と異なるケース(スプレー缶)は disputed 検出も確認する",
+    "",
+    "answer_must_contain / answer_must_not_be_only: 回答文評価(本田さん)用の期待値。",
+    "  tests.stage04_eval.evaluate_answers(conn, cases, answer_fn) が使う。未実装なら skip。"
+  ],
+  "reference_date": "2026-09-08",
+  "change_start": "2026-10-01",
+  "prior_valid_until": "2026-09-30",
+  "knowledge_files": [
+    "knowledge/incoming/お知らせ-4-1.md",
+    "knowledge/incoming/お知らせ-4-2.md"
+  ],
+  "additions": [
+    {
+      "item": "ホバーボード",
+      "anchor": "お知らせ-01-ホバーボード回収",
+      "method_contains": [
+        "リサイクルフェスタ",
+        "無料で回収"
+      ],
+      "answer_must_contain": [
+        "リサイクルフェスタ"
+      ]
+    },
+    {
+      "item": "ソーラーランタン",
+      "anchor": "お知らせ-02-ソーラーランタン回収",
+      "method_contains": [
+        "くるりん号",
+        "第3金曜"
+      ],
+      "answer_must_contain": [
+        "くるりん号"
+      ]
+    },
+    {
+      "item": "電動一輪車",
+      "anchor": "お知らせ-03-電動一輪車回収",
+      "method_contains": [
+        "KQX-777",
+        "9,990円"
+      ],
+      "answer_must_contain": [
+        "KQX-777"
+      ]
+    },
+    {
+      "item": "電動キックボード",
+      "anchor": "お知らせ-04-電動キックボード回収",
+      "method_contains": [
+        "グリーンリサイクルデー",
+        "エコパークひびき"
+      ],
+      "answer_must_contain": [
+        "グリーンリサイクルデー"
+      ]
+    },
+    {
+      "item": "ドローン",
+      "anchor": "お知らせ-05-ドローン回収",
+      "method_contains": [
+        "スマート家電回収キャラバン",
+        "若松海岸緑地"
+      ],
+      "answer_must_contain": [
+        "スマート家電回収キャラバン"
+      ]
+    },
+    {
+      "item": "予備バッテリー",
+      "anchor": "お知らせ-06-予備バッテリー回収",
+      "method_contains": [
+        "バッテリー安全回収ステーション",
+        "BTX-455"
+      ],
+      "answer_must_contain": [
+        "BTX-455"
+      ]
+    },
+    {
+      "item": "VRゴーグル",
+      "anchor": "お知らせ-07-VRゴーグル回収",
+      "method_contains": [
+        "デジタルガジェット感謝祭",
+        "スペースワールド記念公園"
+      ],
+      "answer_must_contain": [
+        "デジタルガジェット感謝祭"
+      ]
+    },
+    {
+      "item": "ポータブル発電機",
+      "anchor": "お知らせ-08-ポータブル発電機回収",
+      "method_contains": [
+        "防災用品リユース会",
+        "手数料500円"
+      ],
+      "answer_must_contain": [
+        "防災用品リユース会"
+      ]
+    },
+    {
+      "item": "充電ケーブル",
+      "anchor": "お知らせ-09-充電ケーブル回収",
+      "method_contains": [
+        "ケーブルリサイクル便",
+        "隔月10日"
+      ],
+      "answer_must_contain": [
+        "ケーブルリサイクル便"
+      ]
+    },
+    {
+      "item": "電動キャリーカート",
+      "anchor": "お知らせ-10-電動キャリーカート回収",
+      "method_contains": [
+        "シニアモビリティ点検回収デー",
+        "MB-018"
+      ],
+      "answer_must_contain": [
+        "MB-018"
+      ]
+    },
+    {
+      "item": "小型精米機",
+      "anchor": "お知らせ-11-小型精米機回収",
+      "method_contains": [
+        "キッチン家電リユースBOX",
+        "市民センター"
+      ],
+      "answer_must_contain": [
+        "キッチン家電リユースBOX"
+      ]
+    },
+    {
+      "item": "庭園ライト",
+      "anchor": "お知らせ-12-庭園ライト回収",
+      "method_contains": [
+        "ソーラー製品限定回収デー",
+        "響灘緑地"
+      ],
+      "answer_must_contain": [
+        "ソーラー製品限定回収デー"
+      ]
+    },
+    {
+      "item": "電動芝刈り機",
+      "anchor": "お知らせ-13-電動芝刈り機回収",
+      "method_contains": [
+        "ガーデン家電特別受付",
+        "GD-902"
+      ],
+      "answer_must_contain": [
+        "GD-902"
+      ]
+    },
+    {
+      "item": "USB卓上扇風機",
+      "anchor": "お知らせ-14-USB卓上扇風機回収",
+      "method_contains": [
+        "小型USB家電回収ポスト",
+        "区役所エントランス"
+      ],
+      "answer_must_contain": [
+        "小型USB家電回収ポスト"
+      ]
+    },
+    {
+      "item": "電動車椅子",
+      "anchor": "お知らせ-15-電動車椅子回収",
+      "method_contains": [
+        "福祉用具リユースセンター",
+        "WC-233"
+      ],
+      "answer_must_contain": [
+        "WC-233"
+      ]
+    }
+  ],
+  "changes": [
+    {
+      "item": "スプレー缶",
+      "anchor": "お知らせ-01-スプレー缶",
+      "notice_prior": "燃えないごみ",
+      "new_method_contains": [
+        "かん・びん",
+        "使い切"
+      ],
+      "hayamihyo": {
+        "method": "家庭ごみ"
+      },
+      "answer_must_contain": [
+        "燃えないごみ",
+        "2026",
+        "10月",
+        "かん・びん"
+      ],
+      "answer_must_not_be_only": [
+        "燃えないごみ"
+      ]
+    },
+    {
+      "item": "蛍光管",
+      "anchor": "お知らせ-02-蛍光管",
+      "notice_prior": "家庭ごみ",
+      "new_method_contains": [
+        "蛍光管回収ボックス"
+      ],
+      "hayamihyo": null,
+      "answer_must_contain": [
+        "家庭ごみ",
+        "2026",
+        "10月",
+        "蛍光管回収ボックス"
+      ],
+      "answer_must_not_be_only": [
+        "家庭ごみ"
+      ]
+    },
+    {
+      "item": "保冷剤",
+      "anchor": "お知らせ-03-保冷剤",
+      "notice_prior": "資源化物",
+      "new_method_contains": [
+        "そのまま家庭ごみ"
+      ],
+      "hayamihyo": {
+        "method": "資源化物"
+      },
+      "answer_must_contain": [
+        "資源化物",
+        "2026",
+        "10月",
+        "そのまま家庭ごみ"
+      ],
+      "answer_must_not_be_only": [
+        "資源化物"
+      ]
+    },
+    {
+      "item": "傘",
+      "anchor": "お知らせ-04-傘",
+      "notice_prior": "粗大ごみ",
+      "new_method_contains": [
+        "家庭ごみとして出せる",
+        "指定袋"
+      ],
+      "hayamihyo": {
+        "method": "粗大ごみ"
+      },
+      "answer_must_contain": [
+        "粗大ごみ",
+        "2026",
+        "10月",
+        "家庭ごみとして出せる"
+      ],
+      "answer_must_not_be_only": [
+        "粗大ごみ"
+      ]
+    },
+    {
+      "item": "カセットボンベ",
+      "anchor": "お知らせ-05-カセットボンベ",
+      "notice_prior": "燃えないごみ",
+      "new_method_contains": [
+        "家庭ごみ",
+        "穴は開けず"
+      ],
+      "hayamihyo": {
+        "method": "燃えないごみ"
+      },
+      "answer_must_contain": [
+        "燃えないごみ",
+        "2026",
+        "10月",
+        "家庭ごみ"
+      ],
+      "answer_must_not_be_only": [
+        "燃えないごみ"
+      ]
+    },
+    {
+      "item": "魔法びん",
+      "anchor": "お知らせ-06-魔法びん",
+      "notice_prior": "資源化物",
+      "new_method_contains": [
+        "家庭ごみ"
+      ],
+      "hayamihyo": {
+        "method": "資源化物"
+      },
+      "answer_must_contain": [
+        "資源化物",
+        "2026",
+        "10月",
+        "家庭ごみ"
+      ],
+      "answer_must_not_be_only": [
+        "資源化物"
+      ]
+    },
+    {
+      "item": "使い捨てライター",
+      "anchor": "お知らせ-07-使い捨てライター",
+      "notice_prior": "資源化物",
+      "new_method_contains": [
+        "使い切",
+        "家庭ごみ"
+      ],
+      "hayamihyo": null,
+      "answer_must_contain": [
+        "資源化物",
+        "2026",
+        "10月",
+        "使い切"
+      ],
+      "answer_must_not_be_only": [
+        "資源化物"
+      ]
+    },
+    {
+      "item": "カセットテープ",
+      "anchor": "お知らせ-08-カセットテープ",
+      "notice_prior": "資源化物",
+      "new_method_contains": [
+        "家庭ごみ"
+      ],
+      "hayamihyo": null,
+      "answer_must_contain": [
+        "資源化物",
+        "2026",
+        "10月",
+        "家庭ごみ"
+      ],
+      "answer_must_not_be_only": [
+        "資源化物"
+      ]
+    },
+    {
+      "item": "フロッピーディスク",
+      "anchor": "お知らせ-09-フロッピーディスク",
+      "notice_prior": "小型電子機器回収ボックス",
+      "new_method_contains": [
+        "回収ボックスの対象から外",
+        "家庭ごみ"
+      ],
+      "hayamihyo": {
+        "method": "小型電子機器"
+      },
+      "answer_must_contain": [
+        "小型電子機器回収ボックス",
+        "2026",
+        "10月",
+        "回収ボックスの対象から外"
+      ],
+      "answer_must_not_be_only": [
+        "小型電子機器回収ボックス"
+      ]
+    },
+    {
+      "item": "使い捨てカイロ",
+      "anchor": "お知らせ-10-使い捨てカイロ",
+      "notice_prior": "燃えないごみ",
+      "new_method_contains": [
+        "家庭ごみ"
+      ],
+      "hayamihyo": null,
+      "answer_must_contain": [
+        "燃えないごみ",
+        "2026",
+        "10月",
+        "家庭ごみ"
+      ],
+      "answer_must_not_be_only": [
+        "燃えないごみ"
+      ]
+    },
+    {
+      "item": "紙おむつ",
+      "anchor": "お知らせ-11-紙おむつ",
+      "notice_prior": "資源化物",
+      "new_method_contains": [
+        "汚物を取り除",
+        "家庭ごみ"
+      ],
+      "hayamihyo": {
+        "method": "資源化物"
+      },
+      "answer_must_contain": [
+        "資源化物",
+        "2026",
+        "10月",
+        "汚物を取り除"
+      ],
+      "answer_must_not_be_only": [
+        "資源化物"
+      ]
+    },
+    {
+      "item": "ボールペン",
+      "anchor": "お知らせ-12-ボールペン",
+      "notice_prior": "小物金属回収ボックス",
+      "new_method_contains": [
+        "回収ボックスの対象から外",
+        "家庭ごみ"
+      ],
+      "hayamihyo": {
+        "method": "小物金属"
+      },
+      "answer_must_contain": [
+        "小物金属回収ボックス",
+        "2026",
+        "10月",
+        "回収ボックスの対象から外"
+      ],
+      "answer_must_not_be_only": [
+        "小物金属回収ボックス"
+      ]
+    },
+    {
+      "item": "使用済みの花火",
+      "anchor": "お知らせ-13-使用済みの花火",
+      "notice_prior": "そのまま家庭ごみに出してよい",
+      "new_method_contains": [
+        "水にひた",
+        "家庭ごみ"
+      ],
+      "hayamihyo": {
+        "method": "そのまま家庭ごみに出してよい"
+      },
+      "answer_must_contain": [
+        "そのまま家庭ごみに出してよい",
+        "2026",
+        "10月",
+        "水にひた"
+      ],
+      "answer_must_not_be_only": [
+        "そのまま家庭ごみに出してよい"
+      ]
+    },
+    {
+      "item": "ヘアピン",
+      "anchor": "お知らせ-14-ヘアピン",
+      "notice_prior": "家庭ごみ",
+      "new_method_contains": [
+        "小物金属回収ボックス",
+        "透明"
+      ],
+      "hayamihyo": {
+        "method": "家庭ごみ"
+      },
+      "answer_must_contain": [
+        "家庭ごみ",
+        "2026",
+        "10月",
+        "小物金属回収ボックス"
+      ],
+      "answer_must_not_be_only": [
+        "家庭ごみ"
+      ]
+    },
+    {
+      "item": "乾電池",
+      "anchor": "お知らせ-15-乾電池",
+      "notice_prior": "電池類。回収ボックスへ。絶縁すれば家庭ごみにも出せる",
+      "new_method_contains": [
+        "電池類回収ボックス",
+        "絶縁"
+      ],
+      "hayamihyo": null,
+      "answer_must_contain": [
+        "電池類。回収ボックスへ。絶縁すれば家庭ごみにも出せる",
+        "2026",
+        "10月",
+        "電池類回収ボックス"
+      ],
+      "answer_must_not_be_only": [
+        "電池類。回収ボックスへ。絶縁すれば家庭ごみにも出せる"
+      ]
+    }
+  ],
+  "no_match": [
+    {
+      "item": "電動スケートボード",
+      "note": "早見表にもお知らせにも無い。lookup_item_versions が空を返し、4-3 類似品物フォールバックの発火条件になる",
+      "answer_must_contain_any": [
+        "類推",
+        "類似",
+        "確認",
+        "個別"
+      ]
+    },
+    {
+      "item": "宇宙服",
+      "note": "同上。想定外入力でも例外を投げないこと",
+      "answer_must_contain_any": [
+        "類推",
+        "類似",
+        "確認",
+        "個別"
+      ]
+    }
+  ]
+}
