@@ -216,17 +216,22 @@ def test_blocking_route_sets_item_match_from_the_returned_name(monkeypatch):
 def test_lexically_related_accepts_and_rejects():
     from app.rag.router import _lexically_related as related
 
-    # 採点が通す類推: 質問品と候補が文字列上つながっている
-    assert related("電動スケートボード", "スケートボード")  # 部分文字列
-    assert related("電気毛布", "毛布")  # 部分文字列
-    assert related("VRヘッドセット", "ヘッドホン")  # 「ヘッド」連続一致
+    # 信頼できる類推 = 候補が質問品の上位語(末尾一致)
+    assert related("電動スケートボード", "スケートボード")
+    assert related("電気毛布", "毛布")
     assert related("ソーラー懐中電灯", "懐中電灯")
     assert related("カイロ", "カイロ(使い捨て)")  # timeline 経路を壊さない
+    assert related("ハンドミキサー", "ミキサー")
+    assert related("目覚まし時計", "時計")
 
-    # 語彙的に無関係な誤ヒットは弾く
+    # 汎用語の重複だけ、または無関係 → 信頼しない(確認を促す側に倒す)
+    assert not related("VRヘッドセット", "ヘッドホン")   # 「ヘッド」接頭のみ
+    assert not related("小型モバイルプロジェクター", "モバイルバッテリー")
+    assert not related("小型踏み台", "ステップマシーン")
+    assert not related("電動爪切り", "缶切り")           # 「切り」語尾のみ
     assert not related("セグウェイ", "かご")
     assert not related("スマートウォッチ", "湿気取りの容器")
-    assert not related("電子レンジ", "オーブン")  # 意味は近いが文字の重なりが無い
+    assert not related("電子レンジ", "オーブン")
 
 
 def test_lexically_related_ignores_kana_only_overlap():
@@ -479,13 +484,18 @@ def test_analogy_pick_uses_query_relation():
     hits = [_rec("湿気取りの容器(使い捨て)"), _rec("使い捨てカイロ"), _rec("時計")]
     assert _analogy_pick(hits, "目覚まし時計").item_name == "時計"
 
-    # 共通連続「掃除」で「掃除機」を拾う(部分文字列でなくても)
-    hits = [_rec("使い捨てカイロ"), _rec("湿気取りの容器(使い捨て)"), _rec("掃除機")]
-    assert _analogy_pick(hits, "お掃除ロボット").item_name == "掃除機"
+    # 「ドライヤー」⊂「ネイルドライヤー」(末尾一致 = 上位語)
+    hits = [_rec("使い捨てカイロ"), _rec("湿気取りの容器(使い捨て)"), _rec("ドライヤー")]
+    assert _analogy_pick(hits, "ネイルドライヤー").item_name == "ドライヤー"
 
-    # 末尾一致(主辞)を優先: 「電動爪切り」→「缶切り」>「電動芝刈り機」
-    hits = [_rec("電動芝刈り機"), _rec("使い捨てカイロ"), _rec("缶切り")]
-    assert _analogy_pick(hits, "電動爪切り").item_name == "缶切り"
+    # 括弧書きは無視して末尾一致を見る
+    hits = [_rec("湿気取りの容器(使い捨て)"), _rec("シュレッダー(家庭用)")]
+    assert _analogy_pick(hits, "電動ミニシュレッダー").item_name == "シュレッダー(家庭用)"
+
+    # 汎用語の重複しかない候補群 → 強い関連なしなので距離順先頭に戻す
+    # (弱い関連での「見かけ精密な」断定を避ける。ゲート側で確認を促す)
+    hits = [_rec("電動芝刈り機"), _rec("缶切り")]
+    assert _analogy_pick(hits, "電動爪切り").item_name == "電動芝刈り機"
 
 
 def test_analogy_pick_filters_notice_records():
