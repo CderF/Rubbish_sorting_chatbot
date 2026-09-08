@@ -73,9 +73,12 @@ class RoutedAnswer:
     案内させ、どちらか一方だけで断定させない。"""
 
     item_match: str = "none"
-    """品名検索がどの段でヒットしたか: "exact" / "partial" / "similar" / "none"。
-    "similar"(ベクトル類似のみ)のとき、要件4-3 として「早見表に個別記載が
-    ないので類似品目に準じた案内である」旨を明示させる。"""
+    """品名検索の結果が、質問された品名そのものか否か:
+      "exact"   — 返ってきた早見表行の item_name が質問の品名と一致
+      "analogy" — ヒットはあるが、いずれも別の(多くはより具体的な)品目
+      "none"    — ヒットなし
+    どの段(exact/partial/vector)でヒットしたかではなく、名前が一致したかで
+    判定する(PR #14 レビュー)。"analogy" のとき要件4-3 の断り書きを出す。"""
 
     missing: list[str] = field(default_factory=list)
     """回答に不足している入力項目(例: ["町名"])。

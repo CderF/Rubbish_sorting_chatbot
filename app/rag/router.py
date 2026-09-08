@@ -209,24 +209,35 @@ def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str
 
 
 # --- 検索 ------------------------------------------------------------------
-def _search_item(item_name: str) -> tuple[list[ItemRecord], str]:
+def _search_item(item_name: str) -> list[ItemRecord]:
     """完全一致 → 部分一致 → ベクトル類似度 の順にフォールバックする(早見表パス)。
 
-    戻り値はヒットと、どの段でヒットしたか("exact" / "partial" / "similar" /
-    "none")。tier は要件4-3 の判定に使う ―― "similar" は早見表に個別記載が
-    なくベクトル類似で拾っただけなので、回答側で「類推」の断り書きを付ける。
-
     ベクトル類似度は前2段がどちらも0件のときだけ発火する(issue #7)。
-    `vector_search_items` はChroma未構築でも例外を投げず空リストを返す。
+    `vector_search_items` はChroma未構築・関連ヒットなしのいずれも空リストを返す。
+
+    「質問の品名そのものか、似た別品目か」の判定は呼び出し側で行う
+    (`_classify_item_match`)。ここでは段を区別しない。
     """
     exact = lookup_item_exact(item_name)
     if exact:
-        return [exact], "exact"
+        return [exact]
     partial = lookup_item_partial(item_name)[:5]
     if partial:
-        return partial, "partial"
-    similar = vector_search_items(item_name, top_k=3)
-    return similar, ("similar" if similar else "none")
+        return partial
+    return vector_search_items(item_name, top_k=3)
+
+
+def _classify_item_match(item_name: str, hits: list[ItemRecord]) -> str:
+    """"exact" / "analogy" / "none"。どの段でヒットしたかではなく、返ってきた
+    行の名前が質問の品名と実際に一致しているかで決める(PR #14 レビュー)。
+    partial(`LIKE '%クエリ%'`)は「テレビ」→「テレビ台」のように別品目を返す
+    ので analogy 側になる。"""
+    if not hits:
+        return "none"
+    q = _norm(item_name)
+    if any(_norm(getattr(h, "item_name", "")) == q for h in hits):
+        return "exact"
+    return "analogy"
 
 
 def _apply_timeline(ans: RoutedAnswer, item_name: str, today: "date | None" = None) -> None:
@@ -280,7 +291,8 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     ans.detected_item = item_name
 
     if item_name:
-        ans.item_hits, ans.item_match = _search_item(item_name)
+        ans.item_hits = _search_item(item_name)
+        ans.item_match = _classify_item_match(item_name, ans.item_hits)
 
     if ward:
         # ごみ種別が明示されていれば絞り込むが、0件なら種別なしで引き直す。
@@ -370,7 +382,12 @@ def _build_context(ans: RoutedAnswer) -> str:
     blocks: list[str] = []
 
     if ans.item_hits:
-        lines = ["## 分別早見表の検索結果"]
+        if ans.item_match == "analogy":
+            q = ans.detected_item or "この品名"
+            header = f"## 早見表に「{q}」の個別記載なし ― 類似する品目の情報"
+        else:
+            header = "## 分別早見表の検索結果"
+        lines = [header]
         for r in ans.item_hits:
             lines.append(f"- 品名: {r.item_name}")
             lines.append(f"  出し方: {r.disposal_method}")
@@ -438,12 +455,13 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
             "どちらか一方だけを答えて断定しない。\n"
         )
 
-    if ans.item_match == "similar":
+    if ans.item_match == "analogy":
         parts.append(
-            "- 検索した品名は早見表に個別の記載がなく、下記は類似する品目の情報である。"
-            "「類似する『(検索結果の品名)』に準じると〜」の形で案内し、"
-            "断定しない。あわせて「個別の記載がないため、正確な分別は"
-            "北九州市の公式ページや窓口で確認してください」と必ず添える。\n"
+            "- 『類似する品目の情報』欄の品目は、質問された品名そのものではなく"
+            "早見表にある別の品目である。その欄に書かれている実際の品目名を挙げて"
+            "「類似する『(その品目名)』に準じると〜」の形で案内し、断定しない。"
+            "個別の記載がないため、正確な分別は北九州市の公式ページや窓口で"
+            "確認するよう必ず添える。収集日など他の欄の情報はこの限りではない。\n"
         )
 
     if ans.missing:
