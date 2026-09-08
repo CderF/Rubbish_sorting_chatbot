@@ -412,6 +412,13 @@ $('fileInput').onchange = e => {
 
 /* ---------- input behaviour ---------- */
 $('input').addEventListener('keydown', e => {
+  // 日本語入力の「変換確定のEnter」と「送信のEnter」を区別する。
+  // IMEで変換中に押したEnterも keydown を発火させるため、これを送信として
+  // 扱うと (1) 変換前のかな文字がそのまま送信され、(2) その直後にIMEが確定
+  // 文字を空になった入力欄へ書き戻すので、入力欄に文字が残ってしまう。
+  // isComposing が変換中を示す。keyCode 229 は同じ状況を示す古い指標で、
+  // isComposing を持たない環境向けの保険。
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }
 });
 $('input').addEventListener('input', e => {
