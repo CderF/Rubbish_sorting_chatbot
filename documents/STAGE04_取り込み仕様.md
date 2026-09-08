@@ -27,7 +27,8 @@ Team B / Teamb4 (周 楚涵)
 | `app/stage04/notice_parser.py` | Markdown解析のみ。I/O・DB・ネットワークに触れない |
 | `app/stage04/store.py` | `app/data/db.py` の上に構築。`knowledge_sources` テーブルと、バージョン列の読み取り(`lookup_item_versions` / `version_window`)だけを追加する |
 | `app/stage04/ingest.py` | `Notice` → `WasteItem` 変換、新旧リンク、`relink`、CLIエントリポイント |
-| `tests/stage04_ingest_test.py` | オフラインテスト20件(GPU・サーバー不要) |
+| `tests/stage04_ingest_test.py` | 単体テスト(パーサ・store・ingest・relink) |
+| `tests/stage04_eval.py` + `tests/fixtures/stage04_eval_cases.json` | 『質問 → 期待DB状態』評価(4-1/4-2、データ側)。`python -m tests.stage04_eval` でグレーダー風の表を出力 |
 | `tests/fixtures/hayamihyo_seed.json` | **テスト専用**の擬似早見表15件。本番投入禁止 |
 
 `app/data/` 配下(Teamb2担当)のファイルは一切変更していない。`app/data/schema.py` の `WasteItem` を
