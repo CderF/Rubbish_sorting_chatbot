@@ -23,3 +23,10 @@ nvidia-ml-py==13.610.43    # provides the `pynvml` module; the old `pynvml`
 
 # required at runtime by FlashInfer, which JIT-compiles CUDA kernels on startup
 ninja==1.13.2
+
+# data layer (STAGE 02-04). pydantic arrives transitively with FastAPI, but
+# app/data/schema.py imports it directly, so it is pinned explicitly here.
+pydantic==2.13.5
+
+# tests only (tests/stage04_ingest_test.py runs offline, no GPU needed)
+pytest==9.1.1

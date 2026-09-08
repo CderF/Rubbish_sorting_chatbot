@@ -36,6 +36,17 @@ server.log
 # decision on whether it should be purged from history.
 documents/課題.pdf
 
+# --- data artefacts (STAGE 02-04) ------------------------------------------
+# The structured DB is rebuilt from the crawler + knowledge/incoming/, so it is
+# generated output, not source. knowledge/incoming/ itself IS tracked: the
+# distributed お知らせ files are inputs and ingest must stay reproducible.
+/data/
+*.db
+*.sqlite
+*.sqlite3
+chroma/
+.chroma/
+
 # --- os / editor -----------------------------------------------------------
 .DS_Store
 .vscode/
