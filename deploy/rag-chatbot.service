@@ -14,7 +14,7 @@ WorkingDirectory=/home/teamb2/app/app
 # service comes up. Idempotent (content-hash dedup); `-` so a failure here
 # never blocks the service from starting. Does NOT crawl or rebuild the
 # vector index — run `make knowledge` for that after a data-source change.
-ExecStartPre=-/bin/sh -c 'cd /home/teamb2/app && /home/teamb2/venv/bin/python -m app.stage04.ingest knowledge/incoming/*.md && /home/teamb2/venv/bin/python -m app.stage04.ingest --relink'
+ExecStartPre=-/bin/sh -c 'cd /home/teamb2/app && /home/teamb2/venv/bin/python -m app.notices.ingest knowledge/incoming/*.md && /home/teamb2/venv/bin/python -m app.notices.ingest --relink'
 ExecStart=/home/teamb2/venv/bin/uvicorn server:app --host 0.0.0.0 --port 8080
 
 # Secrets (WEBUI_PASSWORD etc.) — see .env.example.
