@@ -209,20 +209,27 @@ def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str
 
 
 # --- 検索 ------------------------------------------------------------------
-def _search_item(item_name: str) -> list[ItemRecord]:
+def _search_item(item_name: str) -> tuple[list[ItemRecord], str | None]:
     """完全一致 → 部分一致 → ベクトル類似度 の順にフォールバックする(早見表パス)。
 
     ベクトル類似度は前2段がどちらも0件のときだけ発火する(issue #7)。
     `vector_search_items` はChroma未構築でも例外を投げず空リストを返すので、
     ここでの呼び出しに追加のガードは要らない。
+
+    戻り値は (ヒット, どの段で当たったか)。段を返すのは、ベクトル由来の結果が
+    「質問された品目そのもの」とは限らないため。たとえば「アルミ缶」は早見表の
+    表記が「アルミかん」なので完全一致・部分一致とも外れ、ベクトル段まで落ちて
+    「油よけ(アルミ製)」のような別品目が混ざる。WebUIの根拠表示で区別できる
+    ようにしておく。
     """
     exact = lookup_item_exact(item_name)
     if exact:
-        return [exact]
+        return [exact], "exact"
     partial = lookup_item_partial(item_name)[:5]
     if partial:
-        return partial
-    return vector_search_items(item_name, top_k=3)
+        return partial, "partial"
+    vector = vector_search_items(item_name, top_k=3)
+    return vector, ("vector" if vector else None)
 
 
 def _apply_timeline(ans: RoutedAnswer, item_name: str, today: "date | None" = None) -> None:
@@ -274,9 +281,10 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
 
     item_name = image_item_name or extract_item_name(prompt, strip_waste_words=wants_schedule)
     ans.detected_item = item_name
+    ans.item_from_image = bool(image_item_name)
 
     if item_name:
-        ans.item_hits = _search_item(item_name)
+        ans.item_hits, ans.item_match_stage = _search_item(item_name)
 
     if ward:
         # ごみ種別が明示されていれば絞り込むが、0件なら種別なしで引き直す。
@@ -444,6 +452,67 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
         parts.append("\n# 検索結果\n" + ans.context + "\n")
 
     return "".join(parts)
+
+
+# --- WebUI 向けの根拠データ ------------------------------------------------
+MATCH_STAGE_LABELS = {
+    "exact": "完全一致",
+    "partial": "部分一致",
+    "vector": "類似検索",
+}
+
+
+def _attr(rec, name: str, default=None):
+    """レコードは Pydanticモデル(データ層)・dataclass(スタブ)・ベクトル検索の
+    戻り値と実装がまちまちなので、無い属性は既定値で埋める。"""
+    value = getattr(rec, name, default)
+    return default if value is None else value
+
+
+def describe_sources(ans: RoutedAnswer) -> dict:
+    """回答の根拠を WebUI に渡せる形へ変換する(STAGE02 2-2)。
+
+    本文末尾の引用URLだけでは「どのレコードを見て、どの経路で見つけたのか」が
+    分からない。検索段(完全一致/部分一致/類似検索)と実際に取得した行をそのまま
+    返し、利用者が回答を検証できるようにする。
+
+    この結果は `/ui/chat` だけに流す。採点用の `/chat` は仕様上 `delta` のSSEしか
+    想定されていないため、そちらのストリームには一切足さない。
+    """
+    return {
+        "detected": {
+            "item": ans.detected_item,
+            "ward": ans.detected_ward,
+            "town": ans.detected_town,
+            "from_image": ans.item_from_image,
+        },
+        "match_stage": ans.item_match_stage,
+        "match_stage_label": MATCH_STAGE_LABELS.get(ans.item_match_stage or ""),
+        "found": ans.found,
+        "missing": ans.missing,
+        "items": [
+            {
+                "item_name": _attr(r, "item_name", ""),
+                "item_name_raw": _attr(r, "item_name_raw", ""),
+                "disposal_method": _attr(r, "disposal_method", ""),
+                "notes": _attr(r, "notes", ""),
+                "source_url": _attr(r, "source_url", ""),
+                "source_page_title": _attr(r, "source_page_title", ""),
+            }
+            for r in ans.item_hits
+        ],
+        "schedules": [
+            {
+                "ward": _attr(r, "ward", ""),
+                "town": _attr(r, "town", ""),
+                "waste_type": _attr(r, "waste_type", ""),
+                "weekday": _attr(r, "weekday", ""),
+                "source_url": _attr(r, "source_url", ""),
+            }
+            for r in ans.schedule_hits
+        ],
+        "urls": ans.sources,
+    }
 
 
 def format_citations(ans: RoutedAnswer) -> str:
