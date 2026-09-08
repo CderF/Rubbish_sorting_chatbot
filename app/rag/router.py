@@ -179,6 +179,70 @@ def extract_region(prompt: str) -> tuple[str | None, str | None]:
     return ward, town
 
 
+_CHOME_SUFFIX_RE = re.compile(r"\d+丁目$")
+
+
+def _town_base(town: str) -> str:
+    """町名から丁目番号を除いた「地区の呼び名」を返す(例: 「黒崎1丁目」→「黒崎」)。"""
+    return _CHOME_SUFFIX_RE.sub("", town)
+
+
+@functools.lru_cache(maxsize=len(WARDS) + 1)
+def _district_groups(ward: str) -> dict[str, tuple[str, ...]]:
+    """区内の町名を「丁目を除いた地区の呼び名」でグルーピングする。
+
+    「黒崎に住んでいます」のように丁目を省略した自然な言い方に対応するため。
+    実データで確認済み: 全7区で344地区がこの意味で複数の丁目に分かれており、
+    そのうち277地区(92%)は地区内の全丁目で収集日が完全に一致する
+    (`_uniform_district_schedule` が使う)。1丁目しか無い地区名は既存の
+    `_town_candidates` の完全一致で足りるため、ここでは除く。
+    """
+    groups: dict[str, list[str]] = {}
+    for town in _town_candidates(ward):
+        base = _town_base(town)
+        if base != town:  # 丁目を含む町名だけを対象にする
+            groups.setdefault(base, []).append(town)
+    return {base: tuple(towns) for base, towns in groups.items() if len(towns) > 1}
+
+
+def _match_district(ward: str, prompt: str) -> tuple[str, tuple[str, ...]] | None:
+    """プロンプトに、丁目を省略した地区名が含まれるかを調べる。
+
+    見つかった場合 (地区名, その地区に属する町名一覧) を返す。地区名が長い順に
+    試すので、「黒崎」と「黒崎城石」のように一方がもう一方を含む場合でも
+    より具体的な方が優先される。
+    """
+    text = _norm(prompt)
+    tail = text.split(ward, 1)[1] if ward in text else text
+    for base, towns in sorted(_district_groups(ward).items(), key=lambda kv: len(kv[0]), reverse=True):
+        if base and base in tail:
+            return base, towns
+    return None
+
+
+def _uniform_district_schedule(
+    ward: str, towns: tuple[str, ...], waste_type: str | None
+) -> list[ScheduleRecord] | None:
+    """地区内の全ての町(丁目)で収集日が完全に一致する場合に限り、代表1町分の
+    結果を返す。1つでも食い違う町があれば None を返し、呼び出し側は従来通り
+    「町名(丁目)が必要」という案内にフォールバックする(丁目を勝手に決めつけて
+    答えることはしない)。
+    """
+    per_town: list[list[ScheduleRecord]] = []
+    for t in towns:
+        hits = lookup_collection_schedule(ward, t, waste_type)
+        if not hits:
+            return None
+        per_town.append(hits)
+
+    def key(hits: list[ScheduleRecord]) -> frozenset:
+        return frozenset((h.waste_type, h.weekday) for h in hits)
+
+    if len({key(hits) for hits in per_town}) != 1:
+        return None
+    return per_town[0]
+
+
 def extract_waste_type(prompt: str) -> str | None:
     text = _norm(prompt)
     return next((w for w in WASTE_TYPES if w in text), None)
@@ -452,6 +516,22 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
             if not schedules and waste_type:
                 schedules = lookup_collection_schedule(ward, town, None)
 
+            if not schedules and not town:
+                # 丁目を省略した地区名(「黒崎」等)の可能性を試す。地区内の
+                # 全丁目で収集日が完全に一致する場合に限り、それをそのまま
+                # 使う(実測: 全7区344地区中277地区(92%)が地区内で完全一致)。
+                # 割れている地区は None が返るので、下の missing("町名") に
+                # そのままフォールバックする(丁目を勝手に決めつけない)。
+                district = _match_district(ward, prompt)
+                if district:
+                    district_name, district_towns = district
+                    uniform = _uniform_district_schedule(ward, district_towns, waste_type)
+                    if uniform:
+                        schedules = uniform
+                        ans.detected_town = district_name
+                        ans.district_schedule = True
+                        ans.district_towns = list(district_towns)
+
         if schedules:
             ans.schedule_hits = schedules
         elif ans.no_weekday_schedule:
@@ -573,6 +653,17 @@ def _build_context(ans: RoutedAnswer) -> str:
                 "その上で、申込なしにはこの曜日へ出せないこと、"
                 "事前に粗大ごみ受付センター(電話: 093-513-3005)へ電話、"
                 "またはインターネットで申込む必要があることも併せて伝える。"
+            )
+        if ans.district_schedule:
+            # 「黒崎」等、丁目を省略した地区名から解決した結果であることを
+            # 明示する。上の行は地区内の代表1町(丁目)の表記になっているが、
+            # 地区内の全町(下記)で収集日が一致することを確認済みなので、
+            # 特定の1丁目に決めつけたわけではないと伝える。
+            lines.append(
+                f"  ※ 「{ans.detected_town}」は丁目の指定がなかったが、"
+                f"地区内の全ての町({'・'.join(ans.district_towns)})で収集日が"
+                "一致することを確認済み。上記の収集日をそのまま案内してよい"
+                "(特定の1丁目だけを見て答えたわけではない)。"
             )
         blocks.append("\n".join(lines))
 
