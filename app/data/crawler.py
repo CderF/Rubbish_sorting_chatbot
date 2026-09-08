@@ -110,6 +110,28 @@ def parse_waste_item_page(html: str, source_url: str) -> list[WasteItem]:
     return records
 
 
+_TOWN_RANGE_RE = re.compile(r"^(.*?)(\d+)[~〜～](\d+)丁目$")
+
+
+def _expand_town_range(town: str) -> list[str]:
+    """収集日ページは複数丁目を1行にまとめて掲載する(例: "浅野1～3丁目")。
+    `lookup_collection_schedule` は `town` の完全一致なので、このまま格納すると
+    利用者が自然に言う「浅野1丁目」が永久にヒットしない(PR #16、藤井の再現
+    テスト参照)。ここで丁目単位に展開してから個別レコードとして格納する
+    ("正規化はデータ層の責務"という既存の契約(lookup.pyのdocstring)に合わせ、
+    展開もデータ層=クロール時点で行う)。
+
+    範囲でない町名(例: "八王寺町")はそのまま1件のリストで返す。
+    """
+    m = _TOWN_RANGE_RE.match(town)
+    if not m:
+        return [town]
+    prefix, start, end = m.group(1), int(m.group(2)), int(m.group(3))
+    if start > end:
+        return [town]
+    return [f"{prefix}{n}丁目" for n in range(start, end + 1)]
+
+
 def parse_schedule_page(html: str, source_url: str) -> list[CollectionSchedule]:
     """Parse one 収集日 ward page into CollectionSchedule records: one row per
     (town, waste type) pair, pivoted out of the page's per-town table row.
@@ -151,23 +173,24 @@ def parse_schedule_page(html: str, source_url: str) -> list[CollectionSchedule]:
         cells = tr.find_all("td")
         if len(cells) < 2 + len(waste_types):
             continue
-        town = cells[1].get_text(strip=True)
-        if not town:
+        town_raw = cells[1].get_text(strip=True)
+        if not town_raw:
             continue
-        for i, waste_type in enumerate(waste_types):
-            weekday = cells[2 + i].get_text(strip=True)
-            if not weekday:
-                continue
-            records.append(
-                CollectionSchedule(
-                    ward=ward,
-                    town=town,
-                    waste_type=waste_type,
-                    weekday=weekday,
-                    source_url=source_url,
-                    crawled_at=now,
+        for town in _expand_town_range(town_raw):
+            for i, waste_type in enumerate(waste_types):
+                weekday = cells[2 + i].get_text(strip=True)
+                if not weekday:
+                    continue
+                records.append(
+                    CollectionSchedule(
+                        ward=ward,
+                        town=town,
+                        waste_type=waste_type,
+                        weekday=weekday,
+                        source_url=source_url,
+                        crawled_at=now,
+                    )
                 )
-            )
     return records
 
 
