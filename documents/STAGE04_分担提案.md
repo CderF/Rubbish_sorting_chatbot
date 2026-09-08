@@ -47,7 +47,7 @@ STAGE 04(動的なナレッジ拡張)の担当分けと、STAGE 02/03 の実装�
 ## 2. STAGE 02/03 のマージ前でも進められること
 
 1. データ側(周): クローラー(FANG さん PR #6)の上に **差分検知 + relink** を実装する。`data_schema.md` §4 が「更新検知・差分抽出のロジックは STAGE04 側で新規実装」と明記している通り。
-2. 回答側(本田さん): `store.lookup_item_versions` の戻り値に対する **時系列回答関数を純関数として** 書ける。DB・LLM・サーバー不要。詳細は [[STAGE04_取り込み仕様.md]] の「引き渡し契約」。
+2. 回答側(本田さん): `store.item_timeline()` / `app/stage04/lookup.pending_change()` の戻り値に対する **時系列回答関数を純関数として** 書ける。DB・LLM・サーバー不要。詳細は [[STAGE04_取り込み仕様.md]] の「引き渡し契約」。
 3. 評価ケース(質問 → 期待回答)は実装非依存でいま書ける。
 
 ---
@@ -88,8 +88,8 @@ STAGE 04 が追加するのは `knowledge_sources` テーブル1つだけ(`app/s
 ### ② 検索関数
 
 - **全バージョン取得は別関数**。`lookup_item_exact` / `lookup_item_partial`(issue #4)は藤井さんが依存する契約なのでシグネチャを変えない。
-  → `app/stage04/store.py` に `lookup_item_versions(conn, item_name) -> list[WasteItem]` として実装済み(PR #5)。`is_current` で絞らず全バージョンを古い順で返す。
-  ※ FANG さん提案の `lookup_item_history` へリネーム希望なら対応します。
+  → `app/stage04/store.py` に `lookup_item_history(conn, item_name) -> list[WasteItem]`(FANG さん提案の名前)として実装済み(PR #5)。`is_current` で絞らず全バージョンを古い順で返す。
+  回答側は通常これを直接使わず、平坦化した `store.item_timeline()` / `app/stage04/lookup.pending_change()` を使う。
 - **説明ページ検索**は当初 `search_descriptions` としていたが、issue #7 で `vector_search_explanations(query, top_k)` として仕様化済み(藤井さん担当、未実装)。**名前を合わせて再利用**する。
 - **ナレッジソース一覧(manifest)**: `app/data/db.py` の `list_sources()`(クロール済みページ)が近い役割を持つ。STAGE 04 は取り込んだお知らせ用に `store.list_knowledge_sources()` を持つ。統一ビューが必要なら `list_sources()` を拡張する形で FANG さんと相談。
 
@@ -116,7 +116,7 @@ FANG 的 PR #3 反馈已全部吸收,本文档按落地的 schema 重写:
 - **`item_key` 不要**: `item_name` 本身就是 NFKC 归一化后的检索键
 - **`source_type` 统一表不要**: `waste_items` / `collection_schedule` 是分表。配布お知らせ进 `waste_items`,`source_url` 用 `knowledge://` 前缀区分
 - **`content_hash`** 放 STAGE 04 自己的 `knowledge_sources` 表(PR #5,FANG 已同意)
-- **全版本取得是独立函数**: `lookup_item_exact/partial`(藤井依赖)不动;`store.lookup_item_versions()` 已在 PR #5 实现(FANG 建议名 `lookup_item_history`,需要就改)
+- **全版本取得是独立函数**: `lookup_item_exact/partial`(藤井依赖)不动;`store.lookup_item_history()`(采用 FANG 建议名)已在 PR #5 实现。回答侧一般用平坦化的 `store.item_timeline()` / `lookup.pending_change()`
 - **`search_descriptions`** → 用 issue #7 的 `vector_search_explanations`(藤井担当)
 - **manifest** → `app/data/db.py` 的 `list_sources()` 已近似;需要统一视图就扩展它
 
