@@ -102,6 +102,24 @@ def lookup_item_partial(item_name: str, limit: int = 10) -> list[WasteItem]:
     return [_row_to_waste_item(r) for r in rows]
 
 
+def lookup_towns(ward: str) -> list[str]:
+    """区内の全町名(丁目単位に展開済み)を返す。
+
+    区名抽出(app/rag/router.py の extract_region)が正規表現ヒューリスティック
+    では拾いきれない実在の町名(例: 「城内」「中井浜」のように丁目/町/台等の
+    定型接尾辞を持たない町名)を検出するために使う。地域抽出はデータ層の
+    実データを正として判定すべき、という方針(早見表パスの検索と同様)。
+    """
+    normalized = _normalize(ward)
+    if not normalized:
+        return []
+    rows = _get_connection().execute(
+        "SELECT DISTINCT town FROM collection_schedule WHERE ward = ? AND is_current = 1",
+        (normalized,),
+    ).fetchall()
+    return [r["town"] for r in rows]
+
+
 def lookup_collection_schedule(
     ward: str, town: str | None, waste_type: str | None = None
 ) -> list[CollectionSchedule] | None:
