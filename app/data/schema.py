@@ -35,12 +35,17 @@ class CollectionSchedule(BaseModel):
     """A row in `collection_schedule` (収集日パス)."""
 
     id: int | None = None
-    ward: str
-    town: str
-    waste_type: str
+    ward: str = Field(..., description="NFKC正規化済み(区名)")
+    town: str = Field(..., description="NFKC正規化済み(町名・丁目) — 検索キー")
+    waste_type: str = Field(..., description="NFKC正規化済み(ごみ種別)")
     weekday: str = Field(..., description="複数曜日はカンマ区切り、例: '月,木'")
     source_url: str
     crawled_at: datetime
     is_current: bool = True
     effective_from: date | None = None
     superseded_by: int | None = None
+
+    @field_validator("ward", "town", "waste_type")
+    @classmethod
+    def _normalize(cls, v: str) -> str:
+        return unicodedata.normalize("NFKC", v).strip()

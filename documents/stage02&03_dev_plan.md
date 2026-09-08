@@ -27,7 +27,7 @@ app/
 ├── webui.html              # 既存。ナレッジ一覧・画像アップロード欄を追加(藤井)
 ├── data/                   # ★データ層(FANG)
 │   ├── crawler.py          # 早見表8ページ + 収集日7区ページのクローリング(再実行可能)
-│   ├── db.py                # SQLiteスキーマ定義・初期化
+│   ├── db.py                # SQLiteスキーマ定義・初期化(スキーマ詳細は documents/data_schema.md 参照)
 │   └── lookup.py            # lookup_item_exact / lookup_item_partial / lookup_collection_schedule
 └── rag/                     # ★応用層(藤井)
     ├── vector_store.py      # Chroma構築、embedding、説明ページ・早見表フォールバック用のベクトル検索
@@ -93,8 +93,11 @@ def vector_search_explanations(query: str, top_k: int = 3) -> list[ChunkRecord]:
     """説明・注意事項ページ(ごみステーション等)に対するベクトル検索。"""
 
 # app/rag/image_classify.py
-def classify_image_to_item_name(image_base64: str) -> str | None:
-    """VLMに画像を渡し、品目名相当の文字列を抽出する。特定できない場合は None。"""
+def classify_image_to_item_name(image_base64: str, engine, processor) -> str | None:
+    """VLMに画像を渡し、品目名相当の文字列を抽出する。特定できない場合は None。
+    engine/processor は app/server.py が起動時に初期化する共有vLLMエンジンを
+    そのまま受け取る(L4 1枚のVRAMで2つ目のモデルをロードしないため。詳細は
+    GitHub issue #7 のImplementation Decisions参照)。"""
 
 # app/rag/router.py
 def handle_query(prompt: str, img_b64: str | None) -> RoutedAnswer:
@@ -121,17 +124,24 @@ def handle_query(prompt: str, img_b64: str | None) -> RoutedAnswer:
 ### 4-1. データ層(Teamb2 FANG XIUWEN)
 
 **STAGE02**
-- [ ] 早見表8ページ(あ行〜わ行)のクローリングスクリプト作成(`app/data/crawler.py`)
-- [ ] 早見表HTML表パース → `ItemRecord` 構造化(品名/出し方/備考/source_url)
-- [ ] SQLiteスキーマ設計・初期化(`app/data/db.py`)
-- [ ] `lookup_item_exact` / `lookup_item_partial` 実装(`app/data/lookup.py`) ※**最優先、藤井のSTAGE02統合作業のブロッカーになるため**
-- [ ] 取り込み済みファイル一覧のエクスポート(WebUIの2-3要件用、JSON等)
+- [x] 早見表8ページ(あ行〜わ行)のクローリングスクリプト作成(`app/data/crawler.py`)
+- [x] 早見表HTML表パース → `WasteItem` 構造化(品名/出し方/備考/source_url)
+- [x] SQLiteスキーマ設計・初期化(`app/data/db.py`)
+- [x] `lookup_item_exact` / `lookup_item_partial` 実装(`app/data/lookup.py`) ※**最優先、藤井のSTAGE02統合作業のブロッカーになるため**
+- [x] 取り込み済みファイル一覧のエクスポート(WebUIの2-3要件用、`db.list_sources()`)
 
 **STAGE03**
-- [ ] 収集日データ(7区×町名/丁目)のクローリングスクリプト作成
-- [ ] 収集日データパース → `ScheduleRecord` 構造化(区/町名/ごみ種別/曜日/source_url)
-- [ ] `lookup_collection_schedule` 実装(区のみ指定時は `None` を返す仕様を厳守)
-- [ ] 差分再取得ロジック(STAGE04前方互換。まずは「全件再取得+上書き」で可)
+- [x] 収集日データ(7区×町名/丁目)のクローリングスクリプト作成
+- [x] 収集日データパース → `CollectionSchedule` 構造化(区/町名/ごみ種別/曜日/source_url)
+- [x] `lookup_collection_schedule` 実装(区のみ指定時は `None` を返す仕様を厳守)
+- [x] 差分再取得ロジック(STAGE04前方互換。`db.rebuild_db()` が「全件再取得+上書き」を実装)
+
+実装メモ(GitHub issue #4のspecからの変更点・実装時に判明した事項):
+- 3公開関数は `ItemRecord`/`ScheduleRecord` という素のdictではなく、`app/data/schema.py` の `WasteItem`/`CollectionSchedule` pydanticモデルのインスタンスを返す(issue #4のImplementation Decisionsで確定済み)
+- 早見表8ページはページごとにHTML構造が3パターンある(`<table summary="分別早見表">` / `<caption>分別早見表</caption>` / どちらも無く5つの独立tableが並ぶだけ)。`crawler.py` の `_is_waste_item_table` はこの3パターン全てに対応
+- 収集日7区のページもthead/tbodyの有無が区によって異なる(小倉北区・若松区はthead/tbodyあり、残り5区はヘッダー行`<tr><th>...</th></tr>`が五十音グループごとにデータ行の間に直接繰り返される)。`parse_schedule_page` はthead/tbodyに依存せず`<th>`の有無で行を判定する
+- `CollectionSchedule` の `ward`/`town`/`waste_type` にもNFKC正規化のバリデータが必要だった(`WasteItem.item_name` と同様)。当初town側だけ正規化していたら全角チルダ「～」を含む町名(例: 青葉1～2丁目)がクエリ側でNFKC正規化されて半角「~」になり、DB格納値(非正規化)と一致せず検索がヒットしなかった
+- 実測データ量: `waste_items` 864件、`collection_schedule` 2472件(7区・778町名)
 
 ### 4-2. 応用層(Teamb3 藤井誠人)
 
