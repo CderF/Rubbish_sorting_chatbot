@@ -101,6 +101,13 @@ WASTE_TYPES = (
     "ペットボトル",
 )
 
+# collection_schedule に実在するのはこの5種別のみ(実データで確認済み)。
+# 早見表の disposal_method にはこの他に「小物金属」「小型電子機器」「電池類」
+# 「古着」「紙パック」「蛍光管回収ボックス」等があるが、これらは全て曜日での
+# 収集ではなく「回収ボックスへ随時持ち込み」方式であり、決まった収集曜日を
+# 持たない。`_blocking_route` はこの集合との照合で収集日検索の要否を判定する。
+_CURBSIDE_WASTE_TYPES = {"家庭ごみ", "プラスチック", "ペットボトル", "かん・びん", "粗大ごみ"}
+
 # 品名抽出の際に取り除く「ごみ種別を指す語」。俗称・言い換えを含むため
 # WASTE_TYPES とは別に持つ(こちらは検索キーには使わない)。
 # 「ペットボトル」のように品名でもある語が含まれるので、区名が取れた
@@ -414,16 +421,41 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         ans.item_match = _classify_item_match(item_name, ans.item_hits)
 
     if ward:
-        # ごみ種別が明示されていれば絞り込むが、0件なら種別なしで引き直す。
-        # 設計提案書 3-1 は「品名と地区を伝えると出し方と収集日まで案内できる」
-        # ことを求めるので、種別が一致しないことを理由に収集日を落とさない。
-        waste_type = extract_waste_type(prompt) if wants_schedule else None
-        schedules = lookup_collection_schedule(ward, town, waste_type)
-        if not schedules and waste_type:
-            schedules = lookup_collection_schedule(ward, town, None)
+        # 早見表がヒットしていれば、その出し方(disposal_method)を収集日検索の
+        # ごみ種別として優先的に使う。プロンプトの語そのものではなく実際に
+        # 一致した品目の区分を使うので、品目名にごみ種別語が出てこない質問
+        # (例:「ペン」→プラスチック)でも正しく絞り込める。ヒットが複数あり
+        # 区分が割れている(analogy候補が混在)場合は特定できないため使わない。
+        item_disposal_methods = {h.disposal_method for h in ans.item_hits}
+        single_item_disposal = (
+            next(iter(item_disposal_methods)) if len(item_disposal_methods) == 1 else None
+        )
+
+        if single_item_disposal is not None and single_item_disposal not in _CURBSIDE_WASTE_TYPES:
+            # 小物金属・小型電子機器・電池類・古着・紙パック・蛍光管等は「回収
+            # ボックスへ随時持ち込み」方式で、決まった収集曜日という概念自体が
+            # 無い。collection_schedule はこの5区分以外を持たないため、ここで
+            # 検索すると無関係な曜日(家庭ごみ等)しか返らず、それをそのまま
+            # 案内すると誤った収集日を答えることになる(STAGE03採点フィード
+            # バックで指摘された「品目ごとの収集枠の違いを反映できていない」
+            # 実例の根拠)。検索自体を行わず、その旨を明示するフラグだけ立てる。
+            schedules = None
+            ans.no_weekday_schedule = True
+        else:
+            # ごみ種別が明示されていれば絞り込むが、0件なら種別なしで引き直す。
+            # 設計提案書 3-1 は「品名と地区を伝えると出し方と収集日まで案内できる」
+            # ことを求めるので、種別が一致しないことを理由に収集日を落とさない。
+            waste_type = single_item_disposal or (
+                extract_waste_type(prompt) if wants_schedule else None
+            )
+            schedules = lookup_collection_schedule(ward, town, waste_type)
+            if not schedules and waste_type:
+                schedules = lookup_collection_schedule(ward, town, None)
 
         if schedules:
             ans.schedule_hits = schedules
+        elif ans.no_weekday_schedule:
+            pass  # 上のフラグで案内するので missing には積まない
         elif not town:
             # 設計提案書 3-1: 区のみでは一意に定まらない。推測せず町名を要求する。
             ans.missing.append("町名")
@@ -522,7 +554,30 @@ def _build_context(ans: RoutedAnswer) -> str:
             # (documents/data_schema.md の旧サンプル記述、実データとは不一致だった)
             # で「曜日」を追加で足すと "第2木曜日曜日" のような二重表記になっていた。
             lines.append(f"- {s.ward}{s.town} / {s.waste_type}: {s.weekday}")
+        if any(s.waste_type == "粗大ごみ" for s in ans.schedule_hits):
+            # 収集日ページの本文(表の外)に「粗大ごみは事前に粗大ごみ受付
+            # センターへ電話またはインターネットで申込」という案内があり、
+            # 7区全ページで文言が同一(2026-09-08 時点で確認)。表の曜日列は
+            # あくまで「申込後に収集される曜日」であり、申込なしにその日に
+            # 出せるわけではない。この前提を書かずに曜日だけ答えると、粗大
+            # ごみの「特定の収集枠」(事前申込制であること)を無視した不適切な
+            # 案内になる(STAGE03採点フィードバックの根拠)。
+            lines.append(
+                "  ※ 粗大ごみは事前申込制。上記の曜日は申込後に収集される日で、"
+                "申込なしにこの日へ出すことはできない。"
+                "事前に粗大ごみ受付センター(電話: 093-513-3005)へ電話、"
+                "またはインターネットで申込むこと。"
+            )
         blocks.append("\n".join(lines))
+
+    if ans.no_weekday_schedule:
+        blocks.append(
+            "## 収集日について\n"
+            "- この品目は決まった収集曜日を持たない区分(回収ボックスへの"
+            "随時持ち込み方式)。曜日を尋ねられても存在しない収集日を"
+            "作り出さず、早見表の検索結果にある備考(回収ボックスの案内)に"
+            "従って回答すること。"
+        )
 
     return "\n\n".join(blocks)
 
@@ -548,6 +603,10 @@ _RULES_WITH_CONTEXT = (
     "- 検索結果に「備考」がある場合、そこに書かれた条件"
     "(持ち込み先・事前申込の要否・梱包方法・注意事項など)を"
     "一つも省略せず、全て回答に含める。\n"
+    "- 備考に材質・サイズ等による条件分岐(例:「プラスチックだけでできており"
+    "50センチ未満のものはプラスチック」)が書かれている場合、それを1本の"
+    "答えに単純化しない。質問文から材質・サイズが判断できるならそれに従って"
+    "回答し、判断できないならどの条件でどちらに分かれるかを両方とも案内する。\n"
 )
 
 _RULES_NO_CONTEXT = (
