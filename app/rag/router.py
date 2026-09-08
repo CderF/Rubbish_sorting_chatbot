@@ -10,6 +10,7 @@ LLMには `RoutedAnswer.context` を渡して文章化のみを担当させ、�
 """
 
 import asyncio
+import functools
 import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,7 @@ try:
         lookup_collection_schedule,
         lookup_item_exact,
         lookup_item_partial,
+        lookup_towns,
     )
 
     _USING_STUBS = False
@@ -33,6 +35,7 @@ except ImportError:
         lookup_collection_schedule,
         lookup_item_exact,
         lookup_item_partial,
+        lookup_towns,
     )
 
     _USING_STUBS = True
@@ -133,18 +136,39 @@ def _norm(s: str) -> str:
     return unicodedata.normalize("NFKC", s or "").strip()
 
 
+@functools.lru_cache(maxsize=len(WARDS) + 1)
+def _town_candidates(ward: str) -> tuple[str, ...]:
+    """区内の実在町名一覧(長い順)をキャッシュする。
+
+    「城内」「中井浜」のように丁目/町/台等の定型接尾辞を持たない実在の町名は
+    `_TOWN` の正規表現では拾えず、取りこぼした分が品名抽出側に漏れ込んで
+    品名を汚染していた(例: 「小倉北区城内で古い履物…」で「城内で」が品名側
+    に残り、検索がヒットしなくなる実例)。データ層が持つ実際の町名一覧を正
+    として使う。1リクエストごとにDBへ問い合わせないよう区ごとにキャッシュ
+    する(クロール結果はサーバー起動中は不変)。
+    """
+    return tuple(sorted(lookup_towns(ward), key=len, reverse=True))
+
+
 def extract_region(prompt: str) -> tuple[str | None, str | None]:
     """プロンプトから区名と町名を抜き出す。見つからなければ None。"""
     text = _norm(prompt)
     ward = next((w for w in WARDS if w in text), None)
 
-    town = None
     # 区名以降を優先して町名を探す(「小倉北区浅野1丁目」のような連結表記に対応)。
     tail = text.split(ward, 1)[1] if ward else text
-    for cand in _TOWN.findall(tail) or _TOWN.findall(text):
-        if cand not in WARDS and not any(w.startswith(cand) for w in WARDS):
-            town = cand
-            break
+
+    town = None
+    if ward:
+        for cand in _town_candidates(ward):
+            if cand in tail:
+                town = cand
+                break
+    if town is None:
+        for cand in _TOWN.findall(tail) or _TOWN.findall(text):
+            if cand not in WARDS and not any(w.startswith(cand) for w in WARDS):
+                town = cand
+                break
     return ward, town
 
 
@@ -166,17 +190,51 @@ def asks_schedule(prompt: str) -> bool:
     return any(k in _norm(prompt) for k in _SCHEDULE_WORDS)
 
 
-def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str | None:
-    """質問文から品名らしき部分を取り出す。
+# 品名の識別に寄与しない修飾語。長い語から先に外す(「古くなった」より先に
+# 「古い」だけ外れて「くなった」が残る、といった取りこぼしを防ぐため)。
+# 早見表の実データに、これらで始まる品名が無いことは確認済み(「使い捨て」
+# 「使い切り」等は品名の一部として実在するため含めない)。
+_JUNK_MODIFIERS = (
+    "古くなった", "使わなくなった", "使用しなくなった", "使用済みの",
+    "壊れた", "汚れた", "不要な", "いらない", "要らない", "古い", "使わない",
+)
+_ETC_SUFFIX = re.compile(r"(?:など|等|とか)$")
+
+
+def _clean_fragment(frag: str) -> str:
+    """断片から修飾語(先頭)・「〜など」(末尾)を落とす。
+
+    「古い履物（靴など）」→ 主候補「履物」、括弧内候補「靴」のように、両方が
+    早見表の実際の品名(靴(くつ))に近づく形にしてから検索に渡すための前処理
+    (STAGE03採点で「古い履物（靴など）」が未回答になっていた実例が根拠)。
+    """
+    for _ in range(2):  # 修飾語が重なるケース(「古い使わなくなった靴」等)に対応
+        for mod in sorted(_JUNK_MODIFIERS, key=len, reverse=True):
+            if frag.startswith(mod) and frag != mod:
+                frag = frag[len(mod):]
+                break
+        else:
+            break
+    frag = _ETC_SUFFIX.sub("", frag)
+    return frag.strip()
+
+
+def _item_name_candidates(prompt: str, strip_waste_words: bool | None = None) -> list[str]:
+    """質問文から品名候補を複数抜き出す(長い順、重複除去)。
 
     正規化はデータ層が内部で行う契約なので、ここでは行わず素の文字列を返す。
 
     `strip_waste_words` が True のとき「家庭ごみ」「燃えるごみ」などのごみ種別語を
     品名候補から除く。None なら `asks_schedule()` の判定に従う。
+
+    括弧書きの言い換え(「履物（靴など）」の「靴」)や、主候補が早見表に無い
+    ケースに備え、断片を1つに絞らず全て候補として返す。`_search_item` 側で
+    主候補→残りの順に完全一致・部分一致を試してから、最後にベクトル検索へ
+    フォールバックする。
     """
     text = _norm(prompt)
     if not text:
-        return None
+        return []
 
     if strip_waste_words is None:
         strip_waste_words = asks_schedule(text)
@@ -197,23 +255,36 @@ def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str
     text = _LEADING.sub("", text)
     text = _TRAILING.sub("", text).strip()
 
-    # 記号・空白で切って最も長い断片を品名候補とする。
-    fragments = []
+    # 記号・空白で切り、断片ごとに修飾語を落として候補化する。
+    fragments: list[str] = []
     for frag in re.split(r"[\s、。「」()（）]+", text):
         frag = _TRAILING.sub("", _LEADING.sub("", frag))
-        if frag:
+        frag = _clean_fragment(frag)
+        if frag and frag not in fragments:
             fragments.append(frag)
-    if not fragments:
-        return None
-    return max(fragments, key=len)
+    fragments.sort(key=len, reverse=True)
+    return fragments
+
+
+def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str | None:
+    """質問文から品名らしき部分(主候補のみ)を取り出す。"""
+    candidates = _item_name_candidates(prompt, strip_waste_words)
+    return candidates[0] if candidates else None
 
 
 # --- 検索 ------------------------------------------------------------------
-def _search_item(item_name: str) -> tuple[list[ItemRecord], str | None]:
+def _search_item(
+    item_name: str, extra_candidates: list[str] | None = None
+) -> tuple[list[ItemRecord], str | None]:
     """完全一致 → 部分一致 → ベクトル類似度 の順にフォールバックする(早見表パス)。
 
-    ベクトル類似度は前2段がどちらも0件のときだけ発火する(issue #7)。
-    `vector_search_items` はChroma未構築・関連ヒットなしのいずれも空リストを返す。
+    `extra_candidates` があれば、主候補(`item_name`)の完全一致・部分一致が
+    どちらも0件のときに、順に完全一致・部分一致を試す。「古い履物（靴など）」
+    の主候補「履物」が早見表に無くても、括弧内候補「靴」なら実際の品名
+    (靴(くつ))に部分一致する、というケースを拾うため(STAGE03採点で該当
+    未回答になっていた実例が根拠)。ベクトル類似度は主候補・全候補の完全一致・
+    部分一致がすべて0件のときだけ発火する(issue #7)。`vector_search_items` は
+    Chroma未構築・関連ヒットなしのいずれも空リストを返す。
 
     戻り値は (ヒット, どの段で当たったか)。段(`item_match_stage`)は WebUI の
     根拠表示用。回答ロジックが使う「質問の品名そのものか、似た別品目か」の
@@ -225,6 +296,15 @@ def _search_item(item_name: str) -> tuple[list[ItemRecord], str | None]:
     partial = lookup_item_partial(item_name)[:5]
     if partial:
         return partial, "partial"
+    for cand in extra_candidates or []:
+        if cand == item_name:
+            continue
+        exact = lookup_item_exact(cand)
+        if exact:
+            return [exact], "exact"
+        partial = lookup_item_partial(cand)[:5]
+        if partial:
+            return partial, "partial"
     vector = vector_search_items(item_name, top_k=3)
     return vector, ("vector" if vector else None)
 
@@ -289,12 +369,16 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
 
     wants_schedule = asks_schedule(prompt)
 
-    item_name = image_item_name or extract_item_name(prompt, strip_waste_words=wants_schedule)
+    if image_item_name:
+        item_candidates = [image_item_name]
+    else:
+        item_candidates = _item_name_candidates(prompt, strip_waste_words=wants_schedule)
+    item_name = item_candidates[0] if item_candidates else None
     ans.detected_item = item_name
     ans.item_from_image = bool(image_item_name)
 
     if item_name:
-        ans.item_hits, ans.item_match_stage = _search_item(item_name)
+        ans.item_hits, ans.item_match_stage = _search_item(item_name, item_candidates[1:])
         ans.item_match = _classify_item_match(item_name, ans.item_hits)
 
     if ward:
