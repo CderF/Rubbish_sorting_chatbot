@@ -36,6 +36,26 @@ except ImportError:
 
     _USING_STUBS = True
 
+# --- ベクトルRAGパス・画像分類パスの解決 -----------------------------------
+# こちらは app/data/lookup.py と違い、常設のスタブファイルは持たない
+# (chromadb/sentence-transformers/vllm いずれも重い依存であり、未インストール
+# 環境でも router.py 自体はimportできるようにするための最小限のフォール
+# バックに留める)。
+try:
+    from app.rag.vector_store import vector_search_items
+except ImportError:
+
+    def vector_search_items(query: str, top_k: int = 3) -> list[ItemRecord]:
+        return []
+
+
+try:
+    from app.rag.image_classify import classify_image_to_item_name
+except ImportError:
+
+    async def classify_image_to_item_name(image_base64: str, engine, processor) -> str | None:
+        return None
+
 
 def using_stubs() -> bool:
     """データ層がまだダミーかどうか。WebUI の警告表示に使う。"""
@@ -179,19 +199,28 @@ def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str
 
 # --- 検索 ------------------------------------------------------------------
 def _search_item(item_name: str) -> list[ItemRecord]:
-    """完全一致 → 部分一致 の順にフォールバックする(早見表パス)。
+    """完全一致 → 部分一致 → ベクトル類似度 の順にフォールバックする(早見表パス)。
 
-    3段目のベクトル類似度検索(`vector_store.vector_search_items`)は未実装。
-    実装され次第ここに追加する。
+    ベクトル類似度は前2段がどちらも0件のときだけ発火する(issue #7)。
+    `vector_search_items` はChroma未構築でも例外を投げず空リストを返すので、
+    ここでの呼び出しに追加のガードは要らない。
     """
     exact = lookup_item_exact(item_name)
     if exact:
         return [exact]
-    return lookup_item_partial(item_name)[:5]
+    partial = lookup_item_partial(item_name)[:5]
+    if partial:
+        return partial
+    return vector_search_items(item_name, top_k=3)
 
 
-def _blocking_route(prompt: str) -> RoutedAnswer:
-    """同期の検索処理。`handle_query` からスレッドで呼ばれる。"""
+def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAnswer:
+    """同期の検索処理。`handle_query` からスレッドで呼ばれる。
+
+    `image_item_name` は画像分類パス(`classify_image_to_item_name`)が
+    画像から抽出した品名。渡されていればプロンプトからのテキスト抽出より
+    優先する(STAGE03 3-2: 画像は品名の代わりに渡されるものなので)。
+    """
     ans = RoutedAnswer()
 
     ward, town = extract_region(prompt)
@@ -199,7 +228,7 @@ def _blocking_route(prompt: str) -> RoutedAnswer:
 
     wants_schedule = asks_schedule(prompt)
 
-    item_name = extract_item_name(prompt, strip_waste_words=wants_schedule)
+    item_name = image_item_name or extract_item_name(prompt, strip_waste_words=wants_schedule)
     ans.detected_item = item_name
 
     if item_name:
@@ -247,19 +276,31 @@ def _blocking_route(prompt: str) -> RoutedAnswer:
 _db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rag-lookup")
 
 
-async def handle_query(prompt: str, img_b64: str | None = None) -> RoutedAnswer:
+async def handle_query(
+    prompt: str,
+    img_b64: str | None = None,
+    engine=None,
+    processor=None,
+) -> RoutedAnswer:
     """`/chat` から呼ばれるエントリポイント。
 
     計画書では同期関数だったが、`server.py` は全体が async で動いており、
     SQLite・embedding・VLM呼び出しでイベントループを塞ぐと同時4リクエスト
     要件に影響するため async 化した(FANG と合意済みの変更点)。
 
-    画像分類パス(`image_classify.classify_image_to_item_name`)は未実装。
-    画像のみの質問は現状ヒットせず、`server.py` が従来どおり画像をVLMへ
-    直接渡すため、STAGE1-1 時点の挙動は維持される。
+    `engine`/`processor` は `server.py` が起動時に初期化する共有vLLMエンジン
+    (STAGE03 3-2向け画像分類パス用)。呼び出し元がどちらも渡さない場合、または
+    `img_b64` が無い場合は画像分類をスキップし、テキストのみのルーティングに
+    フォールバックする(例外にはしない — 呼び出し側の都合を尊重する)。
     """
+    image_item_name = None
+    if img_b64 and engine is not None and processor is not None:
+        image_item_name = await classify_image_to_item_name(img_b64, engine, processor)
+
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_db_executor, _blocking_route, prompt)
+    return await loop.run_in_executor(
+        _db_executor, _blocking_route, prompt, image_item_name
+    )
 
 
 # --- 整形 ------------------------------------------------------------------
