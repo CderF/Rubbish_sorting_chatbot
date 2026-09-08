@@ -122,13 +122,25 @@ _WASTE_WORDS = WASTE_TYPES + (
     "びん",
 )
 
-# 「〜はどう捨てますか」「〜の分別」などの質問定型を落として品名だけを残す。
+# 「〜はどう捨てますか」「〜はどこで回収してもらえますか」「〜の処分方法を
+# 教えてください」などの質問定型を落として品名だけを残す。捨て・処分・回収
+# 等の語が現れたら、その手前まで(\1)を品名として残し、以降を全部落とす。
+# 先頭に最短一致の `.+?` を置き、「ごみ箱」のように品名側にこれらの語が
+# 含まれるケースを丸ごと消してしまわないようにする。
 _QUESTION_TAIL = re.compile(
-    r"(?:は|の|を|って|とは)?\s*"
-    r"(?:どうやって|どのように|どう|なに|何|いつ)?\s*"
-    r"(?:捨て(?:方|る|たい|ます|られ)|出し方|出せ|分別|処分(?:方法|の仕方)?|"
-    r"ごみ|ゴミ|区分|収集日|回収日|収集|回収)"
-    r"[^ぁ-んァ-ヶ一-龥]*.*$"
+    r"(.+?)"
+    r"(?:"
+    # 「〜はどう捨てれば」「〜はどこで回収」「〜はどうやって処分」
+    r"(?:は|の|を|って|とは|も)?\s*"
+    r"(?:どこ|どうやって|どのように|どう|なに|何|いつ)\s*(?:で|に|へ|から)?\s*"
+    r"(?:捨て|出せ|出し|処分|廃棄|分別|区分|回収|収集|処理|片付け)"
+    r"|"
+    # 「〜の捨て方」「〜の処分方法」「〜を回収してもらう」「〜の分別」
+    r"(?:は|の|を|、)\s*"
+    r"(?:捨て方|出し方|処分方法|処分の仕方|分別方法|分別|区分|"
+    r"回収して|収集して|処分して|廃棄して|回収の|処分の|回収方法|処分を)"
+    r")"
+    r".*$"
 )
 
 # 文頭・文末に残る助詞や記号だけを落とす軽量な後処理。
@@ -268,6 +280,10 @@ def asks_schedule(prompt: str) -> bool:
 _JUNK_MODIFIERS = (
     "古くなった", "使わなくなった", "使用しなくなった", "使用済みの",
     "壊れた", "汚れた", "不要な", "いらない", "要らない", "古い", "使わない",
+    # サイズ・形状・用途の修飾。品名そのものではないので検索前に落とす
+    # (採点の「小型の〜」「家庭用の〜」「三輪の〜」対策)。
+    "小型の", "小型", "家庭用の", "家庭用", "携帯用の", "携帯用", "携帯",
+    "三輪の", "折り畳み式の", "折りたたみ式の", "折り畳みの", "折りたたみの",
 )
 _ETC_SUFFIX = re.compile(r"(?:など|等|とか)$")
 
@@ -333,7 +349,7 @@ def _item_name_candidates(
         for word in sorted(_WASTE_WORDS, key=len, reverse=True):
             text = text.replace(word, " ")
 
-    text = _QUESTION_TAIL.sub("", text)
+    text = _QUESTION_TAIL.sub(r"\1", text)
     text = _LEADING.sub("", text)
     text = _TRAILING.sub("", text).strip()
 
@@ -413,6 +429,45 @@ def _search_item(
             return partial, "partial"
     vector = vector_search_items(vector_query or item_name, top_k=3)
     return vector, ("vector" if vector else None)
+
+
+# item_name の直前に来てよい文字(文頭 or 助詞・記号・空白)。「電動スケート
+# ボード」中の「スケートボード」のように直前が語の一部(漢字・かな)なら
+# 別品目=類推とみなす。
+_NAME_BOUNDARY_BEFORE = set("のはをがにへとでもや、。「」（）()　 ・/／")
+
+
+def _resolve_named_hit(prompt: str, hits: list[ItemRecord]) -> "ItemRecord | None":
+    """検索ヒットのうち、その item_name が質問文にそのまま現れており、かつ
+    直前が文頭か助詞・記号であるものを返す。
+
+    候補文字列が質問定型(「〜はどう捨てればいいですか」等)で汚れて
+    exact/partial を素通りし vector に落ちても、ヒット名自体が原文に含まれて
+    いれば、それは類推ではなく完全一致として扱う(採点の自然な問い方対策。
+    trace 実測で 50問中46問が vector・timeline 発火0だった回帰の主因)。
+
+    複数該当時は名前の終端が最も右にあるもの(=主辞。「電動一輪車用の充電
+    ケーブル」なら『充電ケーブル』)を採る。
+    """
+    p = _norm(prompt)
+    best: "ItemRecord | None" = None
+    best_end = -1
+    for h in hits:
+        name = _norm(getattr(h, "item_name", ""))
+        if len(name) < 2:
+            continue
+        start = 0
+        while True:
+            idx = p.find(name, start)
+            if idx == -1:
+                break
+            before = p[idx - 1] if idx > 0 else ""
+            if before == "" or before in _NAME_BOUNDARY_BEFORE:
+                end = idx + len(name)
+                if end > best_end:
+                    best, best_end = h, end
+            start = idx + 1
+    return best
 
 
 def _classify_item_match(item_names: "str | list[str]", hits: list[ItemRecord]) -> str:
@@ -543,6 +598,19 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
             item_name, item_candidates[1:], vector_query
         )
         ans.item_match = _classify_item_match(item_candidates, ans.item_hits)
+
+        # 候補文字列が質問定型で汚れて exact/partial を素通りしても、ヒット名
+        # 自体が原文にそのまま出ていれば完全一致として扱い、正しい品名で
+        # timeline も引けるようにする(trace: 46/50 が vector・timeline 0 の回帰)。
+        if ans.item_match == "analogy":
+            named = _resolve_named_hit(prompt, ans.item_hits)
+            if named is not None:
+                ans.item_match = "exact"
+                ans.detected_item = named.item_name
+                ans.item_hits = [named] + [h for h in ans.item_hits if h is not named]
+                if named.item_name not in item_candidates:
+                    item_candidates = [named.item_name, *item_candidates]
+
         # 4-3 確度ゲート。**真の vector フォールバック時だけ**適用する。
         # exact / partial ヒットは早見表に実在する行(4-1 の新品目、4-2 の通知
         # 品目、部分一致の別表記など)であり、名前が質問と完全一致しなくても
