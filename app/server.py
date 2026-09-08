@@ -245,7 +245,7 @@ async def _route_safely(prompt: str, img: str | None):
     ため、ここだけは意図的に握り潰し、素の生成にフォールバックする。
     """
     try:
-        return await router.handle_query(prompt, img)
+        return await router.handle_query(prompt, img, engine=engine, processor=processor)
     except Exception as exc:  # noqa: BLE001 — 生成の継続を最優先する
         print(f"[rag] handle_query failed, falling back to plain generation: {exc!r}",
               flush=True)
