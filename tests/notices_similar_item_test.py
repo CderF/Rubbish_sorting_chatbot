@@ -544,3 +544,49 @@ def test_electric_nose_trimmer_gets_a_hedged_analogy(monkeypatch):
     assert ans.analogy_unreliable is False
     assert ans.canned_response is None
     assert router._analogy_pick(ans.item_hits, ans.detected_item).item_name == "電動歯ブラシ"
+
+
+# --- #35 前缀清理: 修飾語を全部剥がす(Codex B1レビュー) ----------------
+def test_relation_strength_strips_all_leading_modifiers():
+    from app.rag.router import _relation_strength as S
+
+    # 「家庭用の電動ミニシュレッダー」→ 家庭用/の/電動/ミニ を全部剥がすと
+    # 残りは空 → 「シュレッダー」は上位語(strength 2)
+    assert S("家庭用の電動ミニシュレッダー", "シュレッダー(家庭用)") == 2
+    assert S("家庭用の電動ミニシュレッダー", "シュレッダー処理後の紙") == 1
+
+
+def test_override_analogy_hits_forces_reference_item(monkeypatch):
+    from app.rag.router import _override_analogy_hits
+
+    # 対象がベクトルヒットにあればそれを1件に絞る
+    hits = [_rec("シュレッダー処理後の紙"), _rec("シュレッダー(家庭用)"), _rec("電動芝刈り機")]
+    out = _override_analogy_hits("家庭用の電動ミニシュレッダー", hits)
+    # シュレッダー系は _ANALOGY_PREFERRED に無いが、強関連で拾えるので素通り
+    assert len(out) == 3
+
+    # _ANALOGY_PREFERRED 該当品目はヒットに無くても DB から引いて1件に
+    monkeypatch.setattr(
+        router, "lookup_item_exact",
+        lambda n: _rec("アダプター(電源用)") if n == "アダプター(電源用)" else None,
+    )
+    hits = [_rec("充電ケーブル"), _rec("リチウム電池(充電ができないもの)")]
+    out = _override_analogy_hits("ワイヤレス充電器(パッド型)", hits)
+    assert [h.item_name for h in out] == ["アダプター(電源用)"]
+
+
+def test_analogy_answer_cites_only_the_picked_reference(monkeypatch):
+    monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
+    monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    monkeypatch.setattr(
+        router, "vector_search_items",
+        lambda q, top_k=3: [
+            _rec_src("ハンドクリーナー", "https://ex/a.html"),
+            _rec_src("ミキサー", "https://ex/b.html"),
+            _rec_src("編み機", "https://ex/c.html"),
+        ],
+    )
+    monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
+    ans = router._blocking_route("ハンドミキサーはどう捨てればいいですか？")
+    assert ans.item_match == "analogy"
+    assert ans.sources == ["https://ex/b.html"]  # ミキサーのURLだけ
