@@ -269,9 +269,24 @@ def version_window(
 # knowledge_sources
 # --------------------------------------------------------------------------
 def is_ingested(conn: sqlite3.Connection, content_hash: str) -> bool:
+    """Return True only when the notice metadata and its produced row exist.
+
+    ``app.data.db.rebuild_db()`` performs a full replacement of
+    ``waste_items``.  ``knowledge_sources`` intentionally lives outside that
+    shared schema, so a crawl can leave its idempotency record pointing at a
+    deleted row.  Treating that orphan as ingested would make the following
+    ingest skip the notice and silently disable STAGE04 4-1/4-2.
+    """
     return (
         conn.execute(
-            "SELECT 1 FROM knowledge_sources WHERE content_hash = ?", (content_hash,)
+            """
+            SELECT 1
+            FROM knowledge_sources ks
+            JOIN waste_items wi ON wi.id = ks.produced_item_id
+            WHERE ks.content_hash = ?
+              AND wi.source_url LIKE ?
+            """,
+            (content_hash, f"{KNOWLEDGE_SCHEME}%"),
         ).fetchone()
         is not None
     )
@@ -290,6 +305,37 @@ def record_knowledge_source(
     is_change_notice: bool,
     prior_disposal_method: "str | None" = None,
 ) -> int:
+    values = (
+        source_file,
+        source_type,
+        anchor,
+        title,
+        content_hash,
+        ingested_at.isoformat(),
+        produced_item_id,
+        1 if is_change_notice else 0,
+        prior_disposal_method,
+    )
+
+    # A full crawl replaces ``waste_items`` but leaves this STAGE04 manifest
+    # intact.  Reuse the manifest row when its produced item disappeared;
+    # inserting another row would violate the UNIQUE content_hash constraint.
+    existing = conn.execute(
+        "SELECT id FROM knowledge_sources WHERE content_hash = ?", (content_hash,)
+    ).fetchone()
+    if existing is not None:
+        conn.execute(
+            """
+            UPDATE knowledge_sources
+            SET source_file = ?, source_type = ?, anchor = ?, title = ?,
+                content_hash = ?, ingested_at = ?, produced_item_id = ?,
+                is_change_notice = ?, prior_disposal_method = ?
+            WHERE id = ?
+            """,
+            (*values, existing["id"]),
+        )
+        return int(existing["id"])
+
     cur = conn.execute(
         """
         INSERT INTO knowledge_sources (
@@ -297,17 +343,7 @@ def record_knowledge_source(
             ingested_at, produced_item_id, is_change_notice, prior_disposal_method
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            source_file,
-            source_type,
-            anchor,
-            title,
-            content_hash,
-            ingested_at.isoformat(),
-            produced_item_id,
-            1 if is_change_notice else 0,
-            prior_disposal_method,
-        ),
+        values,
     )
     return int(cur.lastrowid)
 
