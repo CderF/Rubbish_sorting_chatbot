@@ -1,23 +1,23 @@
-"""収集日パスの町名照合に関する再現テスト(現状は失敗する)。
+"""収集日パスの町名照合に関する回帰テスト(PR #16, 藤井の再現テストを元に修正確認用に調整)。
 
-北九州市の収集日ページは複数の丁目を1行にまとめて掲載しており、
-`crawler.parse_schedule_page` はその表記のまま `collection_schedule.town` に
-格納する(例: "浅野1~3丁目")。一方 `lookup_collection_schedule` は
+北九州市の収集日ページは複数の丁目を1行にまとめて掲載している(例:
+"浅野1～3丁目")。修正前は `crawler.parse_schedule_page` がその表記のまま
+`collection_schedule.town` に格納しており、`lookup_collection_schedule` は
 `WHERE town = ?` の完全一致なので、利用者が自然に言う「浅野1丁目」は
-永久にヒットしない。
+永久にヒットしなかった。
 
 実測(2026-09-08 時点、`crawler.fetch_collection_schedules()` の結果):
     収集日レコード 2472件 / ユニーク町名 777件
-    うち範囲表記   340件 (43.8%)  <- この町の住民は収集日を引けない
-    展開すると     1526件
+    うち範囲表記   340件 (43.8%)  <- 修正前はこの町の住民が収集日を引けなかった
 
-本番(B1)での確認:
-    「八幡東区八王寺町の…」   -> 火曜日・金曜日・日曜日 と正しく回答(範囲でない)
-    「八幡東区中央1丁目の…」  -> 該当なし              (実データは "中央1~3丁目")
+修正: 取り込み時点(`crawler._expand_town_range`)で丁目単位に展開してから
+格納するようにした(正規化はデータ層の責務という既存の契約に合わせ、
+`lookup_collection_schedule` 側は完全一致のまま変更していない)。
 
-データ層・応用層のどちらも各自の契約どおりに動いており、範囲表記を展開する
-責務がどちらにも割り当てられていないために落ちている。本テストは期待する
-振る舞いを実行可能な形で固定するもので、修正が入るまで失敗する。
+このテストの `setup()` は、藤井の元の再現テストが直接DBへ投入していた
+生の範囲表記(修正前のcrawlerが格納していた形)を、`_expand_town_range` に
+通してから投入するよう変更した — 修正後は crawler が範囲表記のままDBに
+入れることはないため、そのままでは修正の効果を再現できないため。
 
     python3 tests/collection_schedule_town_test.py
 
@@ -60,11 +60,18 @@ def check(label, ok, detail=""):
 
 
 def setup():
+    # 修正は取り込み時点(crawler._expand_town_range)で丁目単位に展開する方式
+    # なので、DBには最初から展開済みの行しか入らない。ここでも同じ展開関数を
+    # 通してから格納し、実際の crawl 結果を模す(生の範囲表記をDBへ直接投入
+    # すると、この修正方式では再現できないケースになってしまうため)。
+    from app.data.crawler import _expand_town_range
+
     conn = db.connect(DB_PATH)
     db.rebuild_db(conn, [], [
-        CollectionSchedule(ward=w, town=t, waste_type=k, weekday=d,
+        CollectionSchedule(ward=w, town=town, waste_type=k, weekday=d,
                            source_url=URL, crawled_at=CRAWLED_AT)
         for w, t, k, d in FIXTURES
+        for town in _expand_town_range(t)
     ])
     conn.close()
 
