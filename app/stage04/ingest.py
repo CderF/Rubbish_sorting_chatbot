@@ -55,6 +55,11 @@ class IngestResult:
     unlinked: "list[str]" = field(default_factory=list)
     skipped: "list[str]" = field(default_factory=list)
     disputed: "list[tuple[str, str, str]]" = field(default_factory=list)
+    # linked via a base-name match, not an identical name (お知らせ「乾電池」→
+    # 早見表「乾電池(充電式でないもの)」). (notice_name, hayamihyo_name).
+    partial_links: "list[tuple[str, str]]" = field(default_factory=list)
+    # base-name matched several 早見表 rows — NOT linked, needs a human.
+    ambiguous: "list[tuple[str, tuple[str, ...]]]" = field(default_factory=list)
     warnings: "list[str]" = field(default_factory=list)
 
     @property
@@ -73,6 +78,15 @@ class IngestResult:
                 "（クローラー実行後に `--relink` でリンクされます）: "
                 + "、".join(self.unlinked)
             )
+        for notice_name, hayamihyo_name in self.partial_links:
+            lines.append(
+                f"  部分一致リンク: お知らせ「{notice_name}」→ 早見表「{hayamihyo_name}」"
+            )
+        for name, cands in self.ambiguous:
+            lines.append(
+                f"  曖昧: お知らせ「{name}」が早見表の複数行に該当（{'、'.join(cands)}）。"
+                "自動リンクせず。人手で確認"
+            )
         for name, notice_says, crawl_says in self.disputed:
             lines.append(
                 f"  不一致: {name} — お知らせは現行「{notice_says}」だが"
@@ -87,6 +101,8 @@ class IngestResult:
 class RelinkResult:
     linked: "list[tuple[str, int, int]]" = field(default_factory=list)
     still_unlinked: "list[str]" = field(default_factory=list)
+    partial_links: "list[tuple[str, str]]" = field(default_factory=list)
+    ambiguous: "list[tuple[str, tuple[str, ...]]]" = field(default_factory=list)
     # linked, but the crawled 早見表 row's disposal_method does not corroborate
     # the notice's stated 現行 treatment — surfaced, not blocked.
     disputed: "list[tuple[str, str, str]]" = field(default_factory=list)
@@ -94,10 +110,17 @@ class RelinkResult:
     def summary(self) -> str:
         line = (
             f"relink: {len(self.linked)}件をリンクしました "
-            f"(未リンクのまま {len(self.still_unlinked)}件 / 現行表記の不一致 {len(self.disputed)}件)"
+            f"(未リンクのまま {len(self.still_unlinked)}件 / 部分一致 {len(self.partial_links)}件 / "
+            f"曖昧 {len(self.ambiguous)}件 / 現行表記の不一致 {len(self.disputed)}件)"
         )
         if self.still_unlinked:
             line += "\n  早見表に該当なし: " + "、".join(self.still_unlinked)
+        for notice_name, hayamihyo_name in self.partial_links:
+            line += f"\n  部分一致: お知らせ「{notice_name}」→ 早見表「{hayamihyo_name}」"
+        for name, cands in self.ambiguous:
+            line += (
+                f"\n  曖昧: お知らせ「{name}」→ 複数該当（{'、'.join(cands)}）。人手で確認"
+            )
         for name, notice_says, crawl_says in self.disputed:
             line += (
                 f"\n  不一致: {name} — お知らせは現行「{notice_says}」だが"
@@ -146,6 +169,34 @@ def notice_to_waste_item(notice: Notice, ingested_at: datetime) -> WasteItem:
     )
 
 
+def _record_link(
+    result: "IngestResult | RelinkResult",
+    notice_name: str,
+    prior_disposal_method: "str | None",
+    match: "store.PredecessorMatch",
+    new_id: int,
+    conn: sqlite3.Connection,
+) -> None:
+    """Apply one predecessor match: link it, or record why it wasn't linked."""
+    if match.item is not None and match.item.id is not None:
+        store.mark_superseded(conn, match.item.id, new_id)
+        result.linked.append((notice_name, match.item.id, new_id))
+        if not match.exact:
+            result.partial_links.append((notice_name, match.item.item_name))
+        if prior_disposal_method and (
+            prior_disposal_method not in (match.item.disposal_method or "")
+        ):
+            result.disputed.append(
+                (notice_name, prior_disposal_method, match.item.disposal_method)
+            )
+    elif match.candidates:
+        result.ambiguous.append((notice_name, match.candidates))
+    elif isinstance(result, IngestResult):
+        result.unlinked.append(notice_name)
+    else:
+        result.still_unlinked.append(notice_name)
+
+
 def ingest_notices(
     notices: "list[Notice]",
     conn: sqlite3.Connection,
@@ -165,31 +216,19 @@ def ingest_notices(
 
         # Find the predecessor *before* inserting, else the new row matches its
         # own is_current = 1 lookup.
-        predecessor = (
+        match = (
             store.find_current_predecessor(conn, notice.item_name)
             if notice.is_change_notice
-            else None
+            else store.PredecessorMatch()
         )
 
         new_id = store.insert_waste_item(conn, notice_to_waste_item(notice, ingested_at))
         result.inserted.append(notice.item_name)
 
         if notice.is_change_notice:
-            if predecessor is not None and predecessor.id is not None:
-                store.mark_superseded(conn, predecessor.id, new_id)
-                result.linked.append((notice.item_name, predecessor.id, new_id))
-                if notice.prior_disposal_method and (
-                    notice.prior_disposal_method not in (predecessor.disposal_method or "")
-                ):
-                    result.disputed.append(
-                        (
-                            notice.item_name,
-                            notice.prior_disposal_method,
-                            predecessor.disposal_method,
-                        )
-                    )
-            else:
-                result.unlinked.append(notice.item_name)
+            _record_link(
+                result, notice.item_name, notice.prior_disposal_method, match, new_id, conn
+            )
 
         store.record_knowledge_source(
             conn,
@@ -230,20 +269,12 @@ def relink(conn: sqlite3.Connection) -> RelinkResult:
     result = RelinkResult()
     for row in store.unlinked_change_sources(conn):
         new_id = row["produced_item_id"]
-        predecessor = store.find_current_predecessor(
+        match = store.find_current_predecessor(
             conn, row["item_name"], exclude_id=new_id
         )
-        if predecessor is None or predecessor.id is None:
-            result.still_unlinked.append(row["item_name"])
-            continue
-        store.mark_superseded(conn, predecessor.id, new_id)
-        result.linked.append((row["item_name"], predecessor.id, new_id))
-
-        notice_says = row["prior_disposal_method"]
-        if notice_says and notice_says not in (predecessor.disposal_method or ""):
-            result.disputed.append(
-                (row["item_name"], notice_says, predecessor.disposal_method)
-            )
+        _record_link(
+            result, row["item_name"], row["prior_disposal_method"], match, new_id, conn
+        )
     conn.commit()
     return result
 
