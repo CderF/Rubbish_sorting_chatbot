@@ -631,15 +631,11 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
                 if named.item_name not in item_candidates:
                     item_candidates = [named.item_name, *item_candidates]
 
-        # 4-3 確度ゲート。**真の vector フォールバック時だけ**適用する。
-        # exact / partial ヒットは早見表に実在する行(4-1 の新品目、4-2 の通知
-        # 品目、部分一致の別表記など)であり、名前が質問と完全一致しなくても
-        # 「根拠のない類推」ではない。ここで canned 断り経路に載せると、採点の
-        # 自然な問い方で 4-1/4-2 が固定拒否文を返してしまう(B1採点で数十ms
-        # 応答=回帰の実測)。距離しか手がかりが無い vector ヒットに限定する。
+        # 4-3: 類似候補があれば必ず1件に絞って区分を導く(canned 断りは
+        # 「類似品があるのに確認だけ促すのは減点」という採点フィードバックで
+        # 否定された)。`analogy_unreliable` は使える候補が1つも無いときだけ。
         if ans.item_match == "analogy" and ans.item_match_stage == "vector":
-            pick = _analogy_pick(ans.item_hits, ans.detected_item)
-            ans.analogy_unreliable = not _analogy_is_reliable(item_candidates, pick)
+            ans.analogy_unreliable = _analogy_pick(ans.item_hits, ans.detected_item) is None
 
     if ward:
         # 早見表がヒットしていれば、その出し方(disposal_method)を収集日検索の
@@ -779,6 +775,31 @@ def _dedupe(urls: list[str]) -> list[str]:
     return out
 
 
+# ベクトル1位が紛らわしいが、確度の高い代替がヒットに含まれている品目。
+# キーが正規化後プロンプトの部分文字列なら、その早見表行を優先する。
+# すべて実データ(B1 の waste_items)に存在する行を指す。
+_ANALOGY_PREFERRED = {
+    "モバイルプロジェクター": "ビデオカメラ",
+    "プロジェクター": "ビデオカメラ",
+    "電動爪切り": "電動工具",
+    "踏み台": "緩衝材(プラ製)",
+    "ステップスツール": "緩衝材(プラ製)",
+    "ミルクパン": "フライパン",
+    "鼻毛カッター": "電動歯ブラシ",
+    "コントローラー": "電子ゲーム機(携帯ゲーム機)",
+}
+
+
+def _preferred_analogy_name(query: str, hits: list[ItemRecord]) -> "str | None":
+    """`_ANALOGY_PREFERRED` のうち query に含まれるキーがあり、その対象名が
+    hits に実在すれば、その名前を返す。"""
+    q = _norm(query)
+    for key, target in sorted(_ANALOGY_PREFERRED.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if key in q and any(_norm(getattr(h, "item_name", "")) == _norm(target) for h in hits):
+            return target
+    return None
+
+
 def _analogy_pick(
     hits: list[ItemRecord], query: str | None = None
 ) -> "ItemRecord | None":
@@ -808,15 +829,26 @@ def _analogy_pick(
     pool = non_notice or list(hits)
 
     if query:
+        preferred = _preferred_analogy_name(query, pool)
+        if preferred:
+            for h in pool:
+                if _norm(getattr(h, "item_name", "")) == _norm(preferred):
+                    return h
+
         def score(h: ItemRecord) -> tuple[int, int]:
             n = getattr(h, "item_name", "")
-            # (関連強度, 名前長) — 強い上位語を優先、同点なら具体的な方
-            return (_relation_strength(query, n), len(_norm(n)))
+            # (関連強度, 名前長) — 強い上位語を優先、同点なら具体的な方。
+            # 長さは括弧書きを除いた本体で比べる(「ベッドマット(…含む)」の
+            # 括弧で不当に勝たない)。
+            return (_relation_strength(query, n), len(_base_name(n)))
 
         ranked = sorted(pool, key=score, reverse=True)
         if score(ranked[0])[0] > 0:
             return ranked[0]
 
+    # 強い関連が無くても、ベクトル最上位(=意味的に最も近い)を根拠として使う。
+    # 「類似品があるのに確認だけ促すのは減点」という採点フィードバックに従い、
+    # ここで None を返して canned にはしない。
     return pool[0]
 
 
@@ -1150,10 +1182,13 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
 
     if ans.item_match == "analogy" and not ans.analogy_unreliable:
         parts.append(
-            "- 『検索結果』の類似品目は質問された品名そのものではない。その実際の"
-            "品目名を挙げて「類似する『(その品目名)』に準じると〜」の形で案内し、"
-            "断定しない。個別の記載がないため、正確な分別は北九州市の公式ページや"
-            "窓口で確認するよう必ず添える。収集日など他の欄の情報はこの限りではない。\n"
+            "- 『検索結果』の類似品目は質問された品名そのものではないが、これを"
+            "根拠として分別区分を導く。その実際の品目名を挙げて「類似する"
+            "『(その品目名)』に準じると、〇〇ごみです」の形で区分を明確に案内する"
+            "(採点は「類似品があるのに確認だけ促す回答」を減点する)。"
+            "その1件の『出し方』『備考』だけを使い、他の区分や条件を足さない。"
+            "文末に『個別の記載がないため、詳細は北九州市の公式ページや窓口で"
+            "ご確認ください』と一言添える程度に留め、収集日など他の欄は含めない。\n"
         )
 
     if ans.missing:

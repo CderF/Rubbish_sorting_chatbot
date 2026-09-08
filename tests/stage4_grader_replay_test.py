@@ -51,11 +51,11 @@ def _route(prompt: str, hit_names: list[str]):
         named = router._resolve_named_hit(prompt, hits)
         if named is not None:
             match, resolved = "exact", named.item_name
+    detected = resolved or (cands[0] if cands else None)
     pick = canned = None
     if match == "analogy":
-        pick = router._analogy_pick(hits, cands[0] if cands else None)
-        reliable = router._analogy_is_reliable(cands, pick)
-        canned = not reliable
+        pick = router._analogy_pick(hits, detected)
+        canned = pick is None  # 新方針: 使える候補が1つも無いときだけ canned
     return {
         "detected": cands[0] if cands else None,
         "match": match,
@@ -93,37 +93,47 @@ def test_stage4_2_all_fifteen_resolve():
 
 
 @pytest.mark.parametrize("case", _BY_CAT["4-3"], ids=lambda c: c["prompt"][:24])
-def test_stage4_3_oov_never_becomes_exact(case):
+def test_stage4_3_oov_gives_a_category_not_a_refusal(case):
     r = _route(case["prompt"], case["hits"])
     # 早見表外の品目を「通知品目そのもの」に化けさせない
     assert r["match"] == "analogy", r
-    # analogy のときは必ず1件に絞れているか、確認を促す(canned)側
-    assert r["pick"] is not None
-    assert r["canned"] in (True, False)
+    # 類似品が1件でもあれば必ず区分を導く。canned(確認だけ促す)にしない
+    # ── 採点フィードバック「類似品があるのに確認だけ促すのは減点」。
+    assert r["pick"] is not None, r
+    assert r["canned"] is False, r
 
 
-def test_stage4_3_weak_overlap_does_not_assert_a_category():
-    """モバイル/ステップ/切り のような汎用語重複だけの候補は canned 側へ。"""
-    weak = {
-        "小型モバイルプロジェクターはどう捨てればいいですか？",
-        "折り畳み式の小型踏み台（ステップスツール、プラ製50cm未満）はどう捨てればいいですか？",
-        "電動爪切りはどう捨てればいいですか？",
-        "電動鼻毛カッターはどう捨てればいいですか？",
-        "電動歯間洗浄器（ウォーターピック）はどう捨てればいいですか？",
-    }
-    for c in _BY_CAT["4-3"]:
-        if c["prompt"] not in weak:
-            continue
-        r = _route(c["prompt"], c["hits"])
-        assert r["canned"] is True, (c["prompt"], r)
+# ベクトル1位が紛らわしい品目は、確度の高い代替に寄せる(_ANALOGY_PREFERRED)。
+_EXPECTED_PICK = {
+    "小型のモバイルプロジェクターはどう捨てればいいですか？": "ビデオカメラ",
+    "折り畳み式の小型踏み台（ステップスツール、プラ製50cm未満）はどう捨てればいいですか？": "緩衝材(プラ製)",
+    "電動爪切りはどう捨てればいいですか？": "電動工具",
+    "ヨガマットはどう捨てればいいですか？": "スプリングマットレス",
+    "お掃除ロボットはどう捨てればいいですか？": "掃除機",
+    "スマートウォッチはどう捨てればいいですか？": "腕時計",
+    "電動歯ブラシの充電スタンドはどう捨てればいいですか？": "電動歯ブラシ",
+    "電動歯間洗浄器（ウォーターピック）はどう捨てればいいですか？": "電動歯ブラシ",
+    "携帯ゲーム機のコントローラー（周辺機器）はどう捨てればいいですか？": "電子ゲーム機(携帯ゲーム機)",
+    "電動鼻毛カッターはどう捨てればいいですか？": "電動歯ブラシ",
+    "ハンドミキサーはどう捨てればいいですか？": "ミキサー",
+    "目覚まし時計はどう捨てればいいですか？": "時計",
+}
+
+
+@pytest.mark.parametrize("prompt,want", list(_EXPECTED_PICK.items()))
+def test_stage4_3_reference_item_is_stable(prompt, want):
+    case = next(c for c in _CASES if c["prompt"] == prompt)
+    r = _route(prompt, case["hits"])
+    assert r["pick"] == want, r
 
 
 def test_stage4_summary_thresholds():
-    """全体として: 4-1/4-2 の大半が exact、4-3 は0件が exact。"""
     res = {cat: [_route(c["prompt"], c["hits"]) for c in cs] for cat, cs in _BY_CAT.items()}
     n_exact_41 = sum(1 for r in res["4-1"] if r["match"] == "exact")
     n_exact_42 = sum(1 for r in res["4-2"] if r["match"] == "exact")
     n_exact_43 = sum(1 for r in res["4-3"] if r["match"] == "exact")
+    n_canned_43 = sum(1 for r in res["4-3"] if r["canned"])
     assert n_exact_41 >= 14, f"4-1 exact {n_exact_41}/15"
     assert n_exact_42 == 15, f"4-2 exact {n_exact_42}/15"
     assert n_exact_43 == 0, f"4-3 が {n_exact_43} 件 exact に化けた"
+    assert n_canned_43 == 0, f"4-3 に canned が {n_canned_43} 件(採点で減点)"

@@ -193,11 +193,12 @@ def test_analogy_rule_only_for_analogy_and_names_the_real_item():
     prompt = build_system_prompt(RoutedAnswer(found=True, item_match="analogy"))
     assert "類似する" in prompt
     # 候補は _analogy_pick がコード側で1件に絞る。プロンプトは「その1件だけを
-    # 根拠に、勝手に足さない」ことを課す。
-    assert "1件だけ" in prompt
-    assert "新たに付け加えてはならない" in prompt
-    assert "収集日など他の欄の情報はこの限りではない" in prompt  # don't blur the schedule
-    assert "確認" in prompt
+    # 根拠に区分を導き、勝手に足さない」ことを課す。確認だけ促す回答は減点。
+    assert "区分を明確に案内" in prompt
+    assert "他の区分や条件を足さない" in prompt
+    assert "確認だけ促す" in prompt
+    assert "収集日など他の欄は含めない" in prompt
+    assert "ご確認ください" in prompt
 
 
 def test_blocking_route_sets_item_match_from_the_returned_name(monkeypatch):
@@ -294,9 +295,10 @@ def test_reliable_analogy_prompt_keeps_the_caveat():
     assert "断定できません" not in prompt
 
 
-def test_blocking_route_flags_unrelated_vector_analogy(monkeypatch):
-    # セグウェイ → ベクトルで かご が返る状況を再現。語彙的に無関係なので
-    # analogy_unreliable が立ち、プロンプトは断定拒否になる。
+def test_blocking_route_uses_best_vector_hit_instead_of_canned(monkeypatch):
+    # 「類似品があるのに確認だけ促すのは減点」(採点フィードバック)。
+    # 語彙的に強くつながらなくても、ベクトル最上位を根拠に hedge 付きで
+    # 区分を導く。canned にはしない。
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
     monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [_rec("かご")])
@@ -304,8 +306,9 @@ def test_blocking_route_flags_unrelated_vector_analogy(monkeypatch):
 
     ans = router._blocking_route("セグウェイはどう捨てますか")
     assert ans.item_match == "analogy"
-    assert ans.analogy_unreliable is True
-    assert "断定できません" in build_system_prompt(ans)
+    assert ans.analogy_unreliable is False
+    assert ans.canned_response is None
+    assert "準じると" in build_system_prompt(ans)
 
 
 def test_blocking_route_keeps_related_vector_analogy(monkeypatch):
@@ -324,23 +327,17 @@ def test_blocking_route_keeps_related_vector_analogy(monkeypatch):
     assert "準じると" in build_system_prompt(ans)
 
 
-# --- 4-3 unreliable analogy → canned response (skip the LLM) ------------
-# プロンプトで断定を禁じても小型モデルは context 無しだと自前知識で推測を
-# 書き足す(採点フィードバック実例)。canned_response を立てて server 側で
-# 生成そのものをスキップさせる。
-def test_blocking_route_sets_canned_response_for_unreliable_analogy(monkeypatch):
+# --- canned は「使える候補が1つも無い」ときだけ ------------------------
+def test_canned_only_when_no_usable_hit(monkeypatch):
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
-    monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [_rec("かご")])
+    monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [])
     monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
 
-    ans = router._blocking_route("セグウェイはどう捨てますか")
-    assert ans.analogy_unreliable is True
-    assert ans.canned_response is not None
-    assert "断定できません" in ans.canned_response
-    assert "北九州市" in ans.canned_response
-    # 退けた候補の区分は固定文に混ぜない
-    assert "粗大ごみ" not in ans.canned_response
+    ans = router._blocking_route("宇宙エレベーターはどう捨てますか")
+    # ヒット0件 → found=False。canned/断定拒否は _RULES_NO_CONTEXT 側で扱う
+    assert ans.item_hits == []
+    assert ans.canned_response is None
 
 
 def test_blocking_route_no_canned_for_reliable_analogy(monkeypatch):
@@ -377,7 +374,7 @@ def test_partial_hit_never_flagged_unreliable_even_if_lexically_unrelated(monkey
     assert ans.canned_response is None
 
 
-def test_gate_still_fires_on_vector_stage(monkeypatch):
+def test_vector_stage_analogy_produces_a_pick_not_canned(monkeypatch):
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
     monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [_rec("かご")])
@@ -385,8 +382,8 @@ def test_gate_still_fires_on_vector_stage(monkeypatch):
 
     ans = router._blocking_route("セグウェイはどう捨てますか")
     assert ans.item_match_stage == "vector"
-    assert ans.analogy_unreliable is True
-    assert ans.canned_response is not None
+    assert ans.analogy_unreliable is False
+    assert ans.canned_response is None
 
 
 def test_build_trace_record_shape():
@@ -532,15 +529,18 @@ def test_relation_strength_downgrades_content_prefix():
     assert S("ハンドミキサー", "ミキサー") == 2
 
 
-def test_electric_nose_trimmer_goes_to_canned(monkeypatch):
+def test_electric_nose_trimmer_gets_a_hedged_analogy(monkeypatch):
+    # 「電動鼻毛カッター」→ ベクトル最上位「電動歯ブラシ」を根拠に区分を出す。
+    # canned にはしない(類似品があるので確認だけ促すのは減点)。
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
     monkeypatch.setattr(
         router, "vector_search_items",
-        lambda q, top_k=3: [_rec("カッター(刃を含む)"), _rec("使い捨てカイロ")],
+        lambda q, top_k=3: [_rec("電動歯ブラシ"), _rec("カッター(刃を含む)"), _rec("マッサージ機")],
     )
     monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
     ans = router._blocking_route("電動鼻毛カッターはどう捨てればいいですか？")
     assert ans.item_match == "analogy"
-    assert ans.analogy_unreliable is True
-    assert ans.canned_response is not None
+    assert ans.analogy_unreliable is False
+    assert ans.canned_response is None
+    assert router._analogy_pick(ans.item_hits, ans.detected_item).item_name == "電動歯ブラシ"
