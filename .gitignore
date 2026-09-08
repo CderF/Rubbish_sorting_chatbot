@@ -26,6 +26,8 @@ server.log
 .cache/
 .triton/
 .nv/
+var/
+*.db
 .tilelang/
 
 # --- confidential material -------------------------------------------------
