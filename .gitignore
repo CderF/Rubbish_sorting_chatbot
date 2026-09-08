@@ -26,6 +26,8 @@ server.log
 .cache/
 .triton/
 .nv/
+var/
+*.db
 .tilelang/
 
 # --- confidential material -------------------------------------------------
@@ -35,13 +37,13 @@ server.log
 # "Strictly confidential for internal use only" by GMO; see README / team
 # decision on whether it should be purged from history.
 documents/課題.pdf
+# Renamed copy of the same confidential PDF; never tracked, keep it that way.
+documents/北九州ゴミ分類Chatbot課題.pdf
 
-# --- data artefacts (STAGE 02-04) ------------------------------------------
-# The structured DB is rebuilt from the crawler + knowledge/incoming/, so it is
-# generated output, not source. knowledge/incoming/ itself IS tracked: the
-# distributed お知らせ files are inputs and ingest must stay reproducible.
-/data/
-*.db
+# --- data artefacts (STAGE 02-04) ----------------------------------------
+# var/ + *.db (above) hold the crawler's SQLite DB and STAGE 04 ingest output —
+# generated from knowledge/incoming/ + the crawl, not source. knowledge/incoming/
+# itself IS tracked: the distributed お知らせ files are ingest inputs.
 *.sqlite
 *.sqlite3
 chroma/
