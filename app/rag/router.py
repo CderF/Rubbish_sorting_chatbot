@@ -618,7 +618,7 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         # 自然な問い方で 4-1/4-2 が固定拒否文を返してしまう(B1採点で数十ms
         # 応答=回帰の実測)。距離しか手がかりが無い vector ヒットに限定する。
         if ans.item_match == "analogy" and ans.item_match_stage == "vector":
-            pick = _analogy_pick(ans.item_hits)
+            pick = _analogy_pick(ans.item_hits, ans.detected_item)
             ans.analogy_unreliable = not _analogy_is_reliable(item_candidates, pick)
 
     if ward:
@@ -759,7 +759,9 @@ def _dedupe(urls: list[str]) -> list[str]:
     return out
 
 
-def _analogy_pick(hits: list[ItemRecord]) -> "ItemRecord | None":
+def _analogy_pick(
+    hits: list[ItemRecord], query: str | None = None
+) -> "ItemRecord | None":
     """4-3: 類似候補を「コード側で」1件に確定する。
 
     複数候補を LLM に渡すと小型モデルが各候補の出し方を混ぜて答えてしまう
@@ -768,19 +770,50 @@ def _analogy_pick(hits: list[ItemRecord]) -> "ItemRecord | None":
     渡す前に1件へ絞る。
 
     選定規則:
-    - ベクトル距離の最上位(`vector_search_items` は距離昇順)を基本とする。
-    - ただし 4-1 の追加告知(`knowledge://お知らせ-4-1…`)は disposal_method が
-      区分ではなくイベント回収の案内(「◯◯祭で無料回収」)であり、
-      「類似品から区分を類推する」4-3 の根拠には使えない。実際の早見表行
-      (非 `knowledge://`)があればそちらを優先し、無ければ最上位に戻す。
+    - 4-1/4-2 の追加告知(`knowledge://…`)は disposal_method が区分ではなく
+      イベント回収の案内(「◯◯祭で無料回収」)なので、真の類推の根拠には
+      使えない。非 `knowledge://` の早見表行があればその中から選ぶ。
+    - `query`(整形済みの品名)があれば、候補名が query を包含する/される
+      もの(「ミキサー」⊂「ハンドミキサー」、「時計」⊂「目覚まし時計」)を
+      最優先で選ぶ。距離順の先頭は「ハンドミキサー→ハンドクリーナー」の
+      ように主辞がずれた候補を掴むことがあるため(trace 実測)。
+    - それも無ければ距離最上位(先頭)に戻す。
     """
     if not hits:
         return None
-    # お知らせ由来行の source_url は knowledge://<file>#<anchor>(store.py)。
-    for h in hits:
-        if not getattr(h, "source_url", "").startswith("knowledge://"):
-            return h
-    return hits[0]
+    non_notice = [
+        h for h in hits
+        if not getattr(h, "source_url", "").startswith("knowledge://")
+    ]
+    pool = non_notice or list(hits)
+
+    if query:
+        q = _norm(query)
+
+        def relation_score(h: ItemRecord) -> int:
+            n = _norm(getattr(h, "item_name", ""))
+            if len(n) < 2:
+                return 0
+            if n in q:            # 「ミキサー」⊂「ハンドミキサー」
+                return 1000 + len(n)
+            if q in n:            # 「ドローン」⊃ 質問品
+                return 500 + len(q)
+            run = _shared_run_len(q, n)
+            if run < 2:
+                return 0
+            for i in range(len(q) - run + 1):
+                sub = q[i : i + run]
+                if sub in n and not _KANA_ONLY_RE.match(sub):
+                    # 共通部分が質問品の末尾(主辞)なら加点
+                    # (「電動爪切り」→「缶切り」を「電動芝刈り機」より優先)
+                    return run + (5 if q.endswith(sub) else 0)
+            return 0
+
+        ranked = sorted(pool, key=relation_score, reverse=True)
+        if relation_score(ranked[0]) > 0:
+            return ranked[0]
+
+    return pool[0]
 
 
 def _shared_run_len(a: str, b: str) -> int:
@@ -860,7 +893,7 @@ def _build_context(ans: RoutedAnswer) -> str:
             # 入れない(入れると小型モデルがコピーして断定してしまう)。名前
             # だけ参考として残し、断定しないことをプロンプト側で強制する。
             q = ans.detected_item or "この品名"
-            pick = _analogy_pick(ans.item_hits)
+            pick = _analogy_pick(ans.item_hits, ans.detected_item)
             near = pick.item_name if pick is not None else ""
             lines = [
                 f"## 早見表に「{q}」の個別記載なし ― 妥当な類似品目を特定できず",
@@ -874,7 +907,7 @@ def _build_context(ans: RoutedAnswer) -> str:
             # 類推は必ず1件に絞ってから渡す(_analogy_pick 参照)。item_hits
             # 自体は WebUI の根拠表示用に全件残す。
             q = ans.detected_item or "この品名"
-            pick = _analogy_pick(ans.item_hits)
+            pick = _analogy_pick(ans.item_hits, ans.detected_item)
             header = f"## 早見表に「{q}」の個別記載なし ― 類似する品目1件のみ"
             lines = [header]
             if pick is not None:
