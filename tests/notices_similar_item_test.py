@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import app.rag.router as router
 from app.rag.router import (
+    _analogy_pick,
     _build_context,
     _classify_item_match,
     _item_name_candidates,
@@ -36,6 +37,12 @@ def _rec(name: str):
         source_page_title="早見表",
         score=0.9,
     )
+
+
+def _rec_src(name: str, source_url: str):
+    r = _rec(name)
+    r.source_url = source_url
+    return r
 
 
 def _sched():
@@ -118,6 +125,42 @@ def test_search_item_returns_hits_and_stage(monkeypatch):
     assert _search_item("宇宙服") == ([], None)
 
 
+# --- code-side single candidate for 4-3 (採点フィードバック) -----------
+def test_analogy_pick_prefers_hayamihyo_row_over_4_1_event_notice():
+    # VRヘッドセット の実例: ヘッドホン(早見表) と VRゴーグル(4-1告知)が
+    # 候補に並ぶ。区分を持たないイベント告知ではなく早見表行を選ぶ。
+    hits = [
+        _rec_src("VRゴーグル", "knowledge://お知らせ-4-1.md#お知らせ-07-VRゴーグル回収"),
+        _rec_src("ヘッドホン", "https://www.city.kitakyushu.lg.jp/contents/y.html"),
+    ]
+    assert _analogy_pick(hits).item_name == "ヘッドホン"
+
+
+def test_analogy_pick_falls_back_to_top1_when_all_are_notices():
+    hits = [
+        _rec_src("VRゴーグル", "knowledge://お知らせ-4-1.md#お知らせ-07-VRゴーグル回収"),
+        _rec_src("ドローン", "knowledge://お知らせ-4-1.md#お知らせ-05-ドローン回収"),
+    ]
+    assert _analogy_pick(hits).item_name == "VRゴーグル"
+
+
+def test_analogy_context_contains_exactly_one_candidate():
+    # 複数候補があっても LLM に渡す context には1件だけ入れる(混用防止)。
+    ans = RoutedAnswer(
+        found=True,
+        item_match="analogy",
+        detected_item="VRヘッドセット",
+        item_hits=[
+            _rec_src("VRゴーグル", "knowledge://お知らせ-4-1.md#お知らせ-07-VRゴーグル回収"),
+            _rec_src("ヘッドホン", "https://www.city.kitakyushu.lg.jp/contents/y.html"),
+        ],
+    )
+    ctx = _build_context(ans)
+    assert "ヘッドホン" in ctx
+    assert "VRゴーグル" not in ctx  # 2件目は context に出さない
+    assert ctx.count("類似品目:") == 1
+
+
 # --- the caveat is scoped to the item section (blocker 2) ------------
 def test_analogy_relabels_only_the_item_section():
     ans = RoutedAnswer(
@@ -129,7 +172,7 @@ def test_analogy_relabels_only_the_item_section():
     )
     ctx = _build_context(ans)
     assert "早見表に「テレビ」の個別記載なし" in ctx
-    assert "類似候補1: テレビ台" in ctx
+    assert "類似品目: テレビ台" in ctx
     assert "## 分別早見表の検索結果" not in ctx
     # the collection-day section is untouched
     assert "## 収集日の検索結果" in ctx
@@ -149,8 +192,10 @@ def test_analogy_rule_only_for_analogy_and_names_the_real_item():
 
     prompt = build_system_prompt(RoutedAnswer(found=True, item_match="analogy"))
     assert "類似する" in prompt
-    assert "必ず1件だけ選ぶ" in prompt
-    assert "別候補の区分・条件を併記せず" in prompt
+    # 候補は _analogy_pick がコード側で1件に絞る。プロンプトは「その1件だけを
+    # 根拠に、勝手に足さない」ことを課す。
+    assert "1件だけ" in prompt
+    assert "新たに付け加えてはならない" in prompt
     assert "収集日など他の欄の情報はこの限りではない" in prompt  # don't blur the schedule
     assert "確認" in prompt
 
