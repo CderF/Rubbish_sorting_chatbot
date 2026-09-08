@@ -129,6 +129,30 @@ def rebuild_db(
         )
 
 
+def list_current_waste_items(conn: sqlite3.Connection) -> list[WasteItem]:
+    """All current waste_items rows. The narrow lookup_* functions in
+    app/data/lookup.py deliberately don't support "fetch everything" — this
+    exists for the vector RAG path's index build (issue #7), which needs the
+    full item set to embed, not a single lookup."""
+    rows = conn.execute("SELECT * FROM waste_items WHERE is_current = 1").fetchall()
+    return [
+        WasteItem(
+            id=r["id"],
+            item_name=r["item_name"],
+            item_name_raw=r["item_name_raw"],
+            disposal_method=r["disposal_method"],
+            notes=r["notes"],
+            source_url=r["source_url"],
+            source_page_title=r["source_page_title"],
+            crawled_at=r["crawled_at"],
+            is_current=bool(r["is_current"]),
+            effective_from=r["effective_from"],
+            superseded_by=r["superseded_by"],
+        )
+        for r in rows
+    ]
+
+
 def list_sources(conn: sqlite3.Connection) -> list[dict]:
     """Distinct crawled source pages, most recent first — feeds the WebUI's
     ingested-file listing (STAGE02 2-3)."""

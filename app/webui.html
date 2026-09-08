@@ -29,7 +29,7 @@
   header h1{margin:0;font-size:16px;font-weight:650}
   .badge{font-size:11px;padding:3px 9px;border-radius:11px;
          background:var(--accent-soft);color:var(--accent);font-weight:600}
-  .status{margin-left:auto;font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+  .status{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
   .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
   .dot.up{background:var(--ok)} .dot.down{background:var(--err)}
 
@@ -97,8 +97,50 @@
   tr:last-child td{border-bottom:none}
   .sid{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--muted);
        word-break:break-all;margin-bottom:9px}
+  .warn-chip{display:block;margin-top:8px;padding:7px 9px;border-radius:7px;font-size:11.5px;
+             line-height:1.5;background:rgba(184,134,11,.14);color:var(--warn);
+             border:1px solid rgba(184,134,11,.35)}
+
+  /* ---- knowledge browser (STAGE02 2-3) ---- */
+  .kbtn{border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:8px;
+        padding:5px 11px;font-size:12px;cursor:pointer;font-family:inherit}
+  .kbtn:hover{border-color:var(--accent);color:var(--accent)}
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;
+           align-items:center;justify-content:center;padding:24px;z-index:50}
+  .overlay.open{display:flex}
+  .kmodal{background:var(--panel);border:1px solid var(--border);border-radius:14px;
+          width:min(1100px,100%);height:min(740px,100%);display:flex;flex-direction:column;
+          overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.28)}
+  .khead{display:flex;align-items:center;gap:12px;padding:14px 18px;
+         border-bottom:1px solid var(--border);flex-shrink:0}
+  .khead h2{margin:0;font-size:15px;font-weight:650}
+  .khead .sub{font-size:12px;color:var(--muted)}
+  .khead .close{margin-left:auto;border:none;background:none;color:var(--muted);
+                font-size:22px;line-height:1;cursor:pointer;padding:0 4px}
+  .khead .close:hover{color:var(--text)}
+  .kbody{flex:1;display:flex;min-height:0}
+  .klist{width:330px;border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;padding:8px}
+  .kitem{padding:9px 11px;border-radius:8px;cursor:pointer;margin-bottom:3px}
+  .kitem:hover{background:var(--bg)}
+  .kitem.sel{background:var(--accent-soft)}
+  .kitem .t{font-size:13px;font-weight:600;margin-bottom:3px;word-break:break-all}
+  .kitem.sel .t{color:var(--accent)}
+  .kitem .m{font-size:11px;color:var(--muted)}
+  .kdetail{flex:1;overflow:auto;padding:16px 18px;min-width:0}
+  .kdetail .url{font-size:12px;margin-bottom:12px;word-break:break-all}
+  .kdetail .url a{color:var(--accent)}
+  .ktable{width:100%;border-collapse:collapse;font-size:12.5px}
+  .ktable th{position:sticky;top:0;background:var(--panel);text-align:left;font-weight:650;
+             padding:7px 9px;border-bottom:2px solid var(--border);white-space:nowrap}
+  .ktable td{padding:7px 9px;border-bottom:1px solid var(--border);vertical-align:top;
+             text-align:left;font-weight:400}
+  .ktable tr:hover td{background:var(--bg)}
+  .kempty{color:var(--muted);font-size:13px;line-height:1.9;padding:26px 4px}
+  .kempty code{background:rgba(127,127,127,.18);padding:1px 5px;border-radius:4px}
+
   @media (max-width:860px){
     aside{display:none}
+    .klist{width:150px}
   }
 </style>
 </head>
@@ -107,6 +149,7 @@
 <header>
   <h1>北九州市 ごみ分別チャットボット</h1>
   <span class="badge" id="modelBadge">Qwen3-VL-8B-Instruct</span>
+  <button class="kbtn" id="knowledgeBtn" style="margin-left:auto">ナレッジ一覧</button>
   <div class="status"><span class="dot" id="dot"></span><span id="statusText">接続確認中…</span></div>
 </header>
 
@@ -159,6 +202,20 @@
     </div>
 
     <div class="card">
+      <h2>直近の検索(RAG)</h2>
+      <table>
+        <tr><td>抽出した品名</td><td id="rItem">–</td></tr>
+        <tr><td>抽出した地区</td><td id="rArea">–</td></tr>
+        <tr><td>早見表ヒット</td><td id="rItemHits">–</td></tr>
+        <tr><td>収集日ヒット</td><td id="rSchedHits">–</td></tr>
+        <tr><td>引用URL数</td><td id="rSources">–</td></tr>
+      </table>
+      <div class="warn-chip" id="stubWarn" style="display:none">
+        データ層が未接続のため、ダミーデータで動作しています。
+      </div>
+    </div>
+
+    <div class="card">
       <h2>セッション</h2>
       <div class="sid" id="sidText">–</div>
       <button class="act" id="newSession" style="width:100%">新しい会話</button>
@@ -175,6 +232,22 @@
     </div>
   </aside>
 </main>
+
+<div class="overlay" id="kOverlay">
+  <div class="kmodal">
+    <div class="khead">
+      <h2>ナレッジ一覧</h2>
+      <span class="sub" id="kSummary">読み込み中…</span>
+      <button class="close" id="kClose" title="閉じる">&times;</button>
+    </div>
+    <div class="kbody">
+      <div class="klist" id="kList"></div>
+      <div class="kdetail" id="kDetail">
+        <div class="kempty">左の一覧からページを選ぶと、取り込んだ内容を表示します。</div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -213,6 +286,19 @@ function renderMarkdown(src){
   h = h.replace(/(<li>[\s\S]*?<\/li>)(?!\s*<li>)/g, '<ul>$1</ul>');
   h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
                 '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  // 引用URLは素のURLのまま流れてくる(採点側が読む本文にmarkdown記法を混ぜない
+  // ため)ので、ここでリンク化する。既存のリンクとコードブロックはいったん
+  // 退避しておき、その中のURLを二重に囲まないようにする。
+  const keep = [];
+  h = h.replace(/<a [^>]*>[\s\S]*?<\/a>|<(?:pre|code)>[\s\S]*?<\/(?:pre|code)>/g,
+                m => { keep.push(m); return `\u0000${keep.length - 1}\u0000`; });
+  h = h.replace(/https?:\/\/[^\s<)]+/g,
+                m => `<a href="${m}" target="_blank" rel="noopener noreferrer">${m}</a>`);
+  h = h.replace(/\u0000(\d+)\u0000/g, (m, i) => keep[+i]);
+  // .bubble は white-space:pre-wrap なので、ブロック要素の前後に残った改行が
+  // そのまま空行として描画されてしまう。タグに隣接する改行だけを畳む。
+  h = h.replace(/\n+(?=<(?:ul|ol|li|h3|h4|hr|pre)\b)/g, '');
+  h = h.replace(/(<\/(?:ul|ol|li|h3|h4|pre)>|<hr>)\n+/g, '$1');
   return h;
 }
 
@@ -345,6 +431,88 @@ document.addEventListener('click', e => {
   }
 });
 
+/* ---------- knowledge browser (STAGE02 2-3) ----------
+   「検索対象の外部データファイル一覧と内容をWebUIで確認できる」要件。
+   取り込み元はクロールしたページなので、表示は必ずエスケープして通す。 */
+let kSelected = null;
+
+function openKnowledge(){
+  $('kOverlay').classList.add('open');
+  loadSources();
+}
+function closeKnowledge(){
+  $('kOverlay').classList.remove('open');
+}
+
+async function loadSources(){
+  $('kList').innerHTML = '';
+  $('kSummary').textContent = '読み込み中…';
+  try{
+    const res = await fetch('/knowledge');
+    if (res.status === 401){ location.href = '/login'; return; }
+    const d = await res.json();
+
+    if (!d.available || !d.sources.length){
+      $('kSummary').textContent = '0 ページ';
+      $('kDetail').innerHTML =
+        '<div class="kempty">まだナレッジが取り込まれていません。<br>'
+        + 'データ層のクローラが構造化DBを作成すると、ここに一覧が表示されます。<br><br>'
+        + '参照中のDB: <code>' + escapeHtml(d.db_path || '-') + '</code></div>';
+      return;
+    }
+
+    $('kSummary').textContent =
+      d.sources.length + ' ページ / ' + d.total_records.toLocaleString() + ' 件';
+
+    for (const s of d.sources){
+      const el = document.createElement('div');
+      el.className = 'kitem';
+      el.dataset.id = s.id;
+      el.innerHTML =
+        '<div class="t">' + escapeHtml(s.title) + '</div>'
+        + '<div class="m">' + escapeHtml(s.kind_label) + ' · '
+        + s.record_count.toLocaleString() + ' 件'
+        + (s.crawled_at ? ' · ' + escapeHtml(s.crawled_at.slice(0, 10)) : '')
+        + '</div>';
+      el.onclick = () => showSource(s.id);
+      $('kList').appendChild(el);
+    }
+  }catch(e){
+    $('kSummary').textContent = '取得に失敗しました';
+    $('kDetail').innerHTML = '<div class="kempty">' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+async function showSource(id){
+  kSelected = id;
+  for (const el of $('kList').children){
+    el.classList.toggle('sel', el.dataset.id === id);
+  }
+  $('kDetail').innerHTML = '<div class="kempty">読み込み中…</div>';
+  try{
+    const d = await (await fetch('/knowledge/' + encodeURIComponent(id))).json();
+    const head = '<tr>' + d.headers.map(h => '<th>' + escapeHtml(h) + '</th>').join('') + '</tr>';
+    const body = d.rows.map(r =>
+      '<tr>' + r.map(c => '<td>' + escapeHtml(c == null ? '' : String(c)) + '</td>').join('') + '</tr>'
+    ).join('');
+    $('kDetail').innerHTML =
+      '<div class="url">' + escapeHtml(d.kind_label) + ' — <a href="' + escapeHtml(d.url)
+      + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(d.url) + '</a></div>'
+      + '<table class="ktable">' + head + body + '</table>'
+      + (d.truncated ? '<div class="kempty">※ 表示は先頭' + d.rows.length + '件までです。</div>' : '');
+  }catch(e){
+    $('kDetail').innerHTML = '<div class="kempty">読み込みに失敗しました: '
+      + escapeHtml(e.message) + '</div>';
+  }
+}
+
+$('knowledgeBtn').onclick = openKnowledge;
+$('kClose').onclick = closeKnowledge;
+$('kOverlay').onclick = e => { if (e.target === $('kOverlay')) closeKnowledge(); };
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeKnowledge();
+});
+
 /* ---------- live stats ---------- */
 async function refreshStats(){
   try{
@@ -365,6 +533,13 @@ async function refreshStats(){
     $('tps').textContent    = (t.tokens && t.total_s)
       ? (t.tokens / t.total_s).toFixed(1) + ' tok/s' : '–';
 
+    const r = t.retrieval;
+    $('rItem').textContent      = r && r.item ? r.item : '–';
+    $('rArea').textContent      = r && r.ward ? (r.ward + (r.town || '')) : '–';
+    $('rItemHits').textContent  = r ? r.item_hits : '–';
+    $('rSchedHits').textContent = r ? r.schedule_hits : '–';
+    $('rSources').textContent   = r ? r.sources.length : '–';
+
     $('dot').className = 'dot up';
     $('statusText').textContent = '稼働中';
   }catch(e){
@@ -384,7 +559,15 @@ async function loadInfo(){
   }catch(e){ /* leave placeholders */ }
 }
 
+async function checkStubs(){
+  try{
+    const d = await (await fetch('/knowledge')).json();
+    $('stubWarn').style.display = d.using_stubs ? 'block' : 'none';
+  }catch(e){ /* 判定できないときは黙って隠したままにする */ }
+}
+
 loadInfo();
+checkStubs();
 refreshStats();
 setInterval(refreshStats, 1000);
 $('input').focus();

@@ -29,5 +29,12 @@ ninja==1.13.2
 requests==2.34.2
 beautifulsoup4==4.15.0
 
+# STAGE02/03 ベクトルRAGパス (app/rag/vector_store.py, issue #7)
+# sentence-transformers pulls its own torch/transformers; on the L4 server
+# vllm already brings a pinned torch build, so watch for a version conflict
+# at `pip install` time and pin torch explicitly to vllm's version if needed.
+chromadb==1.5.9
+sentence-transformers==6.0.1
+
 # tests only (tests/*_test.py run offline, no GPU needed)
 pytest==9.1.1

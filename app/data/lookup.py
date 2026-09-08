@@ -15,21 +15,28 @@ don't hold a sqlite3.Connection themselves.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import unicodedata
 
 from app.data import db
 from app.data.schema import CollectionSchedule, WasteItem
 
-_conn: sqlite3.Connection | None = None
+# sqlite3.Connection objects can't cross threads (check_same_thread=True by
+# default), and the grader/server calls these functions from a threadpool
+# (FastAPI's asyncio.to_thread) with up to 4 concurrent requests. One
+# connection per thread, lazily created, avoids both the cross-thread error
+# and the lock contention a single shared connection would need.
+_local = threading.local()
 
 
 def _get_connection() -> sqlite3.Connection:
-    global _conn
-    if _conn is None:
-        _conn = db.connect()
-        db.init_db(_conn)
-        _conn.execute("PRAGMA query_only = ON")
-    return _conn
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        conn = db.connect()
+        db.init_db(conn)
+        conn.execute("PRAGMA query_only = ON")
+        _local.conn = conn
+    return conn
 
 
 def _normalize(text: str) -> str:
