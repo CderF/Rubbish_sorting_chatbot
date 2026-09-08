@@ -14,10 +14,10 @@ crawl: ## re-crawl the city site into var/kitakyushu_waste.db (slow, hits the si
 	$(PYTHON) -m app.data.db
 
 ingest: ## ingest the distributed お知らせ files into waste_items
-	@test -n "$(NOTICES)" && $(PYTHON) -m app.stage04.ingest $(NOTICES) || echo "no knowledge/incoming/*.md"
+	@test -n "$(NOTICES)" && $(PYTHON) -m app.notices.ingest $(NOTICES) || echo "no knowledge/incoming/*.md"
 
 relink: ## link change-notices to 早見表 rows that now exist
-	$(PYTHON) -m app.stage04.ingest --relink
+	$(PYTHON) -m app.notices.ingest --relink
 
 index: ## rebuild the Chroma vector index from the current waste_items rows
 	$(PYTHON) -m app.rag.vector_store

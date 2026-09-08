@@ -16,11 +16,11 @@ The answer-text evaluation (本田さん) is built on top of this, not here.
 
 Run standalone for a grader-style table::
 
-    python -m tests.stage04_eval
+    python -m tests.notices_eval
 
 or as a test::
 
-    pytest tests/stage04_eval_test.py
+    pytest tests/notices_eval_test.py
 """
 
 from __future__ import annotations
@@ -33,11 +33,11 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from app.data.schema import WasteItem
-from app.stage04 import store
-from app.stage04.ingest import IngestResult, ingest_notice_file, relink
+from app.notices import store
+from app.notices.ingest import IngestResult, ingest_notice_file, relink
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CASES_PATH = Path(__file__).resolve().parent / "fixtures" / "stage04_eval_cases.json"
+CASES_PATH = Path(__file__).resolve().parent / "fixtures" / "notices_eval_cases.json"
 SEED_URL = "fixture://test-only"
 SEED_CRAWLED_AT = datetime(2026, 9, 1, tzinfo=timezone.utc)
 INGEST_AT = datetime(2026, 9, 8, 3, 0, 0, tzinfo=timezone.utc)

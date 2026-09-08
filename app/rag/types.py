@@ -72,6 +72,14 @@ class RoutedAnswer:
     """STAGE04 4-2: この品目は将来出し方が変わる。旧・新・切替日を時系列で
     案内させ、どちらか一方だけで断定させない。"""
 
+    item_match: str = "none"
+    """品名検索の結果が、質問された品名そのものか否か:
+      "exact"   — 返ってきた早見表行の item_name が質問の品名と一致
+      "analogy" — ヒットはあるが、いずれも別の(多くはより具体的な)品目
+      "none"    — ヒットなし
+    どの段(exact/partial/vector)でヒットしたかではなく、名前が一致したかで
+    判定する(PR #14 レビュー)。"analogy" のとき要件4-3 の断り書きを出す。"""
+
     missing: list[str] = field(default_factory=list)
     """回答に不足している入力項目(例: ["町名"])。
 
@@ -87,3 +95,17 @@ class RoutedAnswer:
 
     detected_ward: str | None = None
     detected_town: str | None = None
+
+    item_match_stage: str | None = None
+    """`item_hits` がどの検索段で得られたか。
+
+    早見表パスは 完全一致 -> 部分一致 -> ベクトル類似度 の3段フォールバック
+    (設計提案書 3-3)。どの段まで落ちたかで結果の確からしさが変わる:
+    完全一致は質問された品目そのもの、ベクトル類似度は「意味が近い別の品目」
+    が混ざりうる。WebUIの根拠表示でこれを区別するために保持する。
+
+    値は "exact" / "partial" / "vector" のいずれか。ヒット0件なら None。
+    """
+
+    item_from_image: bool = False
+    """`detected_item` が画像分類パス由来かどうか(STAGE03 3-2)。"""

@@ -19,7 +19,7 @@ for c in ../venv/bin/python .venv/bin/python; do
 done
 
 echo "[refresh] crawl"        ; "$PYTHON" -m app.data.db
-echo "[refresh] ingest"       ; "$PYTHON" -m app.stage04.ingest knowledge/incoming/*.md
-echo "[refresh] relink"       ; "$PYTHON" -m app.stage04.ingest --relink
+echo "[refresh] ingest"       ; "$PYTHON" -m app.notices.ingest knowledge/incoming/*.md
+echo "[refresh] relink"       ; "$PYTHON" -m app.notices.ingest --relink
 echo "[refresh] vector index" ; "$PYTHON" -m app.rag.vector_store
 echo "[refresh] done"

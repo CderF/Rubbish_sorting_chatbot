@@ -64,10 +64,10 @@ def using_stubs() -> bool:
 
 
 # --- STAGE04 (要件4-2: 出し方の変更) の解決 -------------------------------
-# app/stage04/lookup.py は PR #5。未マージ環境でも router.py が import できる
+# app/notices/lookup.py は PR #5。未マージ環境でも router.py が import できる
 # よう、無い場合は「変更なし」を返すフォールバックに留める。
 try:
-    from app.stage04.lookup import pending_change  # type: ignore[import-not-found]
+    from app.notices.lookup import pending_change  # type: ignore[import-not-found]
 except ImportError:
     def pending_change(item_name: str, as_of):  # noqa: ARG001
         return None
@@ -209,20 +209,37 @@ def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str
 
 
 # --- 検索 ------------------------------------------------------------------
-def _search_item(item_name: str) -> list[ItemRecord]:
+def _search_item(item_name: str) -> tuple[list[ItemRecord], str | None]:
     """完全一致 → 部分一致 → ベクトル類似度 の順にフォールバックする(早見表パス)。
 
     ベクトル類似度は前2段がどちらも0件のときだけ発火する(issue #7)。
-    `vector_search_items` はChroma未構築でも例外を投げず空リストを返すので、
-    ここでの呼び出しに追加のガードは要らない。
+    `vector_search_items` はChroma未構築・関連ヒットなしのいずれも空リストを返す。
+
+    戻り値は (ヒット, どの段で当たったか)。段(`item_match_stage`)は WebUI の
+    根拠表示用。回答ロジックが使う「質問の品名そのものか、似た別品目か」の
+    判定は別で、呼び出し側の `_classify_item_match`(名前一致ベース)で行う。
     """
     exact = lookup_item_exact(item_name)
     if exact:
-        return [exact]
+        return [exact], "exact"
     partial = lookup_item_partial(item_name)[:5]
     if partial:
-        return partial
-    return vector_search_items(item_name, top_k=3)
+        return partial, "partial"
+    vector = vector_search_items(item_name, top_k=3)
+    return vector, ("vector" if vector else None)
+
+
+def _classify_item_match(item_name: str, hits: list[ItemRecord]) -> str:
+    """"exact" / "analogy" / "none"。どの段でヒットしたかではなく、返ってきた
+    行の名前が質問の品名と実際に一致しているかで決める(PR #14 レビュー)。
+    partial(`LIKE '%クエリ%'`)は「テレビ」→「テレビ台」のように別品目を返す
+    ので analogy 側になる。"""
+    if not hits:
+        return "none"
+    q = _norm(item_name)
+    if any(_norm(getattr(h, "item_name", "")) == q for h in hits):
+        return "exact"
+    return "analogy"
 
 
 def _apply_timeline(ans: RoutedAnswer, item_name: str, today: "date | None" = None) -> None:
@@ -274,9 +291,11 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
 
     item_name = image_item_name or extract_item_name(prompt, strip_waste_words=wants_schedule)
     ans.detected_item = item_name
+    ans.item_from_image = bool(image_item_name)
 
     if item_name:
-        ans.item_hits = _search_item(item_name)
+        ans.item_hits, ans.item_match_stage = _search_item(item_name)
+        ans.item_match = _classify_item_match(item_name, ans.item_hits)
 
     if ward:
         # ごみ種別が明示されていれば絞り込むが、0件なら種別なしで引き直す。
@@ -366,7 +385,12 @@ def _build_context(ans: RoutedAnswer) -> str:
     blocks: list[str] = []
 
     if ans.item_hits:
-        lines = ["## 分別早見表の検索結果"]
+        if ans.item_match == "analogy":
+            q = ans.detected_item or "この品名"
+            header = f"## 早見表に「{q}」の個別記載なし ― 類似する品目の情報"
+        else:
+            header = "## 分別早見表の検索結果"
+        lines = [header]
         for r in ans.item_hits:
             lines.append(f"- 品名: {r.item_name}")
             lines.append(f"  出し方: {r.disposal_method}")
@@ -434,6 +458,15 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
             "どちらか一方だけを答えて断定しない。\n"
         )
 
+    if ans.item_match == "analogy":
+        parts.append(
+            "- 『類似する品目の情報』欄の品目は、質問された品名そのものではなく"
+            "早見表にある別の品目である。その欄に書かれている実際の品目名を挙げて"
+            "「類似する『(その品目名)』に準じると〜」の形で案内し、断定しない。"
+            "個別の記載がないため、正確な分別は北九州市の公式ページや窓口で"
+            "確認するよう必ず添える。収集日など他の欄の情報はこの限りではない。\n"
+        )
+
     if ans.missing:
         parts.append(
             f"- 収集日を答えるには{'・'.join(ans.missing)}が必要である。"
@@ -444,6 +477,67 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
         parts.append("\n# 検索結果\n" + ans.context + "\n")
 
     return "".join(parts)
+
+
+# --- WebUI 向けの根拠データ ------------------------------------------------
+MATCH_STAGE_LABELS = {
+    "exact": "完全一致",
+    "partial": "部分一致",
+    "vector": "類似検索",
+}
+
+
+def _attr(rec, name: str, default=None):
+    """レコードは Pydanticモデル(データ層)・dataclass(スタブ)・ベクトル検索の
+    戻り値と実装がまちまちなので、無い属性は既定値で埋める。"""
+    value = getattr(rec, name, default)
+    return default if value is None else value
+
+
+def describe_sources(ans: RoutedAnswer) -> dict:
+    """回答の根拠を WebUI に渡せる形へ変換する(STAGE02 2-2)。
+
+    本文末尾の引用URLだけでは「どのレコードを見て、どの経路で見つけたのか」が
+    分からない。検索段(完全一致/部分一致/類似検索)と実際に取得した行をそのまま
+    返し、利用者が回答を検証できるようにする。
+
+    この結果は `/ui/chat` だけに流す。採点用の `/chat` は仕様上 `delta` のSSEしか
+    想定されていないため、そちらのストリームには一切足さない。
+    """
+    return {
+        "detected": {
+            "item": ans.detected_item,
+            "ward": ans.detected_ward,
+            "town": ans.detected_town,
+            "from_image": ans.item_from_image,
+        },
+        "match_stage": ans.item_match_stage,
+        "match_stage_label": MATCH_STAGE_LABELS.get(ans.item_match_stage or ""),
+        "found": ans.found,
+        "missing": ans.missing,
+        "items": [
+            {
+                "item_name": _attr(r, "item_name", ""),
+                "item_name_raw": _attr(r, "item_name_raw", ""),
+                "disposal_method": _attr(r, "disposal_method", ""),
+                "notes": _attr(r, "notes", ""),
+                "source_url": _attr(r, "source_url", ""),
+                "source_page_title": _attr(r, "source_page_title", ""),
+            }
+            for r in ans.item_hits
+        ],
+        "schedules": [
+            {
+                "ward": _attr(r, "ward", ""),
+                "town": _attr(r, "town", ""),
+                "waste_type": _attr(r, "waste_type", ""),
+                "weekday": _attr(r, "weekday", ""),
+                "source_url": _attr(r, "source_url", ""),
+            }
+            for r in ans.schedule_hits
+        ],
+        "urls": ans.sources,
+    }
 
 
 def format_citations(ans: RoutedAnswer) -> str:
