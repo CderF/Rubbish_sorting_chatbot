@@ -90,6 +90,11 @@ class _VectorItemMatch:
     disposal_method: str
     notes: str
     source_url: str
+    distance: float | None = None
+    """Chroma のコサイン距離(0が完全一致)。4-3の類似候補の確度を呼び出し側
+    (router の類推ゲート・探針ログ)で参照できるよう保持する。早見表の完全一致・
+    部分一致で得た行(WasteItem)は距離を持たないので、参照側は getattr で
+    None 許容にする。"""
 
 
 # --------------------------------------------------------------------------
@@ -331,6 +336,20 @@ def _filter_by_distance(
     ]
 
 
+def _pairs_within_distance(
+    metadatas: list, distances: list, max_distance: float
+) -> "list[tuple[dict, float | None]]":
+    """`_filter_by_distance` と同じ足切りだが、距離を捨てずに (meta, distance) の
+    組で返す。距離が取れないときは距離 None のまま全件通す(従来動作を維持)。"""
+    if not distances or len(distances) != len(metadatas):
+        return [(m, None) for m in metadatas]
+    return [
+        (m, d)
+        for m, d in zip(metadatas, distances)
+        if d is not None and d <= max_distance
+    ]
+
+
 def _search_items_impl(
     query: str, top_k: int, client: chromadb.ClientAPI | None
 ) -> list[ItemRecord]:
@@ -347,15 +366,16 @@ def _search_items_impl(
     )
     metadatas = (result.get("metadatas") or [[]])[0]
     distances = (result.get("distances") or [[]])[0]
-    metadatas = _filter_by_distance(metadatas, distances, _ITEM_MATCH_MAX_DISTANCE)
+    pairs = _pairs_within_distance(metadatas, distances, _ITEM_MATCH_MAX_DISTANCE)
     return [
         _VectorItemMatch(
             item_name=m["item_name"],
             disposal_method=m["disposal_method"],
             notes=m["notes"],
             source_url=m["source_url"],
+            distance=d,
         )
-        for m in metadatas
+        for m, d in pairs
     ]
 
 

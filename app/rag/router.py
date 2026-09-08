@@ -534,6 +534,14 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
             item_name, item_candidates[1:], vector_query
         )
         ans.item_match = _classify_item_match(item_candidates, ans.item_hits)
+        # 4-3 確度ゲート: 類推(analogy)に落ちたら、コード側で1件に絞った候補が
+        # 質問品と語彙的に関連するかを確かめる。関連しなければ(セグウェイ→かご等)
+        # 距離が近くても根拠にせず、断定を避ける経路に載せる。timeline が後で
+        # item_match を exact に上書きする品目(カイロ等)はここでは analogy でも
+        # 語彙的に関連するので誤ってフラグは立たない。
+        if ans.item_match == "analogy":
+            pick = _analogy_pick(ans.item_hits)
+            ans.analogy_unreliable = not _analogy_is_reliable(item_candidates, pick)
 
     if ward:
         # 早見表がヒットしていれば、その出し方(disposal_method)を収集日検索の
@@ -691,12 +699,94 @@ def _analogy_pick(hits: list[ItemRecord]) -> "ItemRecord | None":
     return hits[0]
 
 
+def _shared_run_len(a: str, b: str) -> int:
+    """2文字列の最長共通連続部分列の長さ(素朴なDP)。品名は短いので十分速い。"""
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best = cur[j]
+        prev = cur
+    return best
+
+
+# ひらがな1〜2文字の助詞・送り仮名だけの一致を「関連」と誤認しないため、
+# 共通連続部分列は「かな以外(漢字・カタカナ・英数)を1文字以上含む2文字以上」
+# のときだけ手がかりとして採る。
+_KANA_ONLY_RE = re.compile(r"^[ぁ-ん]+$")
+
+
+def _lexically_related(query: str, cand: str) -> bool:
+    """質問品 `query` と類似候補 `cand` が語彙的に関連するか。
+
+    弱いベクトル(item_nameのみ埋め込み)では セグウェイ→かご のような無関係な
+    誤ヒットも距離が近く、距離しきい値では良否を分離できない。一方、採点が
+    通す類推(電動スケートボード→スケートボード、電気毛布→毛布、VRヘッド
+    セット→ヘッドホン)はいずれも質問品と候補が文字列上つながっている。
+    そこで「一方が他方を部分文字列として含む」または「かな以外を含む2文字
+    以上の連続一致がある」ことを、類推を信頼してよい条件とする。
+
+    ここで False を返しても誤りにはならない(4-3の採点は根拠の薄い断定を
+    減点するのであって、確認を促す回答は安全側)。逆に文字の重なりが無い
+    純粋な意味推測(例: 電子レンジ→オーブン)は確度不足として弾く。
+    """
+    q = _norm(query)
+    c = _norm(cand)
+    if not q or not c:
+        return False
+    if q in c or c in q:
+        return True
+    run = _shared_run_len(q, c)
+    if run < 2:
+        return False
+    # 共通部分列がかなだけ(「して」「から」等)なら手がかりにしない。
+    # run>=2 の共通部分を実際に取り出して判定する。
+    for i in range(len(q) - run + 1):
+        sub = q[i : i + run]
+        if sub in c and not _KANA_ONLY_RE.match(sub):
+            return True
+    return False
+
+
+def _analogy_is_reliable(candidates: "list[str]", pick: "ItemRecord | None") -> bool:
+    """絞り込んだ類似候補 `pick` を、質問の品名候補いずれかと語彙照合して確度判定。
+
+    どれか1つの候補と関連づけばよい(「電動スケートボード」原文でも
+    「スケートボード」でも スケートボード にかかる)。"""
+    if pick is None:
+        return False
+    name = getattr(pick, "item_name", "")
+    return any(_lexically_related(cand, name) for cand in candidates if cand)
+
+
 def _build_context(ans: RoutedAnswer) -> str:
     """検索結果をLLMに渡す平文に整形する。"""
     blocks: list[str] = []
 
     if ans.item_hits:
-        if ans.item_match == "analogy":
+        if ans.item_match == "analogy" and ans.analogy_unreliable:
+            # 4-3 確度ゲートで弾いた: 意味の近い候補はあるが質問品と語彙的に
+            # つながらず、区分の根拠にできない。候補の「出し方」は context に
+            # 入れない(入れると小型モデルがコピーして断定してしまう)。名前
+            # だけ参考として残し、断定しないことをプロンプト側で強制する。
+            q = ans.detected_item or "この品名"
+            pick = _analogy_pick(ans.item_hits)
+            near = pick.item_name if pick is not None else ""
+            lines = [
+                f"## 早見表に「{q}」の個別記載なし ― 妥当な類似品目を特定できず",
+                "- 意味が近い可能性のある品目はあるが、質問品と用途・種類が"
+                "一致する確証がなく、分別区分の根拠にはできない。",
+            ]
+            if near:
+                lines.append(f"  (参考までに挙がった候補: {near} ― ただし根拠にしない)")
+            blocks.append("\n".join(lines))
+        elif ans.item_match == "analogy":
             # 類推は必ず1件に絞ってから渡す(_analogy_pick 参照)。item_hits
             # 自体は WebUI の根拠表示用に全件残す。
             q = ans.detected_item or "この品名"
@@ -825,6 +915,17 @@ _RULES_NO_CONTEXT = (
     "北九州市の公式ページや窓口での確認を案内する。\n"
 )
 
+# 4-3 確度ゲート(_analogy_is_reliable)で弾いたとき用。意味の近い候補は
+# あるが質問品と語彙的に関連づかず、区分の根拠にできないケース。類推で
+# 断定させず、確認を促す(採点フィードバック: 根拠の薄い類推での断定を減点)。
+_RULES_ANALOGY_UNRELIABLE = (
+    "- 早見表に個別の記載がなく、意味の近い品目も質問品と種類が一致する確証が"
+    "ないため、類似品からの類推で分別区分を断定してはならない。\n"
+    "- 参考候補の『出し方』をそのまま当てはめてはならない。"
+    "「類似する品目についても十分に根拠を確認できないため、分別を断定できません。"
+    "北九州市の窓口に確認してください。」の趣旨を必ず伝える。\n"
+)
+
 _CONDITION_HINT_RE = re.compile(r"センチ|cm|以上|未満|だけでできており|kg|キロ")
 
 
@@ -846,7 +947,10 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
     """
     parts = [_BASE_RULES]
 
-    if ans.found and ans.item_match != "analogy":
+    if ans.found and ans.item_match == "analogy" and ans.analogy_unreliable:
+        # 4-3 確度ゲートで弾いた候補。類推で断定させず、確認を促す。
+        parts.append(_RULES_ANALOGY_UNRELIABLE)
+    elif ans.found and ans.item_match != "analogy":
         parts.append(_RULES_WITH_CONTEXT)
     elif ans.found:
         # 類似候補はコード側(_analogy_pick)で既に1件へ絞ってある。ここでは
@@ -867,7 +971,7 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
             "日付を月だけに丸めること、どちらか一方だけを答えることは禁止。\n"
         )
 
-    if ans.item_match == "analogy":
+    if ans.item_match == "analogy" and not ans.analogy_unreliable:
         parts.append(
             "- 『検索結果』の類似品目は質問された品名そのものではない。その実際の"
             "品目名を挙げて「類似する『(その品目名)』に準じると〜」の形で案内し、"
