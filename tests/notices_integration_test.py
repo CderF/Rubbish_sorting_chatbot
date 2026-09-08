@@ -141,16 +141,20 @@ def test_router_surfaces_both_rules_for_a_pending_change(db):
     ans = _blocking_route("スプレー缶はどう捨てますか")
 
     assert ans.timeline_change is True
-    assert "変更前・現在(〜2026-09-30): 燃えないごみ" in ans.context  # 旧ルール
-    assert "切替日(省略・月単位への丸め禁止): 2026-10-01" in ans.context
-    assert "変更後(2026-10-01から):" in ans.context              # 新ルール
+    assert "現在（2026-09-30まで）: 燃えないごみ" in ans.context   # 旧ルール
+    assert "変更日: 2026-10-01" in ans.context
+    assert "変更後（2026-10-01から）:" in ans.context            # 新ルール
     assert "かん・びん" in ans.context                           # 新ルール本文
-    assert "家庭ごみ" in ans.context                             # disputed: 早見表側も注記
+    # disputed(早見表との不一致)は回答根拠に出さない — 過剰な注記になる
+    assert "早見表には" not in ans.context
     assert "## 分別早見表の検索結果" not in ans.context           # 日付なしの未来行を除外
-    assert "knowledge://お知らせ-4-2.md#お知らせ-01-スプレー缶" in ans.sources
+    # 4-2 の参照はお知らせ anchor のみ(曖昧一致で拾う早見表URLは混ぜない)
+    assert ans.sources == ["knowledge://お知らせ-4-2.md#お知らせ-01-スプレー缶"]
     prompt = build_system_prompt(ans)
-    assert "日付を月だけに丸めること" in prompt
-    assert "どちらか一方だけを答えることは禁止" in prompt
+    assert "月に丸めない" in prompt
+    assert "現在の規則と変更後の規則を両方" in prompt
+    # _RULES_WITH_CONTEXT のメタ注記誘発ルールは timeline には当てない
+    assert "備考に書かれていない条件は書かない" not in prompt
 
 
 def test_router_keeps_official_name_that_contains_a_modifier(db):
@@ -179,9 +183,13 @@ def test_router_all_change_notices_keep_the_exact_switch_date(db):
     for name in names:
         ans = router._blocking_route(f"{name}はどう捨てますか")
         assert ans.timeline_change is True, name
-        assert "切替日(省略・月単位への丸め禁止): 2026-10-01" in ans.context, name
-        assert "変更後(2026-10-01から):" in ans.context, name
+        assert "変更日: 2026-10-01" in ans.context, name
+        assert "変更後（2026-10-01から）:" in ans.context, name
+        # 構造化した正確な日付だけを残し、本文頭の月単位表記は落とす
         assert "2026年10月から、" not in ans.context, name
+        # disputed 注記・ラベル漏れが回答根拠に出ないこと
+        assert "早見表には" not in ans.context, name
+        assert "省略・月単位への丸め禁止" not in ans.context, name
 
 
 def test_router_leaves_unchanged_items_alone(db):

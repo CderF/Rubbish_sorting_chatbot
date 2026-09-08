@@ -468,11 +468,10 @@ def _apply_timeline(
     now_seg = tl.segment_on(ref)
     future = [s for s in tl.segments if s.valid_from and s.valid_from > ref]
 
-    # 通常の item_hits は is_current=1 の行だけなので、切替日前でも未来の通知行
-    # が日付なしの「分別早見表の検索結果」として入っている。これと時間軸を同時
-    # に渡すと、LLM が未来の規則を現在の規則として答えたり、どちらか片方を
-    # 落としたりする。変更品目については、この日付付きブロックだけを品目情報の
-    # 正本とし、収集日など別セクションだけを残す。
+    # 通常の item_hits は is_current=1 の行(=日付なしの新通知行)だけなので、
+    # これを時間軸と同時に渡すと LLM が未来の規則を現在の規則として答えたり
+    # 片方を落としたりする。変更品目については、この構造化ブロックを品目情報の
+    # 正本とし、早見表セクションは落とす(収集日など他セクションは残す)。
     kept_blocks = [
         block
         for block in ans.context.split("\n\n")
@@ -480,25 +479,33 @@ def _apply_timeline(
         and not block.startswith("## 早見表に")
     ]
 
-    lines = [
-        "## この品目の変更前後(このブロックだけを正本として回答する)",
-        f"- 対象品目: {tl.item_name}",
-    ]
+    # 小型モデルは context の見出し・補足ラベルをそのまま回答に写すので、
+    # ラベルは付けず素の事実だけを並べる。早見表との不一致(disputed)も
+    # 回答には出さない — 採点の根拠はお知らせであり、「早見表には〜」は
+    # 過剰な注記になる(メンター指摘「過不足なく」)。disputed 情報は
+    # TimelineSegment に残るので WebUI 側では参照できる。
+    lines = ["## 出し方の変更予定(現在の規則と変更後の規則を両方、時系列で述べる)"]
+    lines.append(f"- 品目: {tl.item_name}")
     if now_seg is not None:
         until = now_seg.valid_until.isoformat() if now_seg.valid_until else "当面"
-        lines.append(f"- 変更前・現在(〜{until}): {now_seg.disposal_method}")
-        if now_seg.disputed and now_seg.hayamihyo_disposal_method:
-            lines.append(
-                f"  (早見表には「{now_seg.hayamihyo_disposal_method}」と記載。"
-                "お知らせの内容を優先する)"
-            )
+        lines.append(f"- 現在（{until}まで）: {now_seg.disposal_method}")
     for seg in future:
-        lines.append(f"- 切替日(省略・月単位への丸め禁止): {seg.valid_from.isoformat()}")
         method = _timeline_method_text(seg.disposal_method, seg.valid_from)
-        lines.append(f"- 変更後({seg.valid_from.isoformat()}から): {method}")
+        lines.append(f"- 変更日: {seg.valid_from.isoformat()}")
+        lines.append(f"- 変更後（{seg.valid_from.isoformat()}から）: {method}")
 
     ans.context = "\n\n".join(kept_blocks + ["\n".join(lines)]).strip()
-    ans.sources = _dedupe(ans.sources + [s.source_url for s in tl.segments])
+    # 4-2 の根拠はお知らせ。現在側セグメントの source_url は曖昧一致で拾った
+    # 早見表行の URL のことがあり(実測: 無関係な 924_10043 等が多発)、
+    # 誤った参照を出すくらいなら knowledge:// のお知らせ anchor だけに絞る。
+    notice_urls = _dedupe(
+        [
+            s.source_url
+            for s in tl.segments
+            if s.source_url and s.source_url.startswith("knowledge://")
+        ]
+    )
+    ans.sources = notice_urls or ans.sources
     # 「花火」→ linked notice「使用済みの花火」のように、文字列上は部分一致でも
     # 版本鎖で同一品目だと確定できた。4-3 の類推扱い・断り書きを重ねない。
     ans.item_match = "exact"
@@ -942,6 +949,19 @@ _RULES_ANALOGY_UNRELIABLE = (
     "北九州市の窓口に確認してください。」の趣旨を必ず伝える。\n"
 )
 
+# timeline_change(4-2)専用。_RULES_WITH_CONTEXT の「備考は一つも省略せず全て
+# 含める / 備考に無い条件は書かない」を timeline ブロックに当てると、小型モデルが
+# 「※検索結果にない条件は省略します」等のメタ注記を回答に書き出す(B1実測)。
+# 変更予定は素直に現在→変更日→変更後だけを述べさせる。
+_RULES_TIMELINE = (
+    "- この品目は出し方が変わる予定がある。上の『出し方の変更予定』だけを"
+    "根拠に、「現在は〜。○年○月○日からは〜」の形で、現在の規則と変更後の"
+    "規則を両方、簡潔に述べる。日付は必ず年・月・日まで書き、月に丸めない。\n"
+    "- 『出し方の変更予定』に書かれていること以外は書かない。早見表の記載との"
+    "違い、そこに無い分別方法・持ち込み先・事前申込の要否、"
+    "「※検索結果にない条件は省略します」等のメタ的な注記を加えてはならない。\n"
+)
+
 _CONDITION_HINT_RE = re.compile(r"センチ|cm|以上|未満|だけでできており|kg|キロ")
 
 
@@ -966,6 +986,9 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
     if ans.found and ans.item_match == "analogy" and ans.analogy_unreliable:
         # 4-3 確度ゲートで弾いた候補。類推で断定させず、確認を促す。
         parts.append(_RULES_ANALOGY_UNRELIABLE)
+    elif ans.timeline_change:
+        # 4-2。_RULES_WITH_CONTEXT は当てない(上のコメント参照)。
+        parts.append(_RULES_TIMELINE)
     elif ans.found and ans.item_match != "analogy":
         parts.append(_RULES_WITH_CONTEXT)
     elif ans.found:
@@ -978,14 +1001,6 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
         )
     else:
         parts.append(_RULES_NO_CONTEXT)
-
-    if ans.timeline_change:
-        parts.append(
-            "- この品目は将来出し方が変わる。検索結果の『変更前・現在』、"
-            "『切替日』、『変更後』の3項目を一つも省略せず、"
-            "「現在は〜。YYYY年MM月DD日からは〜」の形で時系列に沿って説明する。"
-            "日付を月だけに丸めること、どちらか一方だけを答えることは禁止。\n"
-        )
 
     if ans.item_match == "analogy" and not ans.analogy_unreliable:
         parts.append(
