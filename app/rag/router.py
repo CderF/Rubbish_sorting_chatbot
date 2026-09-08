@@ -436,18 +436,36 @@ def _search_item(
 # 別品目=類推とみなす。
 _NAME_BOUNDARY_BEFORE = set("のはをがにへとでもや、。「」（）()　 ・/／")
 
+# ヒット名の直後に来てよいもの: 文末 / 助詞・記号 / 「だけ」「のみ」 /
+# 質問定型(どう・どこ、捨て・処分…)。「の」+ 内容語(「の充電スタンド」)が
+# 続く場合は、そのヒット名は修飾語であって主辞ではないので採らない。
+_AFTER_NAME_OK = re.compile(
+    r"^(?:$"
+    r"|[はがをにへとでもや、。・\s?？!！)）」]"
+    r"|って|だけ|のみ|くらい|なんか|とか"
+    r"|(?:は|の|を|、)?\s*(?:どう|どこ|どの|どうやって|どのように)"
+    r"|(?:は|の|を|、)?\s*(?:捨て|出せ|出し|処分|廃棄|分別|区分|回収|収集|処理|片付け)"
+    r")"
+)
+
 
 def _resolve_named_hit(prompt: str, hits: list[ItemRecord]) -> "ItemRecord | None":
-    """検索ヒットのうち、その item_name が質問文にそのまま現れており、かつ
-    直前が文頭か助詞・記号であるものを返す。
+    """検索ヒットのうち、その item_name が質問文の「主辞」としてそのまま
+    現れているものを返す。
 
     候補文字列が質問定型(「〜はどう捨てればいいですか」等)で汚れて
-    exact/partial を素通りし vector に落ちても、ヒット名自体が原文に含まれて
-    いれば、それは類推ではなく完全一致として扱う(採点の自然な問い方対策。
+    exact/partial を素通りし vector に落ちても、ヒット名が原文に主辞として
+    含まれていれば類推ではなく完全一致として扱う(採点の自然な問い方対策。
     trace 実測で 50問中46問が vector・timeline 発火0だった回帰の主因)。
 
-    複数該当時は名前の終端が最も右にあるもの(=主辞。「電動一輪車用の充電
-    ケーブル」なら『充電ケーブル』)を採る。
+    「主辞」の条件:
+    - 直前が文頭 or 助詞・記号(修飾語「小型の」等を挟んでよい)
+    - 直後が文末・助詞・「だけ/のみ」・質問定型のいずれか。
+      「電動歯ブラシの充電スタンド」の「電動歯ブラシ」のように直後が
+      「の」+内容語なら、それは修飾語なので採らない。
+
+    複数該当時は終端が最も右にあるもの(「電動一輪車用の充電ケーブル」なら
+    『充電ケーブル』)を採る。
     """
     p = _norm(prompt)
     best: "ItemRecord | None" = None
@@ -461,9 +479,11 @@ def _resolve_named_hit(prompt: str, hits: list[ItemRecord]) -> "ItemRecord | Non
             idx = p.find(name, start)
             if idx == -1:
                 break
+            end = idx + len(name)
             before = p[idx - 1] if idx > 0 else ""
-            if before == "" or before in _NAME_BOUNDARY_BEFORE:
-                end = idx + len(name)
+            if (before == "" or before in _NAME_BOUNDARY_BEFORE) and _AFTER_NAME_OK.match(
+                p[end:]
+            ):
                 if end > best_end:
                     best, best_end = h, end
             start = idx + 1
@@ -788,29 +808,13 @@ def _analogy_pick(
     pool = non_notice or list(hits)
 
     if query:
-        q = _norm(query)
+        def score(h: ItemRecord) -> tuple[int, int]:
+            n = getattr(h, "item_name", "")
+            # (関連強度, 名前長) — 強い上位語を優先、同点なら具体的な方
+            return (_relation_strength(query, n), len(_norm(n)))
 
-        def relation_score(h: ItemRecord) -> int:
-            n = _norm(getattr(h, "item_name", ""))
-            if len(n) < 2:
-                return 0
-            if n in q:            # 「ミキサー」⊂「ハンドミキサー」
-                return 1000 + len(n)
-            if q in n:            # 「ドローン」⊃ 質問品
-                return 500 + len(q)
-            run = _shared_run_len(q, n)
-            if run < 2:
-                return 0
-            for i in range(len(q) - run + 1):
-                sub = q[i : i + run]
-                if sub in n and not _KANA_ONLY_RE.match(sub):
-                    # 共通部分が質問品の末尾(主辞)なら加点
-                    # (「電動爪切り」→「缶切り」を「電動芝刈り機」より優先)
-                    return run + (5 if q.endswith(sub) else 0)
-            return 0
-
-        ranked = sorted(pool, key=relation_score, reverse=True)
-        if relation_score(ranked[0]) > 0:
+        ranked = sorted(pool, key=score, reverse=True)
+        if score(ranked[0])[0] > 0:
             return ranked[0]
 
     return pool[0]
@@ -837,38 +841,51 @@ def _shared_run_len(a: str, b: str) -> int:
 # 共通連続部分列は「かな以外(漢字・カタカナ・英数)を1文字以上含む2文字以上」
 # のときだけ手がかりとして採る。
 _KANA_ONLY_RE = re.compile(r"^[ぁ-ん]+$")
+_PAREN_TAIL_RE = re.compile(r"[(（].*$")
 
 
-def _lexically_related(query: str, cand: str) -> bool:
-    """質問品 `query` と類似候補 `cand` が語彙的に関連するか。
+def _base_name(s: str) -> str:
+    """比較用に括弧書き(「シュレッダー(家庭用)」「車いす(電動式)」等)を落とす。"""
+    return _PAREN_TAIL_RE.sub("", _norm(s)).strip()
 
-    弱いベクトル(item_nameのみ埋め込み)では セグウェイ→かご のような無関係な
-    誤ヒットも距離が近く、距離しきい値では良否を分離できない。一方、採点が
-    通す類推(電動スケートボード→スケートボード、電気毛布→毛布、VRヘッド
-    セット→ヘッドホン)はいずれも質問品と候補が文字列上つながっている。
-    そこで「一方が他方を部分文字列として含む」または「かな以外を含む2文字
-    以上の連続一致がある」ことを、類推を信頼してよい条件とする。
 
-    ここで False を返しても誤りにはならない(4-3の採点は根拠の薄い断定を
-    減点するのであって、確認を促す回答は安全側)。逆に文字の重なりが無い
-    純粋な意味推測(例: 電子レンジ→オーブン)は確度不足として弾く。
+def _relation_strength(query: str, cand: str) -> int:
+    """質問品 `query` と候補 `cand` の語彙的な近さ。
+
+    - 2 (強い/上位語): 一方が他方の末尾に一致する。「ミキサー」⊂「ハンド
+      ミキサー」、「時計」⊂「目覚まし時計」、「スケートボード」⊂「電動
+      スケートボード」。候補は質問品の上位カテゴリとみなせる。
+    - 1 (弱い/汎用語重複): 「モバイル」「ステップ」「電動」等の接頭辞や
+      「切り」のような語尾だけが共通。分別の根拠にするには弱い。
+    - 0: 無関係。
+
+    括弧書きは落として比較する(「シュレッダー(家庭用)」→「シュレッダー」)。
     """
-    q = _norm(query)
-    c = _norm(cand)
-    if not q or not c:
-        return False
-    if q in c or c in q:
-        return True
+    q = _base_name(query)
+    c = _base_name(cand)
+    if not q or not c or len(c) < 2:
+        return 0
+    if q == c or q.endswith(c) or c.endswith(q):
+        return 2
     run = _shared_run_len(q, c)
     if run < 2:
-        return False
-    # 共通部分列がかなだけ(「して」「から」等)なら手がかりにしない。
-    # run>=2 の共通部分を実際に取り出して判定する。
+        return 0
     for i in range(len(q) - run + 1):
         sub = q[i : i + run]
         if sub in c and not _KANA_ONLY_RE.match(sub):
-            return True
-    return False
+            return 1
+    return 0
+
+
+def _lexically_related(query: str, cand: str) -> bool:
+    """類推を「信頼してよい」= 候補が質問品の上位語(末尾一致)であること。
+
+    汎用語の重複(モバイル→モバイルバッテリー、ステップ→ステップマシーン、
+    切り→缶切り)は信頼に値しないので False。False の側に倒しても、4-3 は
+    「根拠を確認できないため断定できません、市に確認を」という安全な回答に
+    なるだけ(メンター指摘「独自の判断で類似品を置き換えない」)。
+    """
+    return _relation_strength(query, cand) >= 2
 
 
 def _analogy_is_reliable(candidates: "list[str]", pick: "ItemRecord | None") -> bool:
