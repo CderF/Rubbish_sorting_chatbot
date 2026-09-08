@@ -510,6 +510,7 @@ def _apply_timeline(
     # 版本鎖で同一品目だと確定できた。4-3 の類推扱い・断り書きを重ねない。
     ans.item_match = "exact"
     ans.timeline_change = True
+    ans.timeline_item_name = tl.item_name
 
 
 def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAnswer:
@@ -534,6 +535,7 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         )
     item_name = item_candidates[0] if item_candidates else None
     ans.detected_item = item_name
+    ans.item_candidates = list(item_candidates)
     ans.item_from_image = bool(image_item_name)
 
     if item_name:
@@ -541,12 +543,13 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
             item_name, item_candidates[1:], vector_query
         )
         ans.item_match = _classify_item_match(item_candidates, ans.item_hits)
-        # 4-3 確度ゲート: 類推(analogy)に落ちたら、コード側で1件に絞った候補が
-        # 質問品と語彙的に関連するかを確かめる。関連しなければ(セグウェイ→かご等)
-        # 距離が近くても根拠にせず、断定を避ける経路に載せる。timeline が後で
-        # item_match を exact に上書きする品目(カイロ等)はここでは analogy でも
-        # 語彙的に関連するので誤ってフラグは立たない。
-        if ans.item_match == "analogy":
+        # 4-3 確度ゲート。**真の vector フォールバック時だけ**適用する。
+        # exact / partial ヒットは早見表に実在する行(4-1 の新品目、4-2 の通知
+        # 品目、部分一致の別表記など)であり、名前が質問と完全一致しなくても
+        # 「根拠のない類推」ではない。ここで canned 断り経路に載せると、採点の
+        # 自然な問い方で 4-1/4-2 が固定拒否文を返してしまう(B1採点で数十ms
+        # 応答=回帰の実測)。距離しか手がかりが無い vector ヒットに限定する。
+        if ans.item_match == "analogy" and ans.item_match_stage == "vector":
             pick = _analogy_pick(ans.item_hits)
             ans.analogy_unreliable = not _analogy_is_reliable(item_candidates, pick)
 
@@ -1109,3 +1112,29 @@ def format_citations(ans: RoutedAnswer) -> str:
     lines = ["\n\n---\n参照:"]
     lines += [f"- {u}" for u in ans.sources]
     return "\n".join(lines)
+
+
+def build_trace_record(prompt: str, ans: RoutedAnswer) -> dict:
+    """1リクエスト分のルーティング判定を平文の dict にする(副作用なし)。
+
+    STAGE04 採点のどの問いで何が起きたかを後から突き合わせるため、server が
+    これに session_id と最終回答を足して `var/stage4_trace.jsonl` に追記する。
+    回答の内容・挙動はこれによって一切変わらない。
+    """
+    return {
+        "prompt": prompt,
+        "detected_item": ans.detected_item,
+        "item_candidates": list(ans.item_candidates),
+        "item_match_stage": ans.item_match_stage,
+        "item_match": ans.item_match,
+        "analogy_unreliable": ans.analogy_unreliable,
+        "timeline_change": ans.timeline_change,
+        "timeline_item_name": ans.timeline_item_name,
+        "item_hit_names": [
+            getattr(h, "item_name", "") for h in ans.item_hits
+        ],
+        "schedule_hits": len(ans.schedule_hits),
+        "missing": list(ans.missing),
+        "canned_response": bool(ans.canned_response),
+        "sources": list(ans.sources),
+    }

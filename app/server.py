@@ -238,6 +238,29 @@ async def _parse_request(request: Request) -> tuple[str, str, str | None]:
 # --------------------------------------------------------------------------
 # retrieval (STAGE 02 / 03)
 # --------------------------------------------------------------------------
+# STAGE04 採点デバッグ用。挙動は一切変えず、1リクエストのルーティング判定と
+# 最終回答を1行 JSON で追記するだけ。書き込み失敗は握り潰す(生成を止めない)。
+_TRACE_PATH = os.environ.get(
+    "STAGE4_TRACE_PATH",
+    os.path.join(_REPO_ROOT, "var", "stage4_trace.jsonl"),
+)
+_TRACE_ENABLED = os.environ.get("STAGE4_TRACE", "1") != "0"
+
+
+def _write_trace(session_id: str, prompt: str, routed, final_text: str) -> None:
+    if not (_TRACE_ENABLED and routed is not None):
+        return
+    try:
+        rec = router.build_trace_record(prompt, routed)
+        rec["session_id"] = session_id
+        rec["final_response"] = final_text
+        os.makedirs(os.path.dirname(_TRACE_PATH), exist_ok=True)
+        with open(_TRACE_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001 — trace はベストエフォート
+        print(f"[trace] write failed: {exc!r}", flush=True)
+
+
 async def _route_safely(prompt: str, img: str | None):
     """検索パスを呼ぶ。失敗しても生成は止めない。
 
@@ -289,6 +312,7 @@ async def _stream_chat(
         if with_sources:
             payload = {"sources": router.describe_sources(routed)}
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        _write_trace(session_id, prompt, routed, text)
         yield "data: [DONE]\n\n"
         return
 
@@ -358,6 +382,7 @@ async def _stream_chat(
         while len(sessions) > MAX_SESSIONS:
             sessions.popitem(last=False)
 
+    _write_trace(session_id, prompt, routed, prev_text)
     yield "data: [DONE]\n\n"
 
 

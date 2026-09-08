@@ -133,6 +133,16 @@ class RoutedAnswer:
     item_from_image: bool = False
     """`detected_item` が画像分類パス由来かどうか(STAGE03 3-2)。"""
 
+    item_candidates: list[str] = field(default_factory=list)
+    """`_item_name_candidates` が prompt から作った品名候補(原文 + 修飾語を
+    落とした形 + 括弧分割)。回答の組み立てには使わない — 採点デバッグ用の
+    trace(`var/stage4_trace.jsonl`)に残し、どの候補で検索段が決まったかを
+    後から追えるようにする。"""
+
+    timeline_item_name: str | None = None
+    """`_apply_timeline` が時間軸を引けたときの `ItemTimeline.item_name`。
+    trace 用。`timeline_change` が False なら None。"""
+
     district_schedule: bool = False
     """`schedule_hits` が「丁目を省略した地区名」から解決されたものかどうか。
 

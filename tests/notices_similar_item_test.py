@@ -353,3 +353,54 @@ def test_blocking_route_no_canned_for_reliable_analogy(monkeypatch):
 
 def test_default_routed_answer_has_no_canned_response():
     assert RoutedAnswer().canned_response is None
+
+
+# --- gate scoping: only fire on a true vector fallback -----------------
+# 4-1/4-2 の自然な問い方は exact/partial で当たる。名前が完全一致しなくても
+# それは「実在する行への部分一致」であって根拠の無い類推ではない。ここで
+# canned 断りを返すと採点で 4-1/4-2 が固定拒否文になる(数十ms応答=回帰)。
+def test_partial_hit_never_flagged_unreliable_even_if_lexically_unrelated(monkeypatch):
+    monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
+    # 語彙的に無関係な行を partial ヒットとして返す(本来ありえないが、
+    # ゲートが stage を見ずに語彙照合だけしていた頃の回帰を固定する)
+    monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [_rec("かご")])
+    monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
+
+    ans = router._blocking_route("セグウェイはどう捨てますか")
+    assert ans.item_match_stage == "partial"
+    assert ans.analogy_unreliable is False
+    assert ans.canned_response is None
+
+
+def test_gate_still_fires_on_vector_stage(monkeypatch):
+    monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
+    monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [_rec("かご")])
+    monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
+
+    ans = router._blocking_route("セグウェイはどう捨てますか")
+    assert ans.item_match_stage == "vector"
+    assert ans.analogy_unreliable is True
+    assert ans.canned_response is not None
+
+
+def test_build_trace_record_shape():
+    from app.rag.router import build_trace_record
+
+    ans = RoutedAnswer(
+        detected_item="セグウェイ",
+        item_candidates=["セグウェイ"],
+        item_match="analogy",
+        item_match_stage="vector",
+        analogy_unreliable=True,
+        canned_response="…",
+        item_hits=[_rec("かご")],
+    )
+    rec = build_trace_record("セグウェイはどう捨てますか", ans)
+    assert rec["item_match_stage"] == "vector"
+    assert rec["canned_response"] is True
+    assert rec["item_hit_names"] == ["かご"]
+    assert rec["item_candidates"] == ["セグウェイ"]
+    # JSON 化できること(server がそのまま書き出す)
+    import json as _j
+    _j.dumps(rec, ensure_ascii=False)
