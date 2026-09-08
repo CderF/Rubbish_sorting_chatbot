@@ -28,6 +28,7 @@ import base64
 import json
 import os
 import secrets
+import sys
 import time
 import uuid
 from collections import OrderedDict
@@ -44,6 +45,16 @@ from fastapi.responses import (
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from PIL import Image
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+
+# systemd は作業ディレクトリ app/ で `uvicorn server:app` を起動するため、
+# そのままでは app パッケージが解決できない。リポジトリルートを通しておくと
+# `uvicorn server:app`(app/ から) でも `uvicorn app.server:app`(ルートから) でも
+# 同じ import が通る。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from app.rag import knowledge, router  # noqa: E402  (sys.path 調整後に import)
 
 MODEL_NAME = "Qwen3-VL-8B-Instruct"
 # Where the downloaded weights live. Override per machine via MODEL_PATH so the
@@ -83,7 +94,8 @@ sessions: "OrderedDict[str, list]" = OrderedDict()
 _sessions_lock = asyncio.Lock()
 
 # Most recently completed request, shown on the WebUI (STAGE 1-2).
-last_timing = {"first_token_s": None, "total_s": None, "tokens": None, "session_id": None}
+last_timing = {"first_token_s": None, "total_s": None, "tokens": None,
+               "session_id": None, "retrieval": None}
 
 
 # --------------------------------------------------------------------------
@@ -224,6 +236,23 @@ async def _parse_request(request: Request) -> tuple[str, str, str | None]:
 
 
 # --------------------------------------------------------------------------
+# retrieval (STAGE 02 / 03)
+# --------------------------------------------------------------------------
+async def _route_safely(prompt: str, img: str | None):
+    """検索パスを呼ぶ。失敗しても生成は止めない。
+
+    RAG側の例外で 5xx を返すとステージ全体が中断してしまう(冒頭の契約メモ参照)
+    ため、ここだけは意図的に握り潰し、素の生成にフォールバックする。
+    """
+    try:
+        return await router.handle_query(prompt, img)
+    except Exception as exc:  # noqa: BLE001 — 生成の継続を最優先する
+        print(f"[rag] handle_query failed, falling back to plain generation: {exc!r}",
+              flush=True)
+        return None
+
+
+# --------------------------------------------------------------------------
 # streaming
 # --------------------------------------------------------------------------
 async def _stream_chat(session_id: str, prompt: str, img: str | None):
@@ -234,7 +263,16 @@ async def _stream_chat(session_id: str, prompt: str, img: str | None):
     async with _sessions_lock:
         history = sessions.get(session_id, [])
         messages = history + turn
-    prompt_input = _build_prompt(messages)
+
+    # 検索結果はシステムメッセージとして毎ターン先頭に差し込む。会話履歴には
+    # 残さない(ターンごとに検索結果が変わるうえ、積み重なると文脈を圧迫するため)。
+    routed = await _route_safely(prompt, img)
+    if routed is not None:
+        prompt_input = _build_prompt(
+            [{"role": "system", "content": router.build_system_prompt(routed)}] + messages
+        )
+    else:
+        prompt_input = _build_prompt(messages)
 
     start = time.perf_counter()
     first_token_at = None
@@ -256,12 +294,29 @@ async def _stream_chat(session_id: str, prompt: str, img: str | None):
         prev_text = EMPTY_FALLBACK
         yield f"data: {json.dumps({'delta': EMPTY_FALLBACK}, ensure_ascii=False)}\n\n"
 
+    # 引用はLLMに書かせず、検索結果から確定したURLをここで本文に足す
+    # (STAGE02 2-2「根拠を参照ページまで示せる」。採点側は delta を連結した
+    #  文字列だけを見るため、WebUI表示のみに留めず本文に含める)。
+    citations = router.format_citations(routed) if routed is not None else ""
+    if citations:
+        prev_text += citations
+        yield f"data: {json.dumps({'delta': citations}, ensure_ascii=False)}\n\n"
+
     end = time.perf_counter()
     last_timing.update(
         first_token_s=round((first_token_at or end) - start, 3),
         total_s=round(end - start, 3),
         tokens=n_tokens,
         session_id=session_id,
+        retrieval=None if routed is None else {
+            "item": routed.detected_item,
+            "ward": routed.detected_ward,
+            "town": routed.detected_town,
+            "item_hits": len(routed.item_hits),
+            "schedule_hits": len(routed.schedule_hits),
+            "missing": routed.missing,
+            "sources": routed.sources,
+        },
     )
 
     # Persist the turn so the next request with this session_id continues it.
@@ -324,6 +379,27 @@ async def info(_=Depends(require_login)):
         "max_model_len": MAX_MODEL_LEN,
         "max_tokens": MAX_TOKENS,
     }
+
+
+# --------------------------------------------------------------------------
+# knowledge browser (STAGE 02 2-3)
+#   「検索対象の外部データファイル一覧と内容をWebUIで確認できる」
+# --------------------------------------------------------------------------
+@app.get("/knowledge")
+async def knowledge_list(_=Depends(require_login)):
+    """取り込み済みの参照元ページ一覧。DB未作成なら available=false を返す。"""
+    data = await asyncio.to_thread(knowledge.list_sources)
+    data["using_stubs"] = router.using_stubs()
+    return data
+
+
+@app.get("/knowledge/{source_id}")
+async def knowledge_detail(source_id: str, _=Depends(require_login)):
+    """1ページ分の取り込み内容(表形式)。"""
+    doc = await asyncio.to_thread(knowledge.get_source, source_id)
+    if doc is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown source id")
+    return doc
 
 
 LOGIN_PAGE = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
