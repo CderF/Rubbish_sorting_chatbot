@@ -138,6 +138,18 @@ def test_repeating_a_known_item_refocuses_instead_of_duplicating():
 
     assert s.items == ("冷蔵庫", "ソファ")
     assert s.primary_item == "ソファ"
+    # docstring が公開している4値のうちの1つ。並べ替えただけなので訂正ではない
+    # (PR #24 レビュー指摘4: 実装だけが返していて契約に書かれていなかった)。
+    assert s.last_item_update == "refocus"
+    assert not s.corrected
+
+
+def test_refocusing_an_item_already_in_focus_is_a_no_op():
+    s = merge(None, turn("ソファ", item="ソファ"))
+    s = merge(s, turn("ソファの収集日は?", item="ソファ", asks_schedule=True))
+
+    assert s.items == ("ソファ",)
+    assert s.last_item_update == "none"
 
 
 # --- 6-4 の布石: 判断の記録 -------------------------------------------------

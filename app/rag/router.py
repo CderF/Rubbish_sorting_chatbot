@@ -345,6 +345,18 @@ def _clean_fragment(frag: str) -> str:
     return frag.strip()
 
 
+def _trim_particles(text: str, original: str) -> str:
+    """文頭・文末に残った助詞を落とす。ただし発話の先頭は削らない。
+
+    `original` は正規化しただけの発話全文。`text` がまだその先頭から始まって
+    いる(=区名・町名・種別語の除去でずれていない)なら、1文字目は助詞の
+    残骸ではなく内容語の一部なので `_LEADING` を当てない。
+    """
+    if not original.startswith(text):
+        text = _LEADING.sub("", text)
+    return _TRAILING.sub("", text).strip()
+
+
 def _item_name_candidates(
     prompt: str, strip_waste_words: bool | None = None
 ) -> tuple[list[str], str | None]:
@@ -376,6 +388,9 @@ def _item_name_candidates(
     if strip_waste_words is None:
         strip_waste_words = asks_schedule(text)
 
+    # 発話そのものの先頭かどうかを後で判定するために原文を控えておく。
+    original = text
+
     # 訂正されたターンでは、訂正マーカーより後ろが新しい品名
     # (「冷蔵庫じゃなくて洗濯機でした」→「洗濯機でした」)。前半を残すと
     # 長い順に並べる候補列の先頭が訂正前の品名になってしまう(STAGE05)。
@@ -405,8 +420,14 @@ def _item_name_candidates(
 
     text = _QUESTION_TAIL.sub(r"\1", text)
     text = _POLITE_TAIL.sub("", text)
-    text = _LEADING.sub("", text)
-    text = _TRAILING.sub("", text).strip()
+    # 文頭の助詞落とし(`_LEADING`)は、区名・町名・ごみ種別語を除去した「跡」に
+    # 残る助詞を消すためのもので、発話の1文字目に当ててはいけない。`_PARTICLES`
+    # には「ね・や・よ・も・か」等が含まれるため、当てると内容語の頭を削る:
+    # 「ねじ回し」→「じ回し」、「やかん」→(候補なし)、「もう使わない…」→
+    # 「う使わない…」。STAGE04 までは1ターン限りの検索キーの汚れで済んでいたが、
+    # STAGE05 では削られた名前がスロットに載って会話中ずっと残る(レビュー指摘3)。
+    # 発話の先頭がまだそのまま残っている間は当てない。
+    text = _trim_particles(text, original)
 
     # 記号・空白で切り、断片ごとに「原文」と「修飾語を落とした形」の両方を
     # 候補化する。原文だけだと「壊れたテレビ」が完全一致しない一方、加工後
@@ -418,7 +439,7 @@ def _item_name_candidates(
     raw_fragments: list[str] = [text]
     candidates: list[str] = [text]
     for frag in re.split(r"[\s、。「」()（）]+", text):
-        frag = _TRAILING.sub("", _LEADING.sub("", frag))
+        frag = _trim_particles(frag, original)
         if not frag:
             continue
         raw_fragments.append(frag)
@@ -840,23 +861,35 @@ def _route_schedule(ans: RoutedAnswer, state: DialogState, prompt: str) -> None:
     ans.no_weekday_schedule = any(r.no_weekday for r in ans.item_results)
 
     if not queried:
-        if ans.no_weekday_schedule and not any(
-            r.disposal_method and not r.no_weekday for r in ans.item_results
-        ):
-            # 相談中の品目がすべて「決まった収集曜日を持たない」区分。検索は
-            # 行わず、context 側でその旨を明示する。
+        if ans.item_results and all(r.no_weekday for r in ans.item_results):
+            # 相談中の品目が「すべて」決まった収集曜日を持たない区分のときだけ
+            # 検索を省く。ここは以前 `queried` が空であることと同じ条件を
+            # 書いており、区分を特定できない品目(部分一致が割れて
+            # `disposal_method` が None)と no_weekday の品目が同時にいる相談で
+            # 誤発火していた。会話で種別が判明していても検索前に return して
+            # しまい、収集日が無言で落ちる(レビュー指摘1)。
             return
         # 早見表がヒットしていない、または区分が割れて特定できない。会話中に
         # 明示された種別があればそれで絞る(無ければ全種別)。
         queried = [state.waste_type]
 
     schedules: list[ScheduleRecord] = []
+    # 引いたが1行も無かった種別。複数品目で区分が分かれる相談では、他の種別が
+    # 当たると `schedules` 全体は非空になるため、下の「種別なしで引き直す」も
+    # 最後の missing も発火しない。何も言わずに消すと、その品目については
+    # 収集日を調べていないのに調べたかのような回答になる(レビュー指摘2)。
+    unmatched: list[str] = []
     for waste_type in queried:
-        schedules += lookup_collection_schedule(ward, town, waste_type) or []
+        rows = lookup_collection_schedule(ward, town, waste_type) or []
+        if rows:
+            schedules += rows
+        elif waste_type:
+            unmatched.append(waste_type)
     if not schedules and any(queried):
         # 種別が一致しないことを理由に収集日そのものを落とさない。設計提案書
         # 3-1 は「品名と地区を伝えると出し方と収集日まで案内できる」ことを求める。
         schedules = lookup_collection_schedule(ward, town, None) or []
+        unmatched = []  # 種別を問わず引き直したので、種別単位の欠落ではない
 
     if not schedules and not town:
         # 丁目を省略した地区名(「黒崎」等)の可能性を試す。地区内の
@@ -872,6 +905,7 @@ def _route_schedule(ans: RoutedAnswer, state: DialogState, prompt: str) -> None:
             uniform = _uniform_district_schedule(ward, district_towns, district_type)
             if uniform:
                 schedules = uniform
+                unmatched = []  # 地区単位で引き直した結果に置き換わる
                 town = district_name
                 ans.detected_town = district_name
                 ans.district_schedule = True
@@ -879,6 +913,7 @@ def _route_schedule(ans: RoutedAnswer, state: DialogState, prompt: str) -> None:
 
     if schedules:
         ans.schedule_hits = _dedupe_schedules(schedules)
+        ans.schedule_missing_types = unmatched
     elif ans.no_weekday_schedule:
         pass  # context 側で案内するので missing には積まない
     elif not town:
@@ -1362,8 +1397,16 @@ def _item_block(result: ItemResult, label: bool) -> str:
     return "\n".join(lines)
 
 
-def _no_weekday_block(ans: RoutedAnswer, label: bool) -> str:
-    """収集曜日を持たない品目についての指示。
+def _schedule_notes_block(ans: RoutedAnswer, label: bool) -> str:
+    """収集日について補足すべきことをまとめたブロック。
+
+    2種類ある。どちらも「存在しない収集日を作り出させない」ための注記なので
+    同じ見出しに並べる。
+
+    1. 決まった収集曜日を持たない区分の品目(下記)
+    2. 引いたがこの地区にデータが1行も無かったごみ種別
+       (`schedule_missing_types`。複数品目で区分が分かれる相談で、片方だけ
+        該当行があると全体としては非空になり無言で消えるため)
 
     「回収ボックスへ随時持ち込み」と決め打ちしていたが、実際は方式が
     均一ではない: 小物金属・小型電子機器・電池類・古着・紙パック・
@@ -1397,6 +1440,14 @@ def _no_weekday_block(ans: RoutedAnswer, label: bool) -> str:
                 "(回収ボックス等の案内)に書かれている方式に従って回答すること"
                 "(備考に無い方式を勝手に補わない)。"
             )
+    for waste_type in ans.schedule_missing_types:
+        notes.append(
+            f"- 「{waste_type}」の収集日は、この地区({ans.detected_ward}"
+            f"{ans.detected_town})には登録が無く調べられなかった。上の収集日は"
+            "別の区分のものなので、その曜日をこの区分の収集日として案内しない。"
+            "分からないことは分からないと伝え、北九州市の公式ページや窓口での"
+            "確認を促す。"
+        )
     return "## 収集日について\n" + "\n".join(notes) if notes else ""
 
 
@@ -1461,9 +1512,9 @@ def _build_context(ans: RoutedAnswer) -> str:
             )
         blocks.append("\n".join(lines))
 
-    no_weekday = _no_weekday_block(ans, label)
-    if no_weekday:
-        blocks.append(no_weekday)
+    schedule_notes = _schedule_notes_block(ans, label)
+    if schedule_notes:
+        blocks.append(schedule_notes)
 
     for result in ans.item_results:
         if result.timeline_change:
@@ -1754,6 +1805,9 @@ def build_trace_record(prompt: str, ans: RoutedAnswer) -> dict:
         ],
         "schedule_hits": len(ans.schedule_hits),
         "missing": list(ans.missing),
+        # 引いたがこの地区に行が無かった種別。6-4「どう調べて・どう判断したか」
+        # を後から追うには、当たった種別だけでなく空振りした種別も要る。
+        "schedule_missing_types": list(ans.schedule_missing_types),
         "canned_response": bool(ans.canned_response),
         "sources": list(ans.sources),
         # STAGE05: マルチターンの相談は「この1文」だけでは追えない。どの

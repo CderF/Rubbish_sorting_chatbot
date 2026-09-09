@@ -175,7 +175,13 @@ class DialogState:
     浅野1丁目です」のように、質問と地区が別ターンに分かれる。"""
 
     last_item_update: str = "none"
-    """直近ターンで品目スロットに起きたこと。"add" / "replace" / "none"。"""
+    """直近ターンで品目スロットに起きたこと。
+
+    取りうる値は "add" / "replace" / "refocus" / "none" の4つ。"refocus" は
+    既に追っている品目がもう一度名指しされ、`items` の末尾(=いま話題の中心)へ
+    並べ替えただけの場合で、品目の増減は無い。`corrected` は "replace" だけを
+    訂正とみなすので、"refocus" は 5-2 の「変更・訂正」には当たらない。
+    """
 
     last_region_update: str = "none"
     """直近ターンで地区スロットに起きたこと。"set" / "replace" / "none"。"""
@@ -219,7 +225,9 @@ def _merge_items(state: DialogState, turn: TurnInput) -> tuple[tuple[str, ...], 
       - それ以外の新しい品名は**足す**。5-2 は「追加なら前の案内を保ったまま
         足す」を求めており、マーカーの無い言い換え(「冷蔵庫は?」)も追加として
         扱うほうが、前ターンの案内を失わない分だけ安全側に倒れる
-      - 既に追っている品目の再登場では何もしない
+      - 既に追っている品目の再登場では品目の増減は起こさず、`items` の末尾へ
+        並べ替えて「いま話題の中心」にするだけ("refocus"。順序が既に末尾なら
+        "none")
     """
     item = turn.item
     if not item:

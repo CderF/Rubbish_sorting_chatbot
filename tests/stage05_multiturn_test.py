@@ -76,6 +76,17 @@ def seeded_db(tmp_path, monkeypatch):
             # 家庭ごみは collection_schedule に実在する5種別の1つ。区分が
             # 分かれる相談(粗大ごみ + 家庭ごみ)を組めるようにしておく。
             _item("歯ブラシ", "家庭ごみ", "そのまま出せます"),
+            # 収集日データを持たない curbside 種別(この町にプラスチックの行は
+            # 播かない)。区分が分かれる相談で片方だけ該当行が無い形を作る。
+            _item("ペン", "プラスチック", "そのまま出せます"),
+            # 回収ボックス方式(no_weekday)。
+            _item("蛍光管", "蛍光管回収ボックス", "回収ボックスへ"),
+            # 部分一致が2件に割れて disposal_method が確定しない品目。
+            _item("傘(布製)", "家庭ごみ", ""),
+            _item("傘(ビニール製)", "粗大ごみ", ""),
+            # 先頭が助詞集合(はがをにへとでもやのねよかっ)の文字で始まる品名。
+            _item("ねじ回し", "家庭ごみ", "そのまま出せます"),
+            _item("やかん", "家庭ごみ", "そのまま出せます"),
         ],
         [
             # weekday は実データの表記そのまま(PR #20: ここに「曜日」を足さない)
@@ -265,3 +276,95 @@ def test_single_turn_calls_still_work_without_a_state():
     assert ans.found
     assert "キャップとラベルを外す" in ans.context
     assert ans.state is not None and ans.state.items == ("ペットボトル",)
+
+
+# --- レビュー指摘の回帰(PR #24 レビュー 2026-09-09) -------------------------
+def test_known_waste_type_is_used_even_when_a_no_weekday_item_is_present():
+    """会話で判明した種別があるのに収集日検索を省かない(指摘1)。
+
+    区分を特定できない品目(部分一致が割れて `disposal_method` が None)と
+    no_weekday の品目が同時にいると、以前は「全部 no_weekday」の分岐が誤発火し、
+    `state.waste_type` を試す前に検索ごと打ち切っていた。DBに行があるのに
+    `schedule_hits` も `missing` も空という無言の欠落になる。
+    """
+    s = router._blocking_route("傘の家庭ごみの収集日は?").state
+    s = router._blocking_route("小倉北区浅野1丁目です", state=s).state
+    third = router._blocking_route("蛍光管も", state=s)
+
+    assert third.state.waste_type == "家庭ごみ"
+    assert [(h.waste_type, h.weekday) for h in third.schedule_hits] == [
+        ("家庭ごみ", "月曜日・木曜日")
+    ]
+
+
+def test_all_no_weekday_items_still_skip_the_lookup():
+    """指摘1の修正で、本来の「全部 no_weekday なら引かない」を壊していないこと。"""
+    ans = router._blocking_route("小倉北区浅野1丁目で蛍光管を捨てたい")
+
+    assert ans.schedule_hits == []
+    assert ans.missing == []
+    assert "決まった収集曜日を持たない区分" in ans.context
+
+
+def test_a_waste_type_with_no_rows_here_is_announced_not_dropped():
+    """該当行が無い種別を無言で消さない(指摘2)。
+
+    ソファ(粗大ごみ)には行があり、ペン(プラスチック)には無い。片方が当たると
+    `schedule_hits` 全体は非空になるため、以前はペンについて何の断りも出ず、
+    上の粗大ごみの曜日をペンの収集日と読める状態だった。
+    """
+    s = router._blocking_route("ソファの収集日を知りたい").state
+    s = router._blocking_route("小倉北区浅野1丁目です", state=s).state
+    third = router._blocking_route("ペンも", state=s)
+
+    assert third.schedule_missing_types == ["プラスチック"]
+    assert "「プラスチック」の収集日は、この地区(小倉北区浅野1丁目)には登録が無く" in (
+        third.context
+    )
+    # 当たった側の収集日は従来どおり出る。
+    assert [(h.waste_type, h.weekday) for h in third.schedule_hits] == [
+        ("粗大ごみ", "第2水曜日")
+    ]
+
+
+def test_no_missing_types_when_every_queried_type_matched():
+    s = router._blocking_route("ソファを捨てたい").state
+    second = router._blocking_route("小倉北区浅野1丁目です", state=s)
+
+    assert second.schedule_missing_types == []
+    assert "登録が無く" not in second.context
+
+
+def test_leading_particle_is_not_stripped_from_the_start_of_the_utterance():
+    """発話の1文字目を助詞として削らない(指摘3の原因)。
+
+    `_PARTICLES` には「ね・や・よ・も・か」等が含まれる。文頭に当てると
+    「ねじ回し」→「じ回し」、「やかん」→(候補なし)になり、早見表に実在する
+    品目が引けなくなる。STAGE05 では削られた名前がスロットに残り続ける。
+    """
+    assert router._blocking_route("ねじ回しはどう捨てますか").detected_item == "ねじ回し"
+    assert router._blocking_route("やかんを処分したい").detected_item == "やかん"
+
+
+def test_an_unmatched_item_keeps_the_users_own_wording_in_the_slot():
+    """早見表に無い品物でも、スロットに入るのは利用者の言い方そのまま(指摘3)。
+
+    以前は先頭の1文字が落ちた断片(「よくわからない謎の物体X」→
+    「くわからない謎の物体X」)が入り、その壊れた文字列が以降の全ターンで
+    システムプロンプトと context の見出しに出続けた。
+    """
+    first = router._blocking_route("よくわからない謎の物体Xを捨てたい")
+    assert first.state.items == ("よくわからない謎の物体X",)
+
+    second = router._blocking_route("ソファも", state=first.state)
+    assert second.state.items == ("よくわからない謎の物体X", "ソファ")
+    assert "くわからない" not in router.build_system_prompt(second).replace(
+        "よくわからない", ""
+    )
+
+
+def test_leading_particle_is_still_stripped_after_a_removed_region():
+    """区名・町名を除いた「跡」に残る助詞は従来どおり落とす(指摘3の修正の境界)。"""
+    ans = router._blocking_route("小倉北区浅野1丁目でソファを捨てたい")
+    assert ans.detected_item == "ソファ"
+    assert ans.detected_town == "浅野1丁目"
