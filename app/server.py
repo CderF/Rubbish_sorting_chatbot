@@ -386,7 +386,7 @@ async def _stream_chat(
             deadline_hit = True
             break
 
-    prev_text, blocked = guard.scrub_output(prev_text)
+    prev_text, blocked = guard.scrub_output(prev_text, prompt)
 
     # An empty body fails the question outright, so always say something.
     if not prev_text.strip():
