@@ -31,9 +31,14 @@ from app.rag.vector_store import vector_search_explanations, vector_search_items
 
 # --- OpenAI-style function-calling スキーマ ---------------------------------
 # `processor.apply_chat_template(messages, tools=TOOL_SCHEMAS, ...)` にそのまま
-# 渡す想定(Qwen系のテンプレートはこの形式のtoolsパラメータを想定している)。
-# 実際のQwen3-VLのテンプレートでの描画結果は実機接続後に要確認
-# (documents 内の計画メモ参照)。
+# 渡す想定。Hugging Face Hub上の `Qwen/Qwen3-VL-8B-Instruct` の
+# `chat_template.json` を取得して確認済み(2026-09-09): `tools` はリストの
+# 各要素をそのまま `<tools>` タグ内にJSONで列挙するだけなので、このリストの
+# 各要素がOpenAI形式(`{"type": "function", "function": {...}}`)かどうかは
+# テンプレート機構上は問わない。Qwen公式ドキュメント・vLLMのHermes tool
+# parserとの整合を優先し、この形式で統一している。テンプレートの実地確認は
+# 済んでいるが、モデルが実際にこの形式のfunction定義を安定して解釈するかは
+# 実機のGPUでの推論確認が必要(このマシンではVLM本体の重みでの推論は未検証)。
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {

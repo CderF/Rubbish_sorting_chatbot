@@ -16,13 +16,25 @@
   - `build_prompt` は `app/server.py._build_prompt` 互換のシグネチャ
     `(messages: list, tools: list | None = None) -> dict` を想定する。
 
-未検証の前提(実機接続後に要確認):
-  - Qwen3-VL-8B-Instruct のチャットテンプレートが `tools=` 引数を実際に
-    レンダリングするか。
-  - モデルが生成する tool_call の実フォーマット
-    (`app/rag/tool_call_parser.py` 側で候補パターンを追加すれば対応可能)。
-  - `{"role": "tool", "content": ...}` のようなツール結果メッセージの role が
-    このモデルのテンプレートで正しく扱われるか。
+Hugging Face Hub上の `Qwen/Qwen3-VL-8B-Instruct` の `chat_template.json` を
+直接取得して確認済み(2026-09-09、テンプレート自体は数KBのテキストファイル
+なのでGPU無しのこのマシンでも取得できた。VLM本体の重みでの実推論はまだ
+未検証):
+  - `tools=` 引数は実際にレンダリングされる(渡すと `<|im_start|>system` に
+    続けて `# Tools` セクションが挿入され、各ツールを `<tools>` タグ内に
+    JSONで列挙し、モデルへ `<tool_call>{"name":...,"arguments":{...}}
+    </tool_call>` の形で応答するよう明示的に指示する)。
+    `app/rag/tool_call_parser.py` の想定形式と一致する。
+  - `{"role": "tool", "content": ...}` はこのテンプレートで正しく扱われる。
+    ただし個別の `<|im_start|>tool` ターンにはならず、連続する tool ロール
+    のメッセージは1つの `<|im_start|>user ... <tool_response>...
+    </tool_response> ... <|im_end|>` ブロックにまとめられる(テンプレートの
+    仕様であり、こちらの実装は `content` を渡すだけでよく変更不要)。
+
+未検証(実機のGPUでの実推論が必要):
+  - モデルが実際にこの指示通りの tool_call を安定して生成するか(フォー
+    マットの「あるべき姿」は確認できたが、8Bモデルの実際の遵守率は未検証)。
+  - レイテンシ(ツール呼び出し往復で generate() が最低2回になる)。
 """
 
 from __future__ import annotations

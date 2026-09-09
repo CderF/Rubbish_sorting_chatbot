@@ -3,12 +3,19 @@
 `app/rag/agent.py` の `route_agentically` から、非ストリームの短い generate()
 結果(生テキスト)を渡して使う。
 
-Qwen3-VL-8B-Instruct の実際のチャットテンプレートは、このリポジトリの開発
-マシンにVLM本体の重みが無く(推論はB1/B2サーバーのGPUでのみ可能)実地検証
-できていない。Qwenの2.5/3系はHermes方式(`<tool_call>{...}</tool_call>`)を
-標準とするため、それを第一候補として実装するが、単一の固定フォーマットに
-決め打ちせず「候補パターンを順に試す」設計にしてある — 実機接続後に異なる
-形式が確認された場合は `_CANDIDATE_PATTERNS` に追加するだけで対応できる。
+Hermes方式(`<tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>`)
+を第一候補として実装している。これは推測ではなく、Hugging Face Hub上の
+`Qwen/Qwen3-VL-8B-Instruct` の `chat_template.json` を直接取得して確認した
+実際のテンプレートの記述と一致する(2026-09-09、このマシンではVLM本体の
+重みは無くGPU推論はできないが、テンプレート自体は数KBのテキストファイルな
+ので取得できた)。テンプレートは `tools` が渡されるとツール一覧を
+`<tools>...</tools>` XMLタグ内にJSONで列挙し、モデルには「関数呼び出しは
+`<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n
+</tool_call>` の形で返せ」と明示的に指示する — つまり `arguments` は
+(文字列化したJSONではなく)ネストしたJSONオブジェクトとして出力される想定。
+このパーサーはその形式を主に扱うが、単一の固定フォーマットに決め打ちせず
+「候補パターンを順に試す」設計は維持してある(実際の生成結果でずれが見つ
+かった場合に `_CANDIDATE_PATTERNS` へ追加するだけで対応できるように)。
 """
 
 from __future__ import annotations
