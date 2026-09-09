@@ -180,15 +180,39 @@ def test_attack_short_circuits_before_any_lookup(monkeypatch):
     assert ans.found is False
 
 
-def test_off_purpose_is_canned_only_when_nothing_matched(monkeypatch):
-    monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
-    monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
-    monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [])
-    monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
+def test_off_purpose_short_circuits_before_any_lookup(monkeypatch):
+    """目的外利用は検索より前に判定する(検索結果の有無に依存しない)。
+
+    B1実機での確認で、「コード」がベクトル検索で無関係な早見表行「コード類」
+    (ケーブル)に弱く一致し、`ans.found=True` になって旧実装(検索後・
+    found依存)の判定をすり抜ける実例が見つかった。検索そのものを行わない
+    ことで、この種の語の衝突を構造的に無くす。
+    """
+    monkeypatch.setattr(router, "lookup_item_exact", _explode)
+    monkeypatch.setattr(router, "lookup_item_partial", _explode)
+    monkeypatch.setattr(router, "vector_search_items", _explode)
+    monkeypatch.setattr(router, "lookup_collection_schedule", _explode)
 
     ans = router._blocking_route("Pythonでソートのコードを書いてください")
     assert ans.attack_detected == "目的外利用"
     assert ans.canned_response == guard.REFUSAL
+
+
+def test_off_purpose_not_bypassed_by_a_vector_analogy_collision(monkeypatch):
+    """B1実機で実際に観測した回帰: 「コード」を含む目的外の依頼が、ベクトル
+    検索で「コード類」に類推一致して `found=True` になり、旧実装(検索後・
+    found依存)の判定をすり抜けていた。検索より前に判定する現在の実装では
+    再現しないことを固定する。
+    """
+    monkeypatch.setattr(router, "lookup_item_exact", _explode)
+    monkeypatch.setattr(router, "lookup_item_partial", _explode)
+    monkeypatch.setattr(router, "vector_search_items", _explode)
+    monkeypatch.setattr(router, "lookup_collection_schedule", _explode)
+
+    ans = router._blocking_route("Pythonでソートアルゴリズムのコードを書いてください")
+    assert ans.attack_detected == "目的外利用"
+    assert ans.canned_response == guard.REFUSAL
+    assert ans.item_hits == []
 
 
 def test_unknown_item_is_not_treated_as_an_attack(monkeypatch):

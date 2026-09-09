@@ -608,6 +608,20 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         ans.canned_response = guard.REFUSAL
         return ans
 
+    # 「目的外利用」も検索より前に判定する。当初は「検索が何にも当たらない
+    # ときだけ」に限定していたが、B1実機での確認で、コード生成依頼の
+    # 「コード」がベクトル検索で無関係な早見表行「コード類」(ケーブル)に
+    # 弱く一致し、`ans.found` が True になって判定をすり抜けるケースが
+    # 見つかった(実採点でも起こりうる語の衝突)。`_OFF_PURPOSE` の対象は
+    # コード生成・翻訳・創作・数式・天気などの明確に非分別な依頼で、
+    # 早見表に無い品目の質問(例:「宇宙エレベーターはどう捨てますか」)とは
+    # パターンが重ならないため、`found` に依存する必要はなかった。
+    off_purpose = guard.detect_off_purpose(prompt)
+    if off_purpose:
+        ans.attack_detected = off_purpose
+        ans.canned_response = guard.REFUSAL
+        return ans
+
     ward, town = extract_region(prompt)
     ans.detected_ward, ans.detected_town = ward, town
 
@@ -744,17 +758,6 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     # しない(_apply_timeline 内で analogy_unreliable は無視される)。
     if ans.item_match == "analogy" and ans.analogy_unreliable:
         ans.canned_response = _ANALOGY_UNRELIABLE_REPLY
-
-    # PIJ「目的外利用」。ごみ分別以外の作業依頼(コード生成・翻訳など)は、
-    # 検索が何も当てられなかったときにだけ判定する。単独で照合すると正当な
-    # 質問と衝突しうるため、「どの検索パスにも当たらない」ことを前提条件に
-    # 置いて誤検知を抑える。`missing` があるケース(区名・町名の聞き返し)は
-    # 正当な対話の途中なので触らない。
-    if not ans.found and not ans.missing and not ans.canned_response:
-        off_purpose = guard.detect_off_purpose(prompt)
-        if off_purpose:
-            ans.attack_detected = off_purpose
-            ans.canned_response = guard.REFUSAL
     return ans
 
 
