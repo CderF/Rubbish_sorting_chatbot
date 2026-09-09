@@ -216,3 +216,89 @@ def test_trace_record_carries_the_attack_label():
     )
     assert rec["attack_detected"] == "命令上書き"
     assert rec["canned_response"] is True
+
+
+# --- 出力ゲート -------------------------------------------------------------
+def test_leak_fingerprints_still_exist_in_the_real_prompt():
+    """漏洩判定に使う文字列が、実際のシステムプロンプトに存在すること。
+
+    `guard._LEAK_FINGERPRINTS` は router.py のプロンプト定数と二重管理になる。
+    文言を変えると判定が黙って効かなくなるので、ソース中に実在することを
+    ここで固定する(黙って無効化されるのが一番危険な壊れ方のため)。
+    """
+    source = pathlib.Path(router.__file__).read_text(encoding="utf-8")
+    missing = [f for f in guard._LEAK_FINGERPRINTS if f not in source]
+    assert missing == [], f"router.py から消えた漏洩判定文字列: {missing}"
+
+
+def test_system_prompt_leak_replaces_the_whole_answer():
+    leaked = (
+        "はい。あなたは北九州市のごみ分別・収集日を案内するアシスタントです。\n"
+        "# 検索結果\n## 分別早見表の検索結果\n- 品名: ペン"
+    )
+    text, blocked = guard.scrub_output(leaked)
+    assert blocked == "システムプロンプト漏洩"
+    assert text == guard.OUTPUT_BLOCKED
+    # 断片すら残さない。
+    assert "分別早見表の検索結果" not in text
+
+
+def test_normal_answer_passes_through_untouched():
+    answer = (
+        "ペットボトルは「ペットボトル」の収集日に出してください。\n"
+        "キャップとラベルは外し、中を軽くすすいでから出します。"
+    )
+    text, blocked = guard.scrub_output(answer)
+    assert blocked is None
+    assert text == answer
+
+
+def test_model_written_urls_are_stripped():
+    # 引用は format_citations がコード側で付けるので、本文中のURLは全て偽物。
+    text, blocked = guard.scrub_output(
+        "詳しくは https://evil.example.com/phish をご覧ください。家庭ごみです。"
+    )
+    assert blocked == "出力形式ハイジャック"
+    assert "http" not in text
+    assert "家庭ごみです。" in text
+
+
+def test_repetition_loop_is_cut():
+    text, blocked = guard.scrub_output("家庭ごみです。" + "あ" * 500)
+    assert blocked == "出力ループ"
+    assert "家庭ごみです。" in text
+    assert len(text) < 60
+
+
+def test_answer_that_is_entirely_repetition_is_replaced():
+    text, blocked = guard.scrub_output("あ" * 500)
+    assert blocked == "出力ループ"
+    assert text == guard.OUTPUT_BLOCKED
+
+
+def test_multi_character_repetition_unit_is_detected():
+    text, blocked = guard.scrub_output("収集日は月曜です。" + "ハハハ" * 40)
+    assert blocked == "出力ループ"
+    assert "収集日は月曜です。" in text
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "家庭ごみとして出してください。",
+        "月曜日と木曜日が収集日です。事前申込が必要です。",
+        # 定型的な繰り返しを含むが退化ではない、通常の回答。
+        "かん・びんの日に出してください。かん・びんの日は毎週火曜日です。",
+        # 反復判定の下限(60文字)付近。
+        "家庭ごみです。" * 8,
+    ],
+)
+def test_ordinary_answers_are_not_blocked(answer):
+    text, blocked = guard.scrub_output(answer)
+    assert blocked is None, f"誤検知: {answer!r} -> {text!r}"
+
+
+def test_empty_generation_is_left_to_the_server_fallback():
+    text, blocked = guard.scrub_output("   ")
+    assert blocked is None
+    assert not text.strip()

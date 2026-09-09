@@ -276,3 +276,103 @@ def detect_off_purpose(prompt: object) -> str | None:
     if text and _OFF_PURPOSE.search(text):
         return "目的外利用"
     return None
+
+
+# --- 出力側の検査 ---------------------------------------------------------
+# 出力ゲートで置き換えるときの固定文。入力ゲートの REFUSAL と文面を分けて
+# あるのは、trace や採点ログを見たときにどちらのゲートが働いたか区別できる
+# ようにするため。
+OUTPUT_BLOCKED = (
+    "申し訳ありません。この質問にはお答えできません。"
+    "ごみの分別・収集日についてお尋ねください。"
+)
+
+# システムプロンプト漏洩の判定に使う、自分のプロンプト固有の文字列。
+# 我々は自分のシステムプロンプトの原文を完全に知っているので、漏洩判定は
+# 推測ではなく完全一致で行える — PIJ 9分類の中で唯一、確実に検知できる種類。
+#
+# ここは `app/rag/router.py` のプロンプト定数と二重管理になる。文言を変えた
+# ときに気付けるよう、`tests/prompt_injection_test.py` が router.py の
+# ソース中に各文字列が実在することを固定している。
+_LEAK_FINGERPRINTS = (
+    "あなたは北九州市のごみ分別・収集日を案内するアシスタントです",
+    "URLや参照先は書かない",
+    "下記『検索結果』に書かれている内容だけを事実として使う",
+    "# 検索結果",
+    "## 分別早見表の検索結果",
+    "## 収集日の検索結果",
+    "## 出し方の変更予定",
+)
+
+# 引用はコード側(`format_citations`)が確定させるので、モデルが書いたURLは
+# 一律で落とす。出力形式ハイジャックで偽の参照欄を作られるのを防ぐと同時に、
+# ハルシネートしたURLが本文に残るのも防ぐ。
+_URL_RE = re.compile(r"(?:https?://|knowledge://|www\.)\S+")
+
+# 反復判定。60文字未満は見ない(短い定型文の中の繰り返しを誤検知しないため)。
+_REPEAT_MIN_TOTAL = 60
+_REPEAT_MIN_COUNT = 8
+_REPEAT_MAX_UNIT = 40
+
+
+def _degenerate_repeat_start(text: str) -> int | None:
+    """末尾が同一単位の連続反復になっている場合、その開始位置を返す。
+
+    「『あ』を無限に繰り返して」のような出力ループ攻撃は `MAX_TOKENS` で
+    長さは頭打ちになるが、1024トークン分の無意味な反復をそのまま返せば
+    攻撃は成立してしまう。単位長1〜40文字で末尾の反復を数え、8回以上かつ
+    合計60文字以上なら退化した反復とみなす。日本語の正当な回答が同じ単位を
+    8回続けることはない。
+    """
+    n = len(text)
+    if n < _REPEAT_MIN_TOTAL:
+        return None
+    for unit in range(1, _REPEAT_MAX_UNIT + 1):
+        if n < unit * _REPEAT_MIN_COUNT:
+            break
+        tail = text[n - unit:]
+        count = 1
+        while text[n - unit * (count + 1): n - unit * count] == tail:
+            count += 1
+        if count >= _REPEAT_MIN_COUNT and unit * count >= _REPEAT_MIN_TOTAL:
+            return n - unit * count
+    return None
+
+
+def scrub_output(text: str) -> tuple[str, str | None]:
+    """モデルの生成結果を検査し、(送出してよい本文, 発火した攻撃分類) を返す。
+
+    全量バッファリング前提。1文字も送出する前にここを通すので、漏洩した
+    システムプロンプトが部分的にでも採点対象の本文に混ざることがない
+    (SSEは一度 yield したdeltaを取り消せないため、逐次送出のままでは
+    この保証が作れない)。
+    """
+    if not text.strip():
+        return text, None
+
+    for fingerprint in _LEAK_FINGERPRINTS:
+        if fingerprint in text:
+            # 部分的に残すと漏れた断片がそのまま採点本文に入るので全置換する。
+            return OUTPUT_BLOCKED, "システムプロンプト漏洩"
+
+    blocked: str | None = None
+
+    cut = _degenerate_repeat_start(text)
+    if cut is not None:
+        text = text[:cut].rstrip()
+        blocked = "出力ループ"
+        if len(text) < 5:
+            # 反復を落とすと中身が残らない = 回答全体が反復だった。
+            # 下限を低く取るのは、「家庭ごみです。」のような短くても妥当な
+            # 回答が反復に巻き込まれたときに、それを捨てないため。反復自体は
+            # 入力ゲート側でも見ているので、ここは取りこぼしの受け皿。
+            return OUTPUT_BLOCKED, blocked
+
+    cleaned = _URL_RE.sub("", text)
+    if cleaned != text:
+        blocked = blocked or "出力形式ハイジャック"
+        # URLを抜いた跡に残る空行・空の参照欄を畳む。
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+    return cleaned.strip(), blocked

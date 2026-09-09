@@ -19,6 +19,10 @@ Contract notes that shaped this file (from the grading spec):
   * The same session_id is reused across turns of one question (stages 5 / 6-3);
     conversation state must be kept per session_id.
   * Up to 4 concurrent requests per team.
+  * PIJ(プロンプトインジェクション)対策として、生成は全量バッファリングして
+    から1フレームで送出する。SSE は一度送った delta を取り消せないため、
+    逐次送出のままではシステムプロンプト漏洩・反復ループを検知しても本文に
+    混ざったあとになる。フレーム形式は仕様どおり data: {"delta": ...} のまま。
 
 Model: Qwen3-VL-8B-Instruct, served in-process via vLLM AsyncLLMEngine.
 """
@@ -79,6 +83,11 @@ MAX_MODEL_LEN = 8192
 MAX_TOKENS = 1024
 # Keep at most this many sessions in memory (grader issues a new id per question).
 MAX_SESSIONS = 256
+# 生成の打ち切り時刻(秒)。採点は1ターン120秒なので、その内側で必ず返す。
+# 実測は765トークンで約30秒(≒24tok/s)、MAX_TOKENS まで回しても約42秒なので、
+# 通常の生成がここに当たることはない。反復ループ等で生成が伸びたときに、
+# 全量バッファリングのまま時間切れになるのを防ぐための上限。
+GENERATION_DEADLINE_S = 90
 # Never return an empty body — that fails the question outright.
 EMPTY_FALLBACK = "申し訳ありません。回答を生成できませんでした。もう一度お試しください。"
 
@@ -337,26 +346,50 @@ async def _stream_chat(
     first_token_at = None
     prev_text = ""
     n_tokens = 0
+    deadline_hit = False
 
+    # PIJ対策: 生成が終わるまで1文字も送出しない(全量バッファリング)。
+    #
+    # SSE は一度 yield した delta を取り消せず、採点側は delta を連結した
+    # 文字列をそのまま回答として読む。逐次送出のままでは、システムプロンプト
+    # の漏洩や反復ループを検知できても「検知した時点で既に本文に混ざっている」
+    # ため、出力側の検査が意味を持たない。全部生成してから `guard.scrub_output`
+    # を通すことで、送出前に必ず1回検査されることを構造的に保証する。
+    #
+    # 代償は「最初の1文字がクライアントに届くまでの時間」で、生成そのものの
+    # 所要時間は変わらない(warm状態で765トークン約30秒、1ターン120秒の制限に
+    # 対して余裕がある)。ただし逐次送出と違い、遅い生成では最後まで何も届か
+    # ないので、`GENERATION_DEADLINE_S` で必ず制限内に打ち切る。
+    # `first_token_s` は引き続きモデルの初トークン時刻を測る。
     async for request_output in engine.generate(prompt_input, sampling_params, request_id):
         text = request_output.outputs[0].text
-        delta = text[len(prev_text):]
-        prev_text = text
-        if delta:
+        if len(text) > len(prev_text):
             if first_token_at is None:
                 first_token_at = time.perf_counter()
             n_tokens += 1
-            yield f"data: {json.dumps({'delta': delta}, ensure_ascii=False)}\n\n"
+        prev_text = text
+        if time.perf_counter() - start > GENERATION_DEADLINE_S:
+            # ここで抜けると async generator が閉じられ、vLLM 側で当該
+            # リクエストが中断される。ここまでに生成された分を回答として使う
+            # (全量バッファリングなので、打ち切っても本文は必ず1回検査される)。
+            deadline_hit = True
+            break
+
+    prev_text, blocked = guard.scrub_output(prev_text)
 
     # An empty body fails the question outright, so always say something.
     if not prev_text.strip():
         prev_text = EMPTY_FALLBACK
-        yield f"data: {json.dumps({'delta': EMPTY_FALLBACK}, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps({'delta': prev_text}, ensure_ascii=False)}\n\n"
 
     # 引用はLLMに書かせず、検索結果から確定したURLをここで本文に足す
     # (STAGE02 2-2「根拠を参照ページまで示せる」。採点側は delta を連結した
     #  文字列だけを見るため、WebUI表示のみに留めず本文に含める)。
-    citations = router.format_citations(routed) if routed is not None else ""
+    # 出力ゲートが発火した回答には付けない — 本文を固定文に差し替えている
+    # ので、退けた内容の参照だけが残るのは誤解を招く(4-3 の canned と同じ判断)。
+    citations = (
+        router.format_citations(routed) if routed is not None and not blocked else ""
+    )
     if citations:
         prev_text += citations
         yield f"data: {json.dumps({'delta': citations}, ensure_ascii=False)}\n\n"
@@ -376,6 +409,8 @@ async def _stream_chat(
         session_id=session_id,
         retrieval=None if routed is None else {
             "item": routed.detected_item,
+            "output_blocked": blocked,
+            "deadline_hit": deadline_hit,
             "ward": routed.detected_ward,
             "town": routed.detected_town,
             "item_hits": len(routed.item_hits),
