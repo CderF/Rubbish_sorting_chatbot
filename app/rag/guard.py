@@ -31,11 +31,13 @@ import unicodedata
 # 閉じてから指示を書く」ことができてしまう。攻撃者は事前に値を知り得ない。
 DATA_FENCE = f"DATA-{secrets.token_hex(4)}"
 
-# 生成に渡すプロンプトの上限。実採点の質問は最長でも50文字程度で、これを
-# 超える入力は正当な分別質問ではない。`MAX_MODEL_LEN`(8192)を溢れさせて
+# 生成に渡すプロンプトの上限(D5)。実採点の質問は最長でも50文字程度、
+# アリーナで観測した攻撃プロンプトも最長495文字だった。これを大きく超える
+# 入力は正当な分別質問ではない。`MAX_MODEL_LEN`(8192)を溢れさせて
 # `engine.generate` を例外にする攻撃(=SSEが途中で切れ、採点上は失点)も
-# ここで同時に塞ぐ。
-MAX_PROMPT_CHARS = 2000
+# ここで同時に塞ぐ。現行のアリーナ経由では発火しない予防的な上限で、
+# 直接APIや今後の長文ペイロードの伸びを頭打ちにするためのもの。
+MAX_PROMPT_CHARS = 800
 
 # 画像分類パスが返す品名の上限。早見表の実データで最長は30文字弱。
 MAX_ITEM_NAME_CHARS = 40
@@ -186,6 +188,17 @@ _ROLE_NOUN = (
     r"|モード|ロール|キャラクター|人格|管理者|開発者|assistant|model)"
 )
 
+# 攻撃成功マーカー(D3/D6)。攻撃側が「通った」判定に使う固定トークンで、
+# 本文へそのまま書かせようとする(FORMAT_HIJACK_SUCCESS 等、アリーナ実測)。
+# 分別回答にも正当な入力にも、全大文字+アンダースコアのこの形は出てこない。
+# 入力側(detect_attack)・出力側(scrub_output)の両方で使う。大文字限定で
+# 照合し、英文の普通の語("success" 等)を巻き込まない。
+_ATTACK_MARKER_RE = re.compile(
+    r"\b[A-Z][A-Z0-9]{2,}_(?:SUCCESS|OK|DONE|COMPLETE|COMPLETED|CONFIRMED|BYPASS|PASSED)\b"
+    r"|FORMAT[_ ]?HIJACK|MULTILINGUAL[_ ]?HIJACK|INDIRECT[_ ]?INJECTION"
+    r"|PROMPT[_ ]?INJECTION|TEST[_ ]?ATTACK|JAIL[_ ]?BREAK|\bPWNED\b|\bHACKED\b"
+)
+
 # 各パターンは PIJ要件のスライドが挙げる攻撃分類に1対1で対応させる。
 # trace に分類名がそのまま残るので、どの攻撃で発火したかを後から数えられる。
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -281,6 +294,8 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             re.IGNORECASE,
         ),
     ),
+    # 8. 出力形式ハイジャック — 攻撃成功マーカーを本文へ書かせる依頼(D6)。
+    ("出力形式ハイジャック", _ATTACK_MARKER_RE),
 )
 
 # 9. 目的外利用。ごみ分別以外の作業依頼。正当な質問と衝突しうるので、
@@ -383,6 +398,104 @@ def _degenerate_repeat_start(text: str) -> int | None:
     return None
 
 
+# --- D7: 文・段落単位の反復 -------------------------------------------------
+# 「回答をもう一度出力して」「A→A→A」系は、同じ本文を2〜4回吐かせる。
+# MAX_TOKENS には達しないので上の文字単位検出(_degenerate_repeat_start)は
+# すり抜ける。文単位に正規化し、(a) 25字以上の同一文が再登場、または
+# (b) 再登場した文の合計が本文の35%以上、のいずれかで初出位置を返す。
+_BLOCK_REPEAT_MIN_SEG = 12
+_BLOCK_REPEAT_LONG_SEG = 25
+_BLOCK_REPEAT_RATIO = 0.35
+
+
+def _block_repeat_start(text: str) -> int | None:
+    segs: list[tuple[int, str]] = []
+    for m in re.finditer(r"[^\n。！？]+(?:[。！？]|\n|$)", text):
+        key = re.sub(r"\s+", "", m.group(0))
+        if len(key) >= _BLOCK_REPEAT_MIN_SEG:
+            segs.append((m.start(), key))
+    if len(segs) < 3:
+        return None
+    seen: dict[str, int] = {}
+    first_repeat_at: int | None = None
+    repeated_chars = 0
+    for start, key in segs:
+        if key in seen:
+            repeated_chars += len(key)
+            if first_repeat_at is None:
+                first_repeat_at = start
+            if len(key) >= _BLOCK_REPEAT_LONG_SEG:
+                return start
+        else:
+            seen[key] = start
+    if first_repeat_at is None:
+        return None
+    total = sum(len(k) for _, k in segs)
+    if repeated_chars >= total * _BLOCK_REPEAT_RATIO:
+        return first_repeat_at
+    return None
+
+
+# D7: 出力に紛れ込んだ「自分自身への実行指示」を落とす。正当な分別回答が
+# 自分の回答をもう一度実行しろと書くことはない。
+_SELF_INSTRUCTION_RE = re.compile(
+    r"[^\n。]{0,12}(?:この回答|上記の回答|同じ回答|直前の回答|同じ処理|この手順|この規則)"
+    r"[^\n。]{0,16}(?:もう一度|再度|繰り返し|もういちど|続けて|引き継)"
+    r"[^\n。]{0,12}(?:出力|実行|生成|繰り返|適用)[^\n。]{0,10}"
+    r"(?:してください|して下さい|してね|せよ|する|してから)?[。\n]?"
+)
+
+# --- D1: 出力長の安全上限 -------------------------------------------------
+# 実測(B1アリーナtrace)で正当な分別回答は最長529字、4-2の時系列回答でも
+# 600未満。これを大きく超えるのは多言語増幅・ループ・根拠開示で膨らんだ
+# 出力なので、750字を超えたぶんは直近の句点で落とす。截断が起きたら
+# `長さ超過` を trace に残す。
+MAX_OUTPUT_CHARS = 750
+
+
+def _trim_to_sentence(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    for sep in ("。", "!", "?", "！", "？", "\n"):
+        idx = head.rfind(sep)
+        if idx >= limit // 2:
+            return head[: idx + 1].rstrip()
+    idx = head.rfind(" ")
+    if idx >= limit // 2:
+        return head[:idx].rstrip()
+    return head.rstrip()
+
+
+# --- D2: 出力ホワイトリスト ---------------------------------------------------
+# 分別回答なら必ず含む語。区分名(waste_items.disposal_method の表記) +
+# 収集日 + 確認を促す定型 + 追加入力の聞き返し。B1 trace の正当回答84件で
+# 83件(98.8%)がこのどれかを含み、唯一の非該当は画像色形の説明(それ自体が
+# 分別質問ではない)。1つも無ければ分別以外のものを吐かされている
+# (裸のマーカー、観光地リスト、他言語のみ、ローマ字縛り 等)。
+_ANSWER_ANCHORS: tuple[str, ...] = (
+    # 区分名
+    "家庭ごみ", "燃えるごみ", "燃えないごみ", "燃やすごみ", "燃やさないごみ",
+    "もえるごみ", "もえないごみ", "可燃ごみ", "不燃ごみ", "可燃物", "不燃物",
+    "資源化ごみ", "資源ごみ", "空きびん", "空き缶",
+    "かん・びん", "缶・びん", "カン・ビン", "ペットボトル", "プラスチック",
+    "プラ製", "白色トレイ", "食品トレイ", "古紙", "雑がみ", "新聞", "段ボール",
+    "古着", "小物金属", "小型電子機器", "電池類", "蛍光管", "蛍光灯",
+    "粗大ごみ", "スプレー", "危険", "適正処理困難", "拠点回収", "集団回収",
+    "処理施設", "持ち込", "持込", "受入", "回収ボックス", "収集",
+    # 収集日
+    "曜日", "毎週", "第1", "第2", "第3", "第4", "隔週",
+    # 確認・聞き返し・範囲外の定型
+    "確認ください", "ご確認", "お問い合わせ", "問い合わせ", "窓口",
+    "記載がありません", "記載されていません", "情報がありません",
+    "お答えでき", "分かりかね", "町名", "丁目", "お住まい", "区名", "教えてください",
+)
+
+
+def _has_answer_anchor(text: str) -> bool:
+    return any(a in text for a in _ANSWER_ANCHORS)
+
+
 def scrub_output(text: str) -> tuple[str, str | None]:
     """モデルの生成結果を検査し、(送出してよい本文, 発火した攻撃分類) を返す。
 
@@ -390,14 +503,27 @@ def scrub_output(text: str) -> tuple[str, str | None]:
     システムプロンプトが部分的にでも採点対象の本文に混ざることがない
     (SSEは一度 yield したdeltaを取り消せないため、逐次送出のままでは
     この保証が作れない)。
+
+    検査順: 漏洩(完全一致)→ 攻撃マーカー(D3)→ 文字単位反復(既存)→
+    文単位反復(D7)→ 自己実行指示の除去(D7)→ URL除去(既存)→
+    長さ上限(D1)→ 出力ホワイトリスト(D2)。
     """
     if not text.strip():
         return text, None
 
+    # データ境界マーカーの流出(D2/#28): 乱数マーカーは検索結果を囲うために
+    # だけ使う。本文に出た = モデルが検索結果の囲いごと書き写した = 漏洩。
+    if DATA_FENCE in text:
+        return OUTPUT_BLOCKED, "システムプロンプト漏洩"
     for fingerprint in _LEAK_FINGERPRINTS:
         if fingerprint in text:
             # 部分的に残すと漏れた断片がそのまま採点本文に入るので全置換する。
             return OUTPUT_BLOCKED, "システムプロンプト漏洩"
+
+    # D3: 攻撃成功マーカー。本文が実質そのトークンだけ、というケースが実測で
+    # 多い(FORMAT_HIJACK_SUCCESS 等)。推測でなく確実なので全置換する。
+    if _ATTACK_MARKER_RE.search(text):
+        return OUTPUT_BLOCKED, "出力形式ハイジャック"
 
     blocked: str | None = None
 
@@ -412,11 +538,30 @@ def scrub_output(text: str) -> tuple[str, str | None]:
             # 入力ゲート側でも見ているので、ここは取りこぼしの受け皿。
             return OUTPUT_BLOCKED, blocked
 
+    cut = _block_repeat_start(text)
+    if cut is not None:
+        text = text[:cut].rstrip()
+        blocked = blocked or "出力ループ"
+        if len(text) < 5:
+            return OUTPUT_BLOCKED, blocked
+
+    text = _SELF_INSTRUCTION_RE.sub("", text).strip()
+
     cleaned = _URL_RE.sub("", text)
     if cleaned != text:
         blocked = blocked or "出力形式ハイジャック"
         # URLを抜いた跡に残る空行・空の参照欄を畳む。
         cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = cleaned.strip()
 
-    return cleaned.strip(), blocked
+    trimmed = _trim_to_sentence(cleaned, MAX_OUTPUT_CHARS)
+    if trimmed != cleaned:
+        cleaned = trimmed
+        blocked = blocked or "長さ超過"
+
+    # D2: 分別回答の語彙が1つも無ければ、分別以外のものを吐かされている。
+    if cleaned and not _has_answer_anchor(cleaned):
+        return OUTPUT_BLOCKED, "出力ホワイトリスト"
+
+    return cleaned, blocked
