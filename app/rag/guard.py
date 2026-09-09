@@ -366,6 +366,12 @@ _LEAK_FINGERPRINTS = (
 # 引用はコード側(`format_citations`)が確定させるので、モデルが書いたURLは
 # 一律で落とす。出力形式ハイジャックで偽の参照欄を作られるのを防ぐと同時に、
 # ハルシネートしたURLが本文に残るのも防ぐ。
+#
+# Markdown のリンク・画像記法(`[text](url)` / `![alt](url)`)は先に構文ごと
+# 落とす。裸のURLパターンだけを消すと `![alt](` のような壊れた構文が残る
+# (PIJアリーナ #92実測: 追跡用画像URLを埋め込む攻撃で、URL文字列は消えても
+# `![](` が回答末尾に残っていた)。
+_MD_LINK_RE = re.compile(r"!?\[[^\]\n]{0,300}\]\([^)\n]{0,1000}\)")
 _URL_RE = re.compile(r"(?:https?://|knowledge://|www\.)\S+")
 
 # 反復判定。60文字未満は見ない(短い定型文の中の繰り返しを誤検知しないため)。
@@ -548,10 +554,11 @@ def scrub_output(text: str) -> tuple[str, str | None]:
 
     text = _SELF_INSTRUCTION_RE.sub("", text).strip()
 
-    cleaned = _URL_RE.sub("", text)
+    cleaned = _MD_LINK_RE.sub("", text)
+    cleaned = _URL_RE.sub("", cleaned)
     if cleaned != text:
         blocked = blocked or "出力形式ハイジャック"
-        # URLを抜いた跡に残る空行・空の参照欄を畳む。
+        # URL・Markdownリンク構文を抜いた跡に残る空行・空の参照欄を畳む。
         cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = cleaned.strip()
