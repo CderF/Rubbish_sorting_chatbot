@@ -292,14 +292,25 @@ async def _route_safely(prompt: str, img: str | None):
 # streaming
 # --------------------------------------------------------------------------
 async def _stream_chat(
-    session_id: str, prompt: str, img: str | None, with_sources: bool = False
+    session_id: str,
+    prompt: str,
+    img: str | None,
+    with_sources: bool = False,
+    client: str = "",
 ):
     request_id = f"{session_id}-{uuid.uuid4().hex[:8]}"
     sampling_params = SamplingParams(temperature=0.3, max_tokens=MAX_TOKENS)
 
+    # 会話履歴のキーは session_id 単体ではなく送信元IPとの組にする。
+    # session_id はリクエスト本文でクライアントが自由に指定できるので、単体を
+    # キーにすると、他人の session_id を当てるだけでその会話履歴が次の応答の
+    # 文脈として読み出せてしまう(PIJ「情報抽出」)。採点サーバーは単一IPから
+    # 来るため、仕様どおりの複数ターン継続はこの変更の影響を受けない。
+    session_key = f"{client}|{session_id}"
+
     turn = _build_messages(prompt, img)
     async with _sessions_lock:
-        history = sessions.get(session_id, [])
+        history = sessions.get(session_key, [])
         messages = history + turn
 
     # 検索結果はシステムメッセージとして毎ターン先頭に差し込む。会話履歴には
@@ -312,10 +323,10 @@ async def _stream_chat(
         text = routed.canned_response
         yield f"data: {json.dumps({'delta': text}, ensure_ascii=False)}\n\n"
         async with _sessions_lock:
-            sessions[session_id] = messages + [
+            sessions[session_key] = messages + [
                 {"role": "assistant", "content": text}
             ]
-            sessions.move_to_end(session_id)
+            sessions.move_to_end(session_key)
             while len(sessions) > MAX_SESSIONS:
                 sessions.popitem(last=False)
         last_timing.update(
@@ -422,8 +433,8 @@ async def _stream_chat(
 
     # Persist the turn so the next request with this session_id continues it.
     async with _sessions_lock:
-        sessions[session_id] = messages + [{"role": "assistant", "content": prev_text}]
-        sessions.move_to_end(session_id)
+        sessions[session_key] = messages + [{"role": "assistant", "content": prev_text}]
+        sessions.move_to_end(session_key)
         while len(sessions) > MAX_SESSIONS:
             sessions.popitem(last=False)
 
@@ -432,10 +443,14 @@ async def _stream_chat(
 
 
 def _sse(
-    session_id: str, prompt: str, img: str | None, with_sources: bool = False
+    session_id: str,
+    prompt: str,
+    img: str | None,
+    with_sources: bool = False,
+    client: str = "",
 ) -> StreamingResponse:
     return StreamingResponse(
-        _stream_chat(session_id, prompt, img, with_sources),
+        _stream_chat(session_id, prompt, img, with_sources, client),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -448,7 +463,7 @@ async def chat(request: Request):
     if client not in GRADER_IPS:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
     session_id, prompt, img = await _parse_request(request)
-    return _sse(session_id, prompt, img)
+    return _sse(session_id, prompt, img, client=client)
 
 
 @app.post("/ui/chat")
@@ -459,7 +474,8 @@ async def ui_chat(request: Request, _=Depends(require_login)):
     返す。採点用の /chat は仕様どおり delta のみ。
     """
     session_id, prompt, img = await _parse_request(request)
-    return _sse(session_id, prompt, img, with_sources=True)
+    client = request.client.host if request.client else ""
+    return _sse(session_id, prompt, img, with_sources=True, client=client)
 
 
 # --------------------------------------------------------------------------

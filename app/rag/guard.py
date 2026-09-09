@@ -23,7 +23,13 @@
 from __future__ import annotations
 
 import re
+import secrets
 import unicodedata
+
+# 検索結果をシステムプロンプトに埋めるときの境界マーカー。プロセス起動ごとに
+# 引き直すのが要点で、固定文字列だと外部データ側に同じ文字列を書いて「囲いを
+# 閉じてから指示を書く」ことができてしまう。攻撃者は事前に値を知り得ない。
+DATA_FENCE = f"DATA-{secrets.token_hex(4)}"
 
 # 生成に渡すプロンプトの上限。実採点の質問は最長でも50文字程度で、これを
 # 超える入力は正当な分別質問ではない。`MAX_MODEL_LEN`(8192)を溢れさせて
@@ -96,6 +102,44 @@ def sanitize_item_name(text: object) -> str:
     cleaned = normalize_input(text)
     cleaned = " ".join(cleaned.split())
     return cleaned[:MAX_ITEM_NAME_CHARS]
+
+
+# 取り込むテキストの上限。配布お知らせの実データは本文が最長109文字、
+# タイトル36文字。5倍以上の余裕を取りつつ、注入されたペイロードの長さは
+# 抑える。正当なデータが切られることは実質ない。
+MAX_BODY_CHARS = 600
+MAX_TITLE_CHARS = 200
+
+# 行頭のマークダウン見出し・引用記号。`_build_context` は `## 見出し` で
+# セクションを区切るので、取り込むテキストにこれが残っていると偽のセクション
+# ("## 分別早見表の検索結果" 等)を作られる。
+_LINE_MARKUP_RE = re.compile(r"^[ \t]*[#>*\-=+]+[ \t]*", re.MULTILINE)
+
+# 行頭の疑似ロール宣言。同上の理由で落とす。
+_LINE_ROLE_RE = re.compile(
+    r"^[ \t]*(?:system|assistant|user|developer)[ \t]*[:：]",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def sanitize_text(text: object, max_chars: int = MAX_BODY_CHARS) -> str:
+    """外部データ由来のテキストを、`context` に載せられる形に均す。
+
+    PIJ「間接注入」対策。配布お知らせの本文やクロールしたページの備考は、
+    `build_system_prompt` を通してシステムプロンプトの一部になる — ユーザー
+    入力より強い位置に入るので、入力側より丁寧に潰す必要がある。
+
+    改行を空白に畳むのは、注入対策であると同時に構造上の修正でもある。
+    `_build_context` は `- 品名: …` / `  出し方: …` のインデントで項目を
+    並べるが、実データの本文には改行が含まれており(配布15件中の 4-1 全件)、
+    そのまま埋めると2行目がインデントの外に出て、あたかも別の項目や別の
+    セクションであるかのように見える。
+    """
+    cleaned = normalize_input(text)
+    cleaned = _LINE_MARKUP_RE.sub("", cleaned)
+    cleaned = _LINE_ROLE_RE.sub("", cleaned)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:max_chars]
 
 
 # --- 攻撃判定 -------------------------------------------------------------

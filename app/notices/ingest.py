@@ -40,6 +40,7 @@ from pathlib import Path
 
 from app.data.schema import WasteItem
 from app.notices import store
+from app.rag import guard
 from app.notices.notice_parser import Notice, parse_notice_file
 
 # 語順違い(使い捨てライター→ライター)は LIKE では拾えないので、任意でベクトル
@@ -147,6 +148,16 @@ class RelinkResult:
         return line
 
 
+def _url_part(text: str) -> str:
+    """Sanitize a filename / anchor before it goes into `source_url`.
+
+    `source_url` is appended to the answer body verbatim by `format_citations`,
+    so anything here reaches the graded text. Spaces are dropped as well —
+    `sanitize_text` folds newlines to spaces, which a URL must not carry.
+    """
+    return guard.sanitize_text(text, max_chars=120).replace(" ", "")
+
+
 def build_source_url(notice: Notice) -> str:
     """Citation target for a distributed file.
 
@@ -155,31 +166,44 @@ def build_source_url(notice: Notice) -> str:
     column is NOT NULL and requirement 2-2 needs a citation) while making it
     obvious the source is a distributed file rather than the city's site.
     """
-    return f"{store.KNOWLEDGE_SCHEME}{notice.source_file}#{notice.anchor}"
+    return (
+        f"{store.KNOWLEDGE_SCHEME}{_url_part(notice.source_file)}"
+        f"#{_url_part(notice.anchor)}"
+    )
 
 
 def build_notes(notice: Notice) -> str:
-    parts = [notice.title]
+    parts = [guard.sanitize_text(notice.title, max_chars=guard.MAX_TITLE_CHARS)]
     if notice.is_change_notice:
         until = (
             notice.prior_valid_until.isoformat() if notice.prior_valid_until else "不明"
         )
-        parts.append(
-            f"現行（早見表）の「{notice.prior_disposal_method}」としての扱いは{until}まで有効。"
+        prior = guard.sanitize_text(
+            notice.prior_disposal_method or "", max_chars=guard.MAX_TITLE_CHARS
         )
+        parts.append(f"現行（早見表）の「{prior}」としての扱いは{until}まで有効。")
     if notice.issuer:
-        parts.append(notice.issuer)
+        parts.append(guard.sanitize_text(notice.issuer, max_chars=guard.MAX_TITLE_CHARS))
     return " / ".join(p for p in parts if p)
 
 
 def notice_to_waste_item(notice: Notice, ingested_at: datetime) -> WasteItem:
+    """Convert one parsed notice into a `waste_items` row.
+
+    Every field taken from the distributed file is sanitized here (PIJ
+    「間接注入」対策). These files arrive during grading and their text ends up
+    inside the *system* prompt via `build_system_prompt` — a stronger position
+    than user input — so the cleaning happens once, at the only write path into
+    the DB, rather than on every read.
+    """
+    title = guard.sanitize_text(notice.title, max_chars=guard.MAX_TITLE_CHARS)
     return WasteItem(
-        item_name=notice.item_name,  # NFKC-normalized by the model validator
-        item_name_raw=notice.heading,
-        disposal_method=notice.body,
+        item_name=guard.sanitize_item_name(notice.item_name),  # validator も NFKC する
+        item_name_raw=guard.sanitize_item_name(notice.heading),
+        disposal_method=guard.sanitize_text(notice.body),
         notes=build_notes(notice),
         source_url=build_source_url(notice),
-        source_page_title=notice.title or None,
+        source_page_title=title or None,
         crawled_at=ingested_at,
         is_current=True,
         effective_from=notice.effective_from,
@@ -227,6 +251,16 @@ def ingest_notices(
 
     for notice in notices:
         result.warnings.extend(f"{notice.anchor}: {w}" for w in notice.warnings)
+
+        # 取り込みは止めない(正当なお知らせを落とす方が損害が大きい)。
+        # 本文は sanitize 済みでシステムプロンプトの構造は壊せないが、
+        # 配布ファイルに指示文が混ざっていた事実自体は運用者に見せる。
+        attack = guard.detect_attack(notice.body)
+        if attack:
+            result.warnings.append(
+                f"{notice.anchor}: 本文に指示文らしき記述({attack})。"
+                "取り込みは行うが内容を確認すること"
+            )
 
         if store.is_ingested(conn, notice.content_hash):
             result.skipped.append(notice.item_name)
