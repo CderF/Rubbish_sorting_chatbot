@@ -71,6 +71,11 @@ def lookup_item_partial(item_name: str, limit: int = 10) -> list[_StubItem]:
     return hits[:limit]
 
 
+def lookup_towns(ward: str) -> list[str]:
+    key = _norm(ward)
+    return sorted({_norm(rec.town) for rec in _SCHEDULES if _norm(rec.ward) == key})
+
+
 def lookup_collection_schedule(
     ward: str, town: str | None, waste_type: str | None = None
 ) -> list[_StubSchedule] | None:

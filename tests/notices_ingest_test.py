@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from app.data import db
 from app.data.schema import WasteItem
 from app.notices import store
 from app.notices.ingest import ingest_notice_file, relink
@@ -42,23 +43,27 @@ def seed_rows() -> "list[dict]":
     return json.loads(SEED.read_text(encoding="utf-8"))["rows"]
 
 
+def seed_items() -> "list[WasteItem]":
+    return [
+        WasteItem(
+            item_name=row["item_name"],
+            item_name_raw=row["item_name"],
+            disposal_method=row["disposal_method"],
+            notes="",
+            source_url="fixture://test-only",
+            source_page_title=row["source_page_title"],
+            crawled_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            is_current=True,
+        )
+        for row in seed_rows()
+    ]
+
+
 @pytest.fixture
 def seeded_conn(conn):
     """A DB pre-loaded with the 15 pre-change 早見表 entries."""
-    for row in seed_rows():
-        store.insert_waste_item(
-            conn,
-            WasteItem(
-                item_name=row["item_name"],
-                item_name_raw=row["item_name"],
-                disposal_method=row["disposal_method"],
-                notes="",
-                source_url="fixture://test-only",
-                source_page_title=row["source_page_title"],
-                crawled_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
-                is_current=True,
-            ),
-        )
+    for item in seed_items():
+        store.insert_waste_item(conn, item)
     conn.commit()
     return conn
 
@@ -251,6 +256,57 @@ def test_reingesting_the_same_file_changes_nothing(seeded_conn):
     assert second.record_count == 0
     assert len(second.skipped) == 15
     assert before == after == 30
+
+
+def test_reingest_restores_4_1_rows_deleted_by_full_crawl(conn):
+    """A crawl must not leave manifest-only records that disable 4-1."""
+    ingest_notice_file(ADDITIONS, conn, now=INGEST_AT)
+    db.rebuild_db(conn, [], [])
+
+    assert conn.execute("SELECT COUNT(*) FROM knowledge_sources").fetchone()[0] == 15
+    assert conn.execute("SELECT COUNT(*) FROM waste_items").fetchone()[0] == 0
+
+    repaired = ingest_notice_file(ADDITIONS, conn, now=INGEST_AT)
+
+    assert repaired.record_count == 15
+    assert repaired.skipped == []
+    assert conn.execute("SELECT COUNT(*) FROM knowledge_sources").fetchone()[0] == 15
+    assert len(store.lookup_item_history(conn, "ホバーボード")) == 1
+    assert conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM knowledge_sources ks
+        JOIN waste_items wi ON wi.id = ks.produced_item_id
+        """
+    ).fetchone()[0] == 15
+
+    unchanged = ingest_notice_file(ADDITIONS, conn, now=INGEST_AT)
+    assert unchanged.record_count == 0
+    assert len(unchanged.skipped) == 15
+
+
+def test_reingest_restores_4_2_chain_deleted_by_full_crawl(seeded_conn):
+    """After crawl replacement, change notices are rebuilt and linked again."""
+    ingest_notice_file(CHANGES, seeded_conn, now=INGEST_AT)
+    db.rebuild_db(seeded_conn, seed_items(), [])
+
+    assert seeded_conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM knowledge_sources ks
+        JOIN waste_items wi ON wi.id = ks.produced_item_id
+        """
+    ).fetchone()[0] == 0
+
+    repaired = ingest_notice_file(CHANGES, seeded_conn, now=INGEST_AT)
+
+    assert repaired.record_count == 15
+    assert len(repaired.linked) == 15
+    assert repaired.skipped == []
+    assert seeded_conn.execute("SELECT COUNT(*) FROM knowledge_sources").fetchone()[0] == 15
+    assert len(store.lookup_item_history(seeded_conn, "スプレー缶")) == 2
+    timeline = store.item_timeline(seeded_conn, "スプレー缶")
+    assert timeline.change_dates == (CHANGE_START,)
 
 
 def test_both_files_ingest_together(seeded_conn):

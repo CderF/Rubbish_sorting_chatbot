@@ -105,6 +105,30 @@ sessions: "OrderedDict[str, list]" = OrderedDict()
 states: "OrderedDict[str, DialogState]" = OrderedDict()
 _sessions_lock = asyncio.Lock()
 
+
+def _remember(session_id: str, messages: list, answer: str, routed) -> None:
+    """Store one finished turn. Caller must hold `_sessions_lock`.
+
+    Both stores are written here so they cannot drift apart: `sessions` is what
+    the *model* replays, `states` is what the *search* re-runs from. A session
+    that kept only one of the two would either answer from a premise it can no
+    longer justify, or silently forget the item it is still talking about.
+
+    The citation block is deliberately left out of the stored answer: it is
+    rebuilt from the retrieval result on every turn, and keeping it would spend
+    history budget on URLs the model must not write itself anyway.
+    """
+    sessions[session_id] = (
+        messages + [{"role": "assistant", "content": answer}]
+    )[-MAX_HISTORY_MESSAGES:]
+    sessions.move_to_end(session_id)
+    if routed is not None and routed.state is not None:
+        states[session_id] = routed.state
+        states.move_to_end(session_id)
+    while len(sessions) > MAX_SESSIONS:
+        evicted, _ = sessions.popitem(last=False)
+        states.pop(evicted, None)
+
 # Most recently completed request, shown on the WebUI (STAGE 1-2).
 last_timing = {"first_token_s": None, "total_s": None, "tokens": None,
                "session_id": None, "retrieval": None}
@@ -250,6 +274,29 @@ async def _parse_request(request: Request) -> tuple[str, str, str | None]:
 # --------------------------------------------------------------------------
 # retrieval (STAGE 02 / 03)
 # --------------------------------------------------------------------------
+# STAGE04 採点デバッグ用。挙動は一切変えず、1リクエストのルーティング判定と
+# 最終回答を1行 JSON で追記するだけ。書き込み失敗は握り潰す(生成を止めない)。
+_TRACE_PATH = os.environ.get(
+    "STAGE4_TRACE_PATH",
+    os.path.join(_REPO_ROOT, "var", "stage4_trace.jsonl"),
+)
+_TRACE_ENABLED = os.environ.get("STAGE4_TRACE", "1") != "0"
+
+
+def _write_trace(session_id: str, prompt: str, routed, final_text: str) -> None:
+    if not (_TRACE_ENABLED and routed is not None):
+        return
+    try:
+        rec = router.build_trace_record(prompt, routed)
+        rec["session_id"] = session_id
+        rec["final_response"] = final_text
+        os.makedirs(os.path.dirname(_TRACE_PATH), exist_ok=True)
+        with open(_TRACE_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001 — trace はベストエフォート
+        print(f"[trace] write failed: {exc!r}", flush=True)
+
+
 async def _route_safely(prompt: str, img: str | None, state: DialogState | None):
     """検索パスを呼ぶ。失敗しても生成は止めない。
 
@@ -284,6 +331,28 @@ async def _stream_chat(
     # 検索結果はシステムメッセージとして毎ターン先頭に差し込む。会話履歴には
     # 残さない(ターンごとに検索結果が変わるうえ、積み重なると文脈を圧迫するため)。
     routed = await _route_safely(prompt, img, state)
+
+    # 確定回答(4-3 確度ゲート等): LLM に言い換え・脚色・補足をさせず、
+    # そのまま1フレームで返す。engine.generate は通さない。
+    if routed is not None and routed.canned_response:
+        text = routed.canned_response
+        yield f"data: {json.dumps({'delta': text}, ensure_ascii=False)}\n\n"
+        # 確定回答のターンでも会話スロットは保存する。ここで落とすと、
+        # 次のターンで品名・地区を引き継げず 5-1 が途中で切れる
+        # (「断定できない」と答えた品物を利用者が言い直す流れが典型)。
+        async with _sessions_lock:
+            _remember(session_id, messages, text, routed)
+        last_timing.update(
+            first_token_s=0.0, total_s=0.0, tokens=0, session_id=session_id,
+            retrieval={"item": routed.detected_item, "canned": True},
+        )
+        if with_sources:
+            payload = {"sources": router.describe_sources(routed)}
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        _write_trace(session_id, prompt, routed, text)
+        yield "data: [DONE]\n\n"
+        return
+
     if routed is not None:
         prompt_input = _build_prompt(
             [{"role": "system", "content": router.build_system_prompt(routed)}] + messages
@@ -350,17 +419,9 @@ async def _stream_chat(
     # rebuilt from the retrieval result on every turn, and keeping it would
     # spend history budget on URLs the model must not write itself anyway.
     async with _sessions_lock:
-        sessions[session_id] = (
-            messages + [{"role": "assistant", "content": answer_text}]
-        )[-MAX_HISTORY_MESSAGES:]
-        sessions.move_to_end(session_id)
-        if routed is not None and routed.state is not None:
-            states[session_id] = routed.state
-            states.move_to_end(session_id)
-        while len(sessions) > MAX_SESSIONS:
-            evicted, _ = sessions.popitem(last=False)
-            states.pop(evicted, None)
+        _remember(session_id, messages, answer_text, routed)
 
+    _write_trace(session_id, prompt, routed, prev_text)
     yield "data: [DONE]\n\n"
 
 

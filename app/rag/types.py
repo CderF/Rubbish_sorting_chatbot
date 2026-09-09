@@ -70,9 +70,31 @@ class ItemResult:
     複数品目の相談では、片方が完全一致で片方が類推ということが起こる。"""
 
     from_image: bool = False
+
+    analogy_unreliable: bool = False
+    """要件4-3 の確度ゲートで、この品目には根拠にできる類似品が無いと判定した。
+    品目ごとに持つ — 2品目の相談で片方だけが確度不足になることがある。"""
+
+    candidates: list[str] = field(default_factory=list)
+    """`_item_name_candidates` がこの品目のために作った候補列(trace 用)。"""
+
     timeline_change: bool = False
     timeline_lines: list[str] = field(default_factory=list)
     """STAGE04 4-2 の「いつから何がどう変わるか」。品目ごとに持つ。"""
+
+    timeline_item_name: str | None = None
+    """時間軸を引けたときの `ItemTimeline.item_name`(trace 用)。"""
+
+    timeline_sources: list[str] = field(default_factory=list)
+    """4-2 の根拠として採用するお知らせの `knowledge://` URL。"""
+
+    no_weekday: bool = False
+    """この品目は決まった収集曜日を持たない区分だった。品目ごとに持つ —
+    「ソファと蛍光管」のように、片方に曜日があり片方に無い相談が成り立つ。"""
+
+    disposal_method: str | None = None
+    """ヒットの出し方が1つに定まったときのその区分。収集日パスの絞り込みに
+    使う(main の `single_item_disposal` を品目単位にしたもの)。"""
 
 
 @dataclass
@@ -103,6 +125,29 @@ class RoutedAnswer:
       "none"    — ヒットなし
     どの段(exact/partial/vector)でヒットしたかではなく、名前が一致したかで
     判定する(PR #14 レビュー)。"analogy" のとき要件4-3 の断り書きを出す。"""
+
+    canned_response: str | None = None
+    """設定されている場合、サーバーはこの文字列をそのまま唯一の回答として
+    ストリームし、LLM生成をスキップする。
+
+    小型モデルに言い換え・脚色・補足をさせてはならない確定回答用。現状の
+    唯一の利用箇所は 4-3 確度ゲート(`analogy_unreliable`): 根拠にできる
+    類似品が無いのに LLM に自由生成させると「電動自転車かもしれない」等の
+    検索結果に無い推測を書いてしまうため(採点フィードバックの実例)。
+    引用URL(`format_citations`)も付けない — 断定を避ける回答に、退けた
+    候補ページへの参照を添えるのは誤解を招くため。"""
+
+    analogy_unreliable: bool = False
+    """要件4-3: 類似候補(`item_match == "analogy"`)はあるが、質問品と語の上でも
+    十分に関連づかず、区分の根拠として信頼できないと判定した状態。
+
+    ベクトル類似度だけで拾った候補(例: セグウェイ→かご、スマートウォッチ→
+    湿気取りの容器)は、item_name のみを埋め込んだ弱いベクトルでは誤ヒットでも
+    距離が近く、しきい値では良し悪しを分離できない(採点フィードバックの実例)。
+    そこで「候補が質問品と語彙的に関連するか」で確度を判定し、関連しなければ
+    このフラグを立てて、類推で断定させず『類似品でも十分な根拠を確認できない
+    ため断定できない。北九州市に確認を』と案内させる。WebUIの根拠表示のため
+    `item_hits` 自体は残す。"""
 
     missing: list[str] = field(default_factory=list)
     """回答に不足している入力項目(例: ["町名"])。
@@ -145,3 +190,39 @@ class RoutedAnswer:
 
     item_from_image: bool = False
     """`detected_item` が画像分類パス由来かどうか(STAGE03 3-2)。"""
+
+    item_candidates: list[str] = field(default_factory=list)
+    """`_item_name_candidates` が prompt から作った品名候補(原文 + 修飾語を
+    落とした形 + 括弧分割)。回答の組み立てには使わない — 採点デバッグ用の
+    trace(`var/stage4_trace.jsonl`)に残し、どの候補で検索段が決まったかを
+    後から追えるようにする。"""
+
+    timeline_item_name: str | None = None
+    """`_apply_timeline` が時間軸を引けたときの `ItemTimeline.item_name`。
+    trace 用。`timeline_change` が False なら None。"""
+
+    district_schedule: bool = False
+    """`schedule_hits` が「丁目を省略した地区名」から解決されたものかどうか。
+
+    例:「黒崎」は町名としては存在せず「黒崎1〜5丁目」「黒崎城石」の6町が
+    実在するが、この6町の収集日は全て一致する(実測: 全7区344地区中277地区
+    (92%)が地区内で完全一致)。一致する場合に限り、代表として1町分の
+    `schedule_hits` をそのまま使う。`district_towns` に地区内の全町名を
+    残し、LLMには「代表の1町だけを見た結果ではなく地区内で確認済み」と
+    伝えられるようにする(丁目を勝手に決めつけて答えたわけではないことを
+    明示するため)。"""
+
+    district_towns: list[str] = field(default_factory=list)
+    """`district_schedule` が True のとき、収集日が一致すると確認した地区内
+    の全町名(丁目単位)。"""
+
+    no_weekday_schedule: bool = False
+    """この品目は決まった収集曜日を持たない区分(小物金属・小型電子機器・
+    電池類・古着・紙パック・蛍光管等の「回収ボックスへ」方式)だった。
+
+    このとき `schedule_hits` は意図的に空のまま(collection_schedule には
+    元々該当データが無い)。地区が分かっているのに収集日情報が見つからな
+    かった、という `missing` 案内('町名'等の追加入力を促す文言)を出すのは
+    誤りなので、代わりにこのフラグを見て「決まった収集曜日はない」と明示
+    させる(STAGE03採点フィードバック: 品目ごとの「収集枠」の違いを反映
+    できていなかった実例が根拠)。"""
