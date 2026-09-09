@@ -415,6 +415,56 @@ def list_knowledge_sources(conn: sqlite3.Connection) -> "list[dict[str, Any]]":
     return [dict(r) for r in rows]
 
 
+def delete_knowledge_source_file(
+    conn: sqlite3.Connection, source_file: str
+) -> "dict[str, int]":
+    """Undo one お知らせ file's ingest: drop the rows it produced and restore
+    any 早見表 predecessor it had retired (the WebUI "削除" / "再取り込み" path).
+
+    * every `waste_items` row the file's sections produced is deleted (guarded to
+      `knowledge://` rows so a mis-set id can't take out a crawled row);
+    * any row that was `superseded_by` one of those is set back to
+      `is_current = 1, superseded_by = NULL`;
+    * the `knowledge_sources` bookkeeping rows for the file are deleted.
+
+    Multi-notice chains (早見表 → notice A → notice B): deleting the file that
+    holds a *middle* notice restores that notice's own predecessor but leaves
+    the later notice pointing at a now-deleted id. The common case — one file,
+    one notice per item, a two-version chain — is fully consistent.
+    """
+    produced_ids = [
+        r["produced_item_id"]
+        for r in conn.execute(
+            "SELECT produced_item_id FROM knowledge_sources WHERE source_file = ?",
+            (source_file,),
+        ).fetchall()
+        if r["produced_item_id"] is not None
+    ]
+
+    restored = 0
+    removed_items = 0
+    for new_id in produced_ids:
+        restored += conn.execute(
+            "UPDATE waste_items SET is_current = 1, superseded_by = NULL "
+            "WHERE superseded_by = ?",
+            (new_id,),
+        ).rowcount
+        removed_items += conn.execute(
+            "DELETE FROM waste_items WHERE id = ? AND source_url LIKE ?",
+            (new_id, KNOWLEDGE_SCHEME + "%"),
+        ).rowcount
+
+    removed_sources = conn.execute(
+        "DELETE FROM knowledge_sources WHERE source_file = ?", (source_file,)
+    ).rowcount
+    conn.commit()
+    return {
+        "removed_items": removed_items,
+        "restored_predecessors": restored,
+        "removed_sources": removed_sources,
+    }
+
+
 # --------------------------------------------------------------------------
 # item_timeline — a flat old→new view for the answer layer (requirement 4-2)
 # --------------------------------------------------------------------------
