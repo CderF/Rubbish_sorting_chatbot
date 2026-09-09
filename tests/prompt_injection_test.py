@@ -418,6 +418,15 @@ def test_real_disposal_answers_keep_passing_the_whitelist(answer):
 
 
 # --- D7: 文・段落単位の反復と自己実行指示 --------------------------------
+def test_answer_emitted_twice_is_cut_to_one_copy():
+    # B1実機で観測(#54系): 1文の回答をまるごと2回吐くケース。段が2つしか
+    # 無くても、片方がもう片方の再掲なら切る。
+    one = "乾燥剤は家庭ごみとして捨ててください。"
+    text, blocked = guard.scrub_output(one + "\n\n" + one)
+    assert blocked == "出力ループ"
+    assert text.count("乾燥剤は家庭ごみ") == 1
+
+
 def test_block_level_repeat_is_cut_to_one_copy():
     one = (
         "北九州市では、歯ブラシは「家庭ごみ」に分類されます。"

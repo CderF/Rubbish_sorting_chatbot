@@ -414,7 +414,7 @@ def _block_repeat_start(text: str) -> int | None:
         key = re.sub(r"\s+", "", m.group(0))
         if len(key) >= _BLOCK_REPEAT_MIN_SEG:
             segs.append((m.start(), key))
-    if len(segs) < 3:
+    if len(segs) < 2:
         return None
     seen: dict[str, int] = {}
     first_repeat_at: int | None = None
@@ -431,6 +431,7 @@ def _block_repeat_start(text: str) -> int | None:
     if first_repeat_at is None:
         return None
     total = sum(len(k) for _, k in segs)
+    # 2文しか無くて片方がもう片方の再掲(= 回答をまるごと2回吐いた)も切る。
     if repeated_chars >= total * _BLOCK_REPEAT_RATIO:
         return first_repeat_at
     return None
