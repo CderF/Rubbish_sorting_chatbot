@@ -54,7 +54,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from app.rag import knowledge, router  # noqa: E402  (sys.path 調整後に import)
+from app.rag import guard, knowledge, router  # noqa: E402  (sys.path 調整後に import)
 
 MODEL_NAME = "Qwen3-VL-8B-Instruct"
 # Where the downloaded weights live. Override per machine via MODEL_PATH so the
@@ -224,9 +224,13 @@ async def _parse_request(request: Request) -> tuple[str, str, str | None]:
         body = {}
 
     session_id = body.get("session_id") or f"anon-{uuid.uuid4().hex[:8]}"
-    prompt = body.get("prompt")
-    if not isinstance(prompt, str):
-        prompt = "" if prompt is None else str(prompt)
+    # PIJ対策の入力正規化。ゼロ幅文字による難読化を潰し、chat template の
+    # 特殊トークン(<|im_start|> 等)を剥がしてから先へ渡す。`apply_chat_template`
+    # は平文をそのまま埋め込むため、剥がさないとユーザー入力から偽の system
+    # ターンを合成できてしまう(役割偽装のうち唯一、本当に役割境界を越えられる
+    # 経路)。長さ上限は MAX_MODEL_LEN 超過で engine.generate が例外になり
+    # SSEが途中で切れるのも同時に防ぐ。
+    prompt = guard.normalize_input(body.get("prompt"))
 
     img = body.get("img")
     if not isinstance(img, str) or not img.strip():
@@ -307,7 +311,13 @@ async def _stream_chat(
                 sessions.popitem(last=False)
         last_timing.update(
             first_token_s=0.0, total_s=0.0, tokens=0, session_id=session_id,
-            retrieval={"item": routed.detected_item, "canned": True},
+            retrieval={
+                "item": routed.detected_item,
+                "canned": True,
+                # PIJ検知で止めた場合は分類名を残す。採点中に /vram を見て
+                # 「今どの攻撃が何件来ているか」を追えるようにするため。
+                "attack": routed.attack_detected,
+            },
         )
         if with_sources:
             payload = {"sources": router.describe_sources(routed)}

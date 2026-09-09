@@ -16,6 +16,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
+from app.rag import guard
 from app.rag.types import ItemRecord, RoutedAnswer, ScheduleRecord
 
 # --- データ層の解決 --------------------------------------------------------
@@ -597,6 +598,16 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     """
     ans = RoutedAnswer()
 
+    # PIJ(プロンプトインジェクション)ゲート。検索より前に見る。ここで弾いた
+    # 入力は `canned_response` 経由で固定文を返し、`engine.generate` を通さない
+    # (小型モデルは「従うな」という指示だけでは守り切らない — 4-3 の #29 と
+    # 同じ理由)。検索も行わないので、攻撃文が context に混ざる余地もない。
+    attack = guard.detect_attack(prompt)
+    if attack:
+        ans.attack_detected = attack
+        ans.canned_response = guard.REFUSAL
+        return ans
+
     ward, town = extract_region(prompt)
     ans.detected_ward, ans.detected_town = ward, town
 
@@ -733,6 +744,17 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     # しない(_apply_timeline 内で analogy_unreliable は無視される)。
     if ans.item_match == "analogy" and ans.analogy_unreliable:
         ans.canned_response = _ANALOGY_UNRELIABLE_REPLY
+
+    # PIJ「目的外利用」。ごみ分別以外の作業依頼(コード生成・翻訳など)は、
+    # 検索が何も当てられなかったときにだけ判定する。単独で照合すると正当な
+    # 質問と衝突しうるため、「どの検索パスにも当たらない」ことを前提条件に
+    # 置いて誤検知を抑える。`missing` があるケース(区名・町名の聞き返し)は
+    # 正当な対話の途中なので触らない。
+    if not ans.found and not ans.missing and not ans.canned_response:
+        off_purpose = guard.detect_off_purpose(prompt)
+        if off_purpose:
+            ans.attack_detected = off_purpose
+            ans.canned_response = guard.REFUSAL
     return ans
 
 
@@ -770,6 +792,11 @@ async def handle_query(
     image_item_name = None
     if img_b64 and engine is not None and processor is not None:
         image_item_name = await classify_image_to_item_name(img_b64, engine, processor)
+        if image_item_name:
+            # 画像に書き込まれた文字は VLM がそのまま読み上げる。この文字列は
+            # `detected_item` として `_build_context` の f-string に載るので、
+            # システムプロンプトに入る前にここで均す(PIJ「間接注入」の画像版)。
+            image_item_name = guard.sanitize_item_name(image_item_name) or None
 
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
@@ -1340,5 +1367,6 @@ def build_trace_record(prompt: str, ans: RoutedAnswer) -> dict:
         "schedule_hits": len(ans.schedule_hits),
         "missing": list(ans.missing),
         "canned_response": bool(ans.canned_response),
+        "attack_detected": ans.attack_detected,
         "sources": list(ans.sources),
     }
