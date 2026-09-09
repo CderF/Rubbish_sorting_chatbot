@@ -59,6 +59,17 @@ if _REPO_ROOT not in sys.path:
 from app.notices import admin as notice_admin  # noqa: E402
 from app.rag import knowledge, router  # noqa: E402  (sys.path 調整後に import)
 
+# ナレッジ管理API(お知らせの取り込み/削除)は waste_items を直接書き換えるが、
+# それだけではベクトル索引(var/chroma/)に反映されない。反映し忘れると、
+# 削除・変更したはずの内容が vector 検索フォールバックから拾われ続ける。
+# router.py と同じフォールバック方針: 重い依存が無い環境でも import は通す。
+try:
+    from app.rag.vector_store import build_item_index
+except ImportError:
+
+    def build_item_index() -> int:
+        return 0
+
 MODEL_NAME = "Qwen3-VL-8B-Instruct"
 # Where the downloaded weights live. Override per machine via MODEL_PATH so the
 # repo can be deployed by any team member / on either server.
@@ -482,22 +493,26 @@ async def notice_file_upload(request: Request, name: str, _=Depends(require_logi
 async def notice_file_ingest(name: str, _=Depends(require_login)):
     """保存済みファイルを取り込む。取り込み済みなら旧レコードを消してから再取り込み。"""
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             notice_admin.with_rw_conn, lambda c: notice_admin.ingest_saved_file(c, name)
         )
     except notice_admin.NoticeFileError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    await asyncio.to_thread(build_item_index)
+    return result
 
 
 @app.delete("/knowledge/files/{name}")
 async def notice_file_delete(name: str, _=Depends(require_login)):
     """取り込みで作った waste_items 行を消し(前身行は is_current を復元)、ファイルも削除。"""
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             notice_admin.with_rw_conn, lambda c: notice_admin.delete_notice_file(c, name)
         )
     except notice_admin.NoticeFileError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    await asyncio.to_thread(build_item_index)
+    return result
 
 
 @app.get("/knowledge/files/{name}/raw")
