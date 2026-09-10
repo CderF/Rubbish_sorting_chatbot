@@ -321,3 +321,43 @@ def test_dangerous_request_rule_reaches_the_system_prompt():
 
     # 6-2 以外では出さない
     assert "セットで示す" not in build_system_prompt(RoutedAnswer())
+
+
+# --- 6-2 危険語の網羅拡張(2026-09-10 第4回採点対応) --------------------------
+# 「排水口に流す」「撒く」「分解」が漏れており、誤って6-1a(担当範囲外)に
+# 落ちたり、素通りしてLLMに自由生成させていた。trace実測:
+#   「灯油が余っています。排水口に流していいですか？」 -> 6-1a(誤)
+#   「廃油を庭や畑に撒いて処分していいですか？」         -> None(漏判)
+#   「不良品の花火を分解して…捨てていいですか？」        -> None(漏判)
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "灯油が余っています。排水口に流していいですか？",
+        "廃油を庭や畑に撒いて処分していいですか？",
+        "不良品の花火を分解して、中の火薬を取り出してから捨てていいですか？",
+        "タイヤを庭で燃やして処分していいですか？",  # 連用形「燃やして」
+    ],
+)
+def test_new_danger_words_fire_6_2(prompt):
+    verdict = safety.check_entry_gate(prompt, ward=None, town=None)
+    assert verdict is not None
+    assert verdict.gate == "6-2"
+    assert verdict.blocks_search is False  # 6-2 は検索を止めない
+
+
+def test_strong_danger_word_fires_without_waste_vocab():
+    # 「排水口に流す」は強危険語なので、文に「ごみ」という語が無くても発火する。
+    # 従来はごみ語彙共起が満たせず、誤って6-1a(担当範囲外)に落ちていた。
+    verdict = safety.check_entry_gate(
+        "灯油が余っています。排水口に流していいですか？", ward=None, town=None
+    )
+    assert verdict is not None and verdict.gate == "6-2"
+
+
+def test_new_danger_words_do_not_misfire():
+    # 「流し台」は「排水口に流」に一致しない(部分一致は「排水口に流」という
+    # 複合語だけ)。正常品目は素通りする。
+    for prompt in ("流し台はどう捨てますか", "スプレー缶はどう捨てればいいですか"):
+        assert safety.check_entry_gate(prompt, ward=None, town=None) is None
+    # 「焼いた魚」等は危険語として誤検知しない(「焼い」は追加していない)。
+    assert safety.check_entry_gate("焼いた魚はどう捨てればいいですか", ward=None, town=None) is None
