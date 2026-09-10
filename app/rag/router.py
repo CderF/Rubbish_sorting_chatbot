@@ -733,6 +733,11 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     # しない(_apply_timeline 内で analogy_unreliable は無視される)。
     if ans.item_match == "analogy" and ans.analogy_unreliable:
         ans.canned_response = _ANALOGY_UNRELIABLE_REPLY
+
+    # --- 6-3 fallback hook (STAGE06 proposal §7.3 / 担当B) ---
+    # ここに: ans.found が False かつ ans.canned_response が未設定かつ
+    # ans.safety_gate が None のとき、safety.no_result_reply() を canned_response
+    # に立てて「完全空振り」を LLM 生成に回さず固定文で返す。足場では未実装。
     return ans
 
 
@@ -1278,6 +1283,7 @@ def describe_sources(ans: RoutedAnswer) -> dict:
         "match_stage": ans.item_match_stage,
         "match_stage_label": MATCH_STAGE_LABELS.get(ans.item_match_stage or ""),
         "found": ans.found,
+        "safety_gate": ans.safety_gate,  # STAGE06 6-4: 発火した安全ゲート、未発火なら None
         "missing": ans.missing,
         "items": [
             {
@@ -1340,5 +1346,6 @@ def build_trace_record(prompt: str, ans: RoutedAnswer) -> dict:
         "schedule_hits": len(ans.schedule_hits),
         "missing": list(ans.missing),
         "canned_response": bool(ans.canned_response),
+        "safety_gate": ans.safety_gate,  # STAGE06 6-4: 発火した安全ゲート("6-1a"/"6-2"/"6-3")
         "sources": list(ans.sources),
     }

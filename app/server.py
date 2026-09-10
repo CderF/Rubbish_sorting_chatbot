@@ -57,7 +57,8 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from app.notices import admin as notice_admin  # noqa: E402
-from app.rag import agent, knowledge, router  # noqa: E402  (sys.path 調整後に import)
+from app.rag import agent, knowledge, router, safety  # noqa: E402  (sys.path 調整後に import)
+from app.rag.types import RoutedAnswer  # noqa: E402
 
 # ナレッジ管理API(お知らせの取り込み/削除)は waste_items を直接書き換えるが、
 # それだけではベクトル索引(var/chroma/)に反映されない。反映し忘れると、
@@ -301,7 +302,23 @@ async def _route_safely(prompt: str, img: str | None):
     ヒット0件・想定外の例外いずれでも None を返す設計なので、その場合は
     そのまま現行の決定論的経路(`router.handle_query`)にフォールバックする
     — グレーディング対象の `/chat` の挙動を壊さないための安全弁。
+
+    STAGE06 入口ゲート(6-1a / 6-2、`app/rag/safety.py`): エージェント経路も
+    決定論経路も通らずここで先に評価する。エージェント経路は `_blocking_route`
+    を経由しないため、ゲートを `router` 側に置くと既定オンのエージェント応答が
+    素通りしてしまう(STAGE06 proposal §7.1 の足場でこの位置に確定)。
+    足場では `check_entry_gate` が常に None を返すため挙動は変わらない。
     """
+    # --- 6-1a/6-2 gate (STAGE06 proposal §7.2 / 担当A) ---
+    ward, town = router.extract_region(prompt)
+    verdict = safety.check_entry_gate(prompt, ward, town)
+    if verdict is not None:
+        ans = RoutedAnswer()
+        ans.detected_ward, ans.detected_town = ward, town
+        ans.canned_response = verdict.reply
+        ans.safety_gate = verdict.gate
+        return ans
+
     if AGENTIC_RAG_ENABLED:
         image_item_name = None
         if img:
