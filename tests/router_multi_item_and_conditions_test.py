@@ -178,6 +178,34 @@ def test_follow_up_without_item_recovers_the_item_from_history():
         assert expected in [h.item_name for h in retried.item_hits], first
 
 
+def test_needs_history_retry_does_not_fire_when_more_input_is_being_asked_for():
+    """「町名が要る」等、あと一歩の情報を求めている回答は引き直さない。
+
+    引き直すと、品名ではなく町名を聞いている状況で過去の発話を混ぜてしまい、
+    `missing` による追加入力の案内(3-1)が消える。
+    """
+    ans = _route("小倉北区の粗大ごみの収集日を教えてください")
+    assert "町名" in ans.missing
+    assert needs_history_retry(ans) is False
+
+
+def test_needs_history_retry_does_not_fire_for_the_other_fixed_answers():
+    """6-1a(確定回答)・6-2(危険)は 6-3 ではないので引き直さない。"""
+    from app.rag.types import RoutedAnswer
+
+    for gate in ("6-1a", "6-2"):
+        assert needs_history_retry(RoutedAnswer(safety_gate=gate, canned_response="x")) is False
+    assert needs_history_retry(RoutedAnswer(canned_response="x")) is False
+
+
+def test_single_item_question_still_gets_the_item_table():
+    """テンプレートを外す条件(多品目・述べられた条件)に当たらない質問は従来どおり。"""
+    prompt = "布団を捨てたいです。"
+    ans = _route(prompt)
+    assert [h.item_name for h in ans.item_hits] == ["布団"]
+    assert apply_response_template(ans, prompt).template_response is True
+
+
 # --- agentic 経路の絞り込み -------------------------------------------------
 
 
