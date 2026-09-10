@@ -57,7 +57,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from app.notices import admin as notice_admin  # noqa: E402
-from app.rag import knowledge, router  # noqa: E402  (sys.path 調整後に import)
+from app.rag import agent, knowledge, router  # noqa: E402  (sys.path 調整後に import)
 
 # ナレッジ管理API(お知らせの取り込み/削除)は waste_items を直接書き換えるが、
 # それだけではベクトル索引(var/chroma/)に反映されない。反映し忘れると、
@@ -95,6 +95,15 @@ MAX_TOKENS = 1024
 MAX_SESSIONS = 256
 # Never return an empty body — that fails the question outright.
 EMPTY_FALLBACK = "申し訳ありません。回答を生成できませんでした。もう一度お試しください。"
+
+# Agentic RAG(Function Calling)。既定オン: B1実機で複数の質問パターン
+# (早見表パス・収集日パス・ベクトルRAGパス)を検証済み(2026-09-10、
+# app/rag/agent.py のモジュールdocstring参照)。失敗しても _route_safely が
+# 現行の決定論的経路へ自動フォールバックするので、既定オンでも安全側の設計
+# は維持している。フラグはいつでも即座に戻せるよう env var のままにしてある
+# (`AGENTIC_RAG_ENABLED=0` で無効化)。
+AGENTIC_RAG_ENABLED = os.environ.get("AGENTIC_RAG_ENABLED", "1") == "1"
+AGENTIC_TOOL_CALL_MAX_TOKENS = 300
 
 app = FastAPI()
 engine: AsyncLLMEngine | None = None
@@ -178,14 +187,20 @@ def _build_messages(prompt: str, img_b64: str | None) -> list:
     return [{"role": "user", "content": prompt}]
 
 
-def _build_prompt(messages: list) -> dict:
-    """Render the chat template and collect any images in the conversation."""
+def _build_prompt(messages: list, tools: list | None = None) -> dict:
+    """Render the chat template and collect any images in the conversation.
+
+    `tools` is only used by the agentic RAG path (`app/rag/agent.py`) to pass
+    the Function Calling tool schemas through to the chat template. Omitted
+    (None) for every other call site, so existing behaviour is unchanged.
+    """
     images = [m["_image"] for m in messages if "_image" in m]
     clean = [{k: v for k, v in m.items() if k != "_image"} for m in messages]
 
-    text_prompt = processor.apply_chat_template(
-        clean, tokenize=False, add_generation_prompt=True
-    )
+    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+    if tools is not None:
+        template_kwargs["tools"] = tools
+    text_prompt = processor.apply_chat_template(clean, **template_kwargs)
     if images:
         return {"prompt": text_prompt, "multi_modal_data": {"image": images}}
     return {"prompt": text_prompt}
@@ -280,7 +295,37 @@ async def _route_safely(prompt: str, img: str | None):
 
     RAG側の例外で 5xx を返すとステージ全体が中断してしまう(冒頭の契約メモ参照)
     ため、ここだけは意図的に握り潰し、素の生成にフォールバックする。
+
+    `AGENTIC_RAG_ENABLED` が真のときは Function Calling によるエージェント
+    経路(`app/rag/agent.py`)を先に試す。`route_agentically` はパース不能・
+    ヒット0件・想定外の例外いずれでも None を返す設計なので、その場合は
+    そのまま現行の決定論的経路(`router.handle_query`)にフォールバックする
+    — グレーディング対象の `/chat` の挙動を壊さないための安全弁。
     """
+    if AGENTIC_RAG_ENABLED:
+        image_item_name = None
+        if img:
+            try:
+                image_item_name = await router.classify_image_to_item_name(
+                    img, engine, processor
+                )
+            except Exception as exc:  # noqa: BLE001 — 分類失敗でもエージェントは試す
+                print(f"[agent] image classification failed: {exc!r}", flush=True)
+
+        agentic_result = await agent.route_agentically(
+            prompt,
+            engine=engine,
+            build_prompt=_build_prompt,
+            sampling_params=SamplingParams(
+                temperature=0.0, max_tokens=AGENTIC_TOOL_CALL_MAX_TOKENS
+            ),
+            image_item_name=image_item_name,
+        )
+        if agentic_result is not None:
+            return agentic_result
+        print("[agent] route_agentically returned None, falling back to deterministic router",
+              flush=True)
+
     try:
         return await router.handle_query(prompt, img, engine=engine, processor=processor)
     except Exception as exc:  # noqa: BLE001 — 生成の継続を最優先する
