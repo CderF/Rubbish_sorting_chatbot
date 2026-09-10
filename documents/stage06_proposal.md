@@ -207,7 +207,7 @@ STAGE04で確立した検証フローを踏襲する:
 `server.py`の`_route_safely`から、6-3フォールバックは`router.py`の`_blocking_route`末尾から、
 それぞれ1回呼ぶだけにする。
 
-### 7.1 Phase 0 — 足場(**完了**。ブランチ`feat/stage06-scaffold`、コミット`126ce97`)
+### 7.1 Phase 0 — 足場(**完了・main合流済み**。PR #43、squash後のコミット`6cde85a`)
 
 契約だけを用意し、検出ロジックは入れない(`check_entry_gate`は常に`None`、
 `no_result_reply`は`""`を返すので挙動は不変)。
@@ -244,7 +244,7 @@ STAGE04で確立した検証フローを踏襲する:
    - `_blocking_route`末尾(空振り判定の近く)に`# --- 6-3 fallback hook ---`の標識コメントだけを置く。
    - `build_trace_record()` / `describe_sources()`に`"safety_gate": ans.safety_gate`を追加。
 
-担当A・Bは`feat/stage06-scaffold`(またはマージ後の`main`)から各自ブランチを切り、以降は完全に並行。
+Phase 0はmainに合流済み。担当A・Bは`main`(コミット`6cde85a`以降)から各自ブランチを切り、以降は完全に並行。
 
 ### 7.2 担当A(FANG / Teamb2)— 入口安全ゲート(6-1a・6-2・6-1b/c回帰)
 
