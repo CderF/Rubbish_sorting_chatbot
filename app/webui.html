@@ -169,6 +169,21 @@
   .kempty{color:var(--muted);font-size:13px;line-height:1.9;padding:26px 4px}
   .kempty code{background:rgba(127,127,127,.18);padding:1px 5px;border-radius:4px}
 
+  /* ---- お知らせファイルの管理 (upload / ingest / delete) ---- */
+  .kupload{border:1px solid var(--border);background:var(--bg);color:var(--text);
+           border-radius:8px;padding:5px 11px;font-size:12px;cursor:pointer;white-space:nowrap}
+  .kupload:hover{border-color:var(--accent);color:var(--accent)}
+  .kgrouphd{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);
+            padding:11px 11px 4px;font-weight:650}
+  .kitem .acts{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
+  .kact{border:1px solid var(--border);background:var(--panel);color:var(--muted);
+        border-radius:6px;padding:3px 9px;font-size:11px;cursor:pointer;font-family:inherit;
+        text-decoration:none;display:inline-block}
+  .kact:hover{border-color:var(--accent);color:var(--accent)}
+  .kact.danger:hover{border-color:var(--err);color:var(--err)}
+  .kbadge{display:inline-block;font-size:10px;padding:1px 6px;border-radius:9px;margin-left:6px;
+          background:rgba(184,134,11,.16);color:var(--warn);vertical-align:middle}
+
   @media (max-width:860px){
     aside{display:none}
     .klist{width:150px}
@@ -269,6 +284,10 @@
     <div class="khead">
       <h2>ナレッジ一覧</h2>
       <span class="sub" id="kSummary">読み込み中…</span>
+      <label class="kupload" style="margin-left:auto" title="お知らせ .md / .txt を追加">
+        ＋ ファイル追加
+        <input type="file" id="kFileInput" accept=".md,.txt" hidden>
+      </label>
       <button class="close" id="kClose" title="閉じる">&times;</button>
     </div>
     <div class="kbody">
@@ -601,33 +620,173 @@ async function loadSources(){
     if (res.status === 401){ location.href = '/login'; return; }
     const d = await res.json();
 
-    if (!d.available || !d.sources.length){
-      $('kSummary').textContent = '0 ページ';
+    const files = d.notice_files || [];
+    // 取り込み済みのお知らせは notice_files 側で扱うので sources からは外す。
+    const pages = (d.sources || []).filter(s => s.kind !== 'knowledge_notice');
+
+    const totalRecs = pages.reduce((a, s) => a + (s.record_count || 0), 0)
+                    + files.reduce((a, f) => a + (f.record_count || 0), 0);
+    $('kSummary').textContent =
+      files.length + ' ファイル / ' + pages.length + ' ページ / '
+      + totalRecs.toLocaleString() + ' 件';
+
+    if (!files.length && !pages.length){
       $('kDetail').innerHTML =
-        '<div class="kempty">まだナレッジが取り込まれていません。<br>'
-        + 'データ層のクローラが構造化DBを作成すると、ここに一覧が表示されます。<br><br>'
+        '<div class="kempty">まだナレッジがありません。<br>'
+        + '右上の「＋ ファイル追加」でお知らせ .md をアップロードするか、'
+        + 'データ層のクローラが構造化DBを作成すると、ここに表示されます。<br><br>'
         + '参照中のDB: <code>' + escapeHtml(d.db_path || '-') + '</code></div>';
       return;
     }
 
-    $('kSummary').textContent =
-      d.sources.length + ' ページ / ' + d.total_records.toLocaleString() + ' 件';
+    if (files.length){
+      const hd = document.createElement('div');
+      hd.className = 'kgrouphd';
+      hd.textContent = 'アップロードしたお知らせ';
+      $('kList').appendChild(hd);
+      for (const f of files) $('kList').appendChild(renderNoticeFileItem(f));
+    }
 
-    for (const s of d.sources){
-      const el = document.createElement('div');
-      el.className = 'kitem';
-      el.dataset.id = s.id;
-      el.innerHTML =
-        '<div class="t">' + escapeHtml(s.title) + '</div>'
-        + '<div class="m">' + escapeHtml(s.kind_label) + ' · '
-        + s.record_count.toLocaleString() + ' 件'
-        + (s.crawled_at ? ' · ' + escapeHtml(s.crawled_at.slice(0, 10)) : '')
-        + '</div>';
-      el.onclick = () => showSource(s.id);
-      $('kList').appendChild(el);
+    if (pages.length){
+      const hd = document.createElement('div');
+      hd.className = 'kgrouphd';
+      hd.textContent = 'クロール済みページ';
+      $('kList').appendChild(hd);
+      for (const s of pages){
+        const el = document.createElement('div');
+        el.className = 'kitem';
+        el.dataset.id = s.id;
+        el.innerHTML =
+          '<div class="t">' + escapeHtml(s.title) + '</div>'
+          + '<div class="m">' + escapeHtml(s.kind_label) + ' · '
+          + (s.record_count || 0).toLocaleString() + ' 件'
+          + (s.crawled_at ? ' · ' + escapeHtml(s.crawled_at.slice(0, 10)) : '')
+          + '</div>';
+        el.onclick = () => showSource(s.id);
+        $('kList').appendChild(el);
+      }
     }
   }catch(e){
     $('kSummary').textContent = '取得に失敗しました';
+    $('kDetail').innerHTML = '<div class="kempty">' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+/* ---------- お知らせファイルの管理 ---------- */
+function renderNoticeFileItem(f){
+  const el = document.createElement('div');
+  el.className = 'kitem';
+  const enc = encodeURIComponent(f.name);
+  const meta = f.ingested
+    ? (f.record_count + ' 件取り込み済み'
+       + (f.change_notice_count ? ' / 変更通知 ' + f.change_notice_count : ''))
+    : '未取り込み';
+  el.innerHTML =
+    '<div class="t">' + escapeHtml(f.name)
+    + (f.ingested ? '' : '<span class="kbadge">未取り込み</span>')
+    + (f.on_disk ? '' : '<span class="kbadge">ファイル無し</span>')
+    + '</div>'
+    + '<div class="m">' + escapeHtml(meta)
+    + (f.size != null ? ' · ' + f.size.toLocaleString() + ' B' : '') + '</div>'
+    + '<div class="acts">'
+    + (f.on_disk
+        ? '<button class="kact" data-act="ingest">'
+          + (f.ingested ? '再取り込み' : '取り込み') + '</button>'
+          + '<button class="kact" data-act="raw">原文</button>'
+          + '<a class="kact" href="/knowledge/files/' + enc
+          + '/raw?download=1">⬇ 保存</a>'
+        : '')
+    + '<button class="kact danger" data-act="delete">削除</button>'
+    + '</div>';
+  el.querySelector('.t').onclick = () => { if (f.on_disk) showNoticeRaw(f.name); };
+  const ing = el.querySelector('[data-act="ingest"]');
+  if (ing) ing.onclick = () => ingestNoticeFile(f.name);
+  const rawb = el.querySelector('[data-act="raw"]');
+  if (rawb) rawb.onclick = () => showNoticeRaw(f.name);
+  el.querySelector('[data-act="delete"]').onclick = () => deleteNoticeFile(f);
+  return el;
+}
+
+async function uploadNoticeFile(file){
+  if (!file) return;
+  $('kSummary').textContent = 'アップロード中…';
+  try{
+    const text = await file.text();
+    const res = await fetch('/knowledge/files?name=' + encodeURIComponent(file.name), {
+      method: 'POST',
+      headers: {'Content-Type': 'text/markdown; charset=utf-8'},
+      body: text
+    });
+    if (res.status === 401){ location.href = '/login'; return; }
+    if (!res.ok){
+      const d = await res.json().catch(() => ({}));
+      alert('アップロード失敗: ' + (d.detail || res.status));
+    }
+  }catch(e){
+    alert('アップロード失敗: ' + e.message);
+  }
+  loadSources();
+}
+
+async function ingestNoticeFile(name){
+  try{
+    const res = await fetch('/knowledge/files/' + encodeURIComponent(name) + '/ingest',
+                            {method: 'POST'});
+    if (res.status === 401){ location.href = '/login'; return; }
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok){
+      alert('取り込み失敗: ' + (d.detail || res.status));
+    }else{
+      $('kDetail').innerHTML =
+        '<div class="kempty"><b>' + escapeHtml(name) + '</b><br><br>'
+        + escapeHtml(d.summary || '')
+        + (d.relink_summary ? '<br><br>' + escapeHtml(d.relink_summary) : '')
+        + '</div>';
+    }
+  }catch(e){ alert('取り込み失敗: ' + e.message); }
+  loadSources();
+}
+
+async function deleteNoticeFile(f){
+  const warn = f.ingested
+    ? f.name + ' を削除します。\n取り込んだ ' + f.record_count
+      + ' 件のレコードも削除され、変更通知で置き換えた早見表の行は元に戻ります。'
+    : f.name + ' を削除します。';
+  if (!confirm(warn)) return;
+  try{
+    const res = await fetch('/knowledge/files/' + encodeURIComponent(f.name),
+                            {method: 'DELETE'});
+    if (res.status === 401){ location.href = '/login'; return; }
+    if (!res.ok){
+      const d = await res.json().catch(() => ({}));
+      alert('削除失敗: ' + (d.detail || res.status));
+    }else{
+      $('kDetail').innerHTML = '<div class="kempty">削除しました。</div>';
+    }
+  }catch(e){ alert('削除失敗: ' + e.message); }
+  loadSources();
+}
+
+async function showNoticeRaw(name){
+  for (const el of $('kList').children){
+    if (el.classList) el.classList.remove('sel');
+  }
+  $('kDetail').innerHTML = '<div class="kempty">読み込み中…</div>';
+  try{
+    const res = await fetch('/knowledge/files/' + encodeURIComponent(name) + '/raw');
+    if (res.status === 401){ location.href = '/login'; return; }
+    if (!res.ok){
+      $('kDetail').innerHTML = '<div class="kempty">読み込みに失敗しました</div>';
+      return;
+    }
+    const text = await res.text();
+    $('kDetail').innerHTML = '<div class="url">' + escapeHtml(name) + '</div>';
+    const pre = document.createElement('pre');
+    pre.style.cssText =
+      'white-space:pre-wrap;word-break:break-word;font-size:12.5px;line-height:1.7;margin:0';
+    pre.textContent = text;
+    $('kDetail').appendChild(pre);
+  }catch(e){
     $('kDetail').innerHTML = '<div class="kempty">' + escapeHtml(e.message) + '</div>';
   }
 }
@@ -657,6 +816,11 @@ async function showSource(id){
 
 $('knowledgeBtn').onclick = openKnowledge;
 $('kClose').onclick = closeKnowledge;
+$('kFileInput').onchange = e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  uploadNoticeFile(f);
+};
 $('kOverlay').onclick = e => { if (e.target === $('kOverlay')) closeKnowledge(); };
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') closeKnowledge();
