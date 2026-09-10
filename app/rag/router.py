@@ -706,6 +706,71 @@ def _item_name_candidates(
     return candidates, vector_query
 
 
+# 品目の列挙を切り分ける区切り(「AとB」「A、B」「AやB」「あとB」)。記号に加えて、
+# かな・漢字に挟まれた助詞「と」「や」も区切りとして扱う。直前・直後を文字種で
+# 縛るのは、「ボート」のように語の一部である「と」を割らないため。
+_LIST_SEP_RE = re.compile(
+    r"[、,，・]+|(?<=[ぁ-んァ-ヶ一-龥])[とや](?=[ぁ-んァ-ヶ一-龥])|あと|それと"
+)
+
+
+def _is_waste_type_only(fragment: str) -> bool:
+    """断片がごみ種別語だけで出来ているか(「かん・びん」「ペットボトル」等)。
+
+    種別そのものの質問であって品目の列挙ではないので、品目の追加検索から外す。
+    """
+    rest = _norm(fragment)
+    for word in sorted(_WASTE_WORDS, key=len, reverse=True):
+        rest = rest.replace(word, "")
+    return len(rest.strip(" ・、,，。")) < 2
+
+
+def _listed_item_extras(prompt: str, exclude: set[str]) -> list[ItemRecord]:
+    """質問文に列挙された品目のうち、早見表に完全一致するものを返す。
+
+    多品目の質問(「たんすと古い布団と、あと段ボールがたくさんあります」)では、
+    主候補の検索だけでは最初の1件しか拾えず、残りの品目が回答から抜け落ちる。
+    列挙の区切り(`_LIST_SEP_RE`)で分割し、断片ごとに完全一致(言い換えの解決込み)
+    を試して、明示的に列挙された品目を漏らさないようにする。
+
+    誤爆を防ぐため、次は採用しない:
+    - ごみ種別語だけの断片、および解決先がごみ種別そのものの行
+      (`_is_waste_type_only`)。種別の質問であって品目の列挙ではない。
+    - `exclude` にある品目(主候補として検索済み)。同じ品目を二重に載せない。
+      断片そのものの表記も見る — 早見表に「テレビ」と「テレビ(ブラウン管式…)」の
+      両方がある環境で、検索済みの「テレビ」を言い換え解決で別の行として
+      足してしまうのを防ぐ(2026-09-10 テスト回帰)。
+    ベクトル検索は使わない — 列挙の断片は短く、意味的近似を根拠にするには
+    材料が足りない(無関係な近傍を拾うだけになる)。
+    """
+    candidates, _ = _item_name_candidates(prompt)
+    fragments: list[str] = []
+    for cand in candidates:
+        for frag in _LIST_SEP_RE.split(cand):
+            frag = frag.strip()
+            if frag and frag not in fragments:
+                fragments.append(frag)
+
+    found: list[ItemRecord] = []
+    for frag in fragments:
+        if _is_waste_type_only(frag) or _norm(frag) in exclude:
+            continue
+        rec = lookup_item_exact(resolve_canonical_alias(frag) or frag)
+        if rec is None:
+            rec = _pick_embedded_item(frag, lookup_item_contained_in(frag))
+        if rec is None or _norm(rec.item_name) in exclude:
+            continue
+        if _is_waste_type_only(rec.item_name):
+            # 断片全体は種別語だけではないが、解決先が種別そのものの行
+            # (「ペットボトル」「かん・びん」)というケース。品目の列挙ではない
+            # ので足さない(「かん・びんとペットボトルは同じ袋に…」で
+            # ペットボトルを品目として拾ってしまう回帰を防ぐ)。
+            continue
+        exclude.add(_norm(rec.item_name))
+        found.append(rec)
+    return found
+
+
 def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str | None:
     """質問文から品名らしき部分(主候補のみ)を取り出す。"""
     candidates, _ = _item_name_candidates(prompt, strip_waste_words)
@@ -783,6 +848,20 @@ def _search_item(
     if embedded is not None:
         return [embedded], "exact"
 
+    # 言い換え表(`_CANONICAL_ALIASES`)の語が質問文にそのまま埋もれている
+    # ケースの救済。「硫酸」のように早見表に品名として存在しない物質名を、
+    # 包括行(「薬品(家庭医薬品でないもの)」)へ固定する。完全一致・部分一致・
+    # 埋め込み品名がすべて空振りしたあとにだけ試すので、既存の品名一致を
+    # 横取りしない(2026-09-10 第6回採点回帰: 「硫酸」がベクトル類似で
+    # 「油(食用油)=家庭ごみ」に化けていた)。
+    for probe in (item_name, *(extra_candidates or [])):
+        target = _resolve_embedded_alias(probe)
+        if not target:
+            continue
+        rec = lookup_item_exact(target)
+        if rec is not None:
+            return [rec], "exact"
+
     # 埋め込み品名も見つからず、ベクトル検索に渡すクエリ自体が文・代名詞
     # 参照・相槌らしいなら(`_looks_like_a_sentence`)、ベクトル検索にも
     # 回さない。根拠の無い文字列をそのまま embedding にかけても、無関係な
@@ -811,6 +890,12 @@ _AFTER_NAME_OK = re.compile(
     r"|(?:は|の|を|、)?\s*(?:捨て|出せ|出し|処分|廃棄|分別|区分|回収|収集|処理|片付け)"
     r")"
 )
+
+# 言い換え表(`_resolve_embedded_alias`)の探索だけに足す緩和。早見表の品名一致
+# (`_pick_embedded_item`)は「電動歯ブラシの充電スタンド」を別品目として正しく
+# 弾く必要があるため緩めないが、言い換えでは「注射器の本体」のように「の」+
+# 部位を表す語が続いても指している品物は同じなので成立させる。
+_PART_SUFFIX_RE = re.compile(r"^の(?:本体|部分|中身|フタ|ふた)")
 
 
 def _pick_embedded_item(text: str, candidates: list[ItemRecord]) -> "ItemRecord | None":
@@ -1060,7 +1145,16 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         # 自体が原文にそのまま出ていれば完全一致として扱い、正しい品名で
         # timeline も引けるようにする(trace: 46/50 が vector・timeline 0 の回帰)。
         if ans.item_match == "analogy":
-            named = _resolve_named_hit(prompt, ans.item_hits)
+            # 言い換え表(`_CANONICAL_ALIASES`)から名前が変わった行(「硫酸」→
+            # 「薬品(家庭医薬品でないもの)」)は、質問文に正式名が現れないため
+            # `_resolve_named_hit` では拾えない。ヒット名と解決先が一致することを
+            # 確認したうえで引き上げる。
+            # 埋め込み品名(`_pick_embedded_item`)はここでは使わない — あちらは
+            # 直前の境界を見ないので、「電動スケートボード」の中の「スケートボード」
+            # のような別品目まで exact に上げてしまう(2026-09-10 テスト回帰)。
+            named = _resolve_named_hit(prompt, ans.item_hits) or _resolve_alias_hit(
+                prompt, item_candidates, ans.item_hits
+            )
             if named is not None:
                 ans.item_match = "exact"
                 ans.detected_item = named.item_name
@@ -1078,6 +1172,27 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         # `analogy_unreliable` は使える候補が1つも無いときだけ。
         if ans.item_match == "analogy" and ans.item_match_stage == "vector":
             ans.analogy_unreliable = _analogy_pick(ans.item_hits, ans.detected_item) is None
+
+        # 品目の列挙(「たんすと布団と、あと段ボール」)では主候補の検索だけでは
+        # 1件しか拾えない。質問文に明示的に列挙された品目を追加で検索し、回答から
+        # 抜け落ちないようにする(2026-09-10 第6回採点回帰)。検索段が exact
+        # (原文の品名が早見表の行に確定した)ときだけ行う — 部分一致・ベクトルの段
+        # では質問の品目が一意でなく、断片の完全一致を混ぜると別品目の断定根拠に
+        # なってしまう。
+        if ans.item_match_stage == "exact" and len(ans.item_hits) == 1:
+            exclude = {_norm(h.item_name) for h in ans.item_hits}
+            exclude |= {_norm(c) for c in item_candidates}
+            extras = _listed_item_extras(prompt, exclude)
+            if extras:
+                # 列挙された品目がそれぞれ原文の品名と完全一致しているなら、類推では
+                # なく「複数品目の質問」として扱う。analogy のままだと context が
+                # `_analogy_pick` で1件に絞られ、他の品目が回答から消える。
+                ans.item_hits = ans.item_hits + extras
+                if ans.item_match != "exact":
+                    ans.item_match = "exact"
+                    ans.detected_item = (
+                        getattr(ans.item_hits[0], "item_name", None) or ans.detected_item
+                    )
 
     if ward:
         # 早見表がヒットしていれば、その出し方(disposal_method)を収集日検索の
@@ -1241,6 +1356,23 @@ def _is_confirmation_question(prompt: str) -> bool:
     return bool(_CONFIRMATION_RE.search(_norm(prompt or "")))
 
 
+# 利用者が品物の状態・内容物を前提として述べている発話(「水と魚が入ったまま」
+# 「洗わずにそのまま」等)。区分を答えるだけでは条件に触れられず、必須項目
+# テンプレート(項目表)では「先に中身を取り出す」等の手順を案内できないため、
+# テンプレートを当てずに LLM に条件ごと個別に答えさせる。
+# 実採点traceの実プロンプト165件で、この判定に当たるのは「水と魚が入ったままの
+# 大きな水槽」と「農薬の空き容器は、洗わずにそのまま」の2件だけで、通常の
+# 分別質問には発火しないことを確認済み(2026-09-10)。
+_STATED_CONDITION_RE = re.compile(
+    r"入ったまま|入れたまま|残ったまま|ついたまま|入った状態"
+    r"|そのまま|このまま|のままで|中身が入|中身入り|入っている|入ってる"
+)
+
+
+def _has_stated_condition(prompt: str) -> bool:
+    return bool(_STATED_CONDITION_RE.search(_norm(prompt or "")))
+
+
 def apply_response_template(ans: RoutedAnswer, prompt: str = "") -> RoutedAnswer:
     """高リスク回答に必須項目テンプレートを適用して返す。
 
@@ -1258,10 +1390,15 @@ def apply_response_template(ans: RoutedAnswer, prompt: str = "") -> RoutedAnswer
     等の誤った前提の確認は、LLM が「いいえ、燃えないごみの日には出せません」と
     前提を明確に否定して通過していた。テンプレートは項目表しか返さず、この
     否定が消える(統合ブランチで実DBに対して確認)。
+
+    `prompt` が品物の状態・内容物を述べている場合(`_has_stated_condition`)も
+    対象外。2026-09-10 第6回採点で「水と魚が入ったままの大きな水槽」に項目表が
+    当たり、述べられた条件に一切触れない回答になっていた(項目表は品目の区分を
+    並べるだけで、条件への対処を書く欄を持たない)。
     """
     if ans.safety_gate == "6-2":
         return ans
-    if _is_confirmation_question(prompt):
+    if _is_confirmation_question(prompt) or _has_stated_condition(prompt):
         return ans
     if ans.canned_response is None:
         templated = _build_required_fields_response(ans)
@@ -1278,6 +1415,11 @@ def _build_required_fields_response(ans: RoutedAnswer) -> str | None:
     収集対象外などを省略したり、根拠のない条件を補ったりする余地を減らす。
     """
     if not ans.item_hits or ans.item_match == "analogy" or ans.timeline_change:
+        return None
+    if len(ans.item_hits) > 1:
+        # 多品目の質問(「たんすと布団と段ボール」)では、この項目表は1品目しか
+        # 表せず、残りの品目が回答から抜け落ちる(2026-09-10 第6回採点回帰)。
+        # 項目表をやめ、LLM に全品目を個別に整理させる。
         return None
 
     item = ans.item_hits[0]
@@ -1303,16 +1445,28 @@ def _build_required_fields_response(ans: RoutedAnswer) -> str | None:
                 for s in schedules
             ))
         else:
-            lines.append("収集日: 検索結果に記載なし")
-        lines.append("申込・手数料: 備考に記載された申込・手数料の条件に従ってください。")
+            lines.append(
+                "収集日: お住まいの区名と町名(丁目まで)をお知らせいただければ"
+                "お調べします。"
+            )
+        lines.append(
+            "申込・手数料: 品目ごとに300円・500円・700円・1,000円のいずれかです。"
+            "事前に粗大ごみ受付センター(電話: 093-513-3005)またはインターネットで"
+            "お申し込みください(インターネットからの申込ではキャッシュレス決済も"
+            "選べます)。"
+        )
         lines.append("注意事項: 粗大ごみは事前申込が必要です。申込なしで収集日に出さないでください。")
         return "\n".join(lines)
 
     if not_collected:
-        lines.append("出し方・条件: 市が収集しない品目です。")
+        lines.append(
+            "出し方・条件: 市が収集しない品目です。"
+            "家庭ごみ・粗大ごみとして出すことはできません。"
+        )
         lines.append("収集日: 市による決まった収集曜日はありません。")
-        lines.append("申込・手数料: 早見表の備考に記載された条件に従ってください。")
-        lines.append("相談先・注意事項: " + (notes or "販売店・専門業者等への相談が必要です。"))
+        lines.append(
+            "相談先: " + (notes or "販売店・専門の処理業者等へご相談ください。")
+        )
         return "\n".join(lines)
 
     if no_weekday:
@@ -1337,6 +1491,22 @@ def _build_required_fields_response(ans: RoutedAnswer) -> str | None:
 # なお本来はデータ層側で解決すべき問題でもある(接続をスレッドごとに持つ、
 # または check_same_thread=False + ロック)。こちらは応用層で完結する防御。
 _db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rag-lookup")
+
+
+def needs_history_retry(ans: "RoutedAnswer | None") -> bool:
+    """決定論的経路が品目も収集日も特定できなかったか。
+
+    この状態の回答は 6-3 の「品名を教えてください」固定文で、セッションの過去の
+    発話にある品目を一切使えていない。6-1a/6-2 は `app/server.py._mark` で印が
+    付くか、そもそも `_route_safely` の入口で返っているので、`safety_gate` が
+    "6-3" かどうかだけを見れば「完全空振り」を正確に判定できる(6-3 以外で
+    canned が立つ経路 — 4-3 確度ゲート・種別の一般説明なし — は、品目や種別に
+    見当が付いている)。
+
+    呼び出し側(`app/server.py._route_safely`)は True のとき、会話履歴の利用者
+    発言を前置した文字列で一度だけ引き直す(`agent.build_history_query`)。
+    """
+    return ans is not None and ans.safety_gate == "6-3"
 
 
 async def handle_query(
@@ -1413,6 +1583,22 @@ _CANONICAL_ALIASES = {
     "カップ麺の容器": "カップめんなどの容器・フィルム",
     "カップめんの容器": "カップめんなどの容器・フィルム",
     "カップラーメンの容器": "カップめんなどの容器・フィルム",
+    # 長音符の有無だけが違う同じ品目の言い換え(早見表の表記は「ソファー」)。
+    "ソファ": "ソファー",
+    # 2026-09-10 第6回採点回帰。化学物質名は早見表に品名として存在せず、
+    # 包括行(「薬品(家庭医薬品でないもの)」等)にしか対応が無い。ベクトル
+    # 類似に任せると「硫酸 → 油(食用油) = 家庭ごみ」のような別区分への誤類推が
+    # 起きるため、物質名そのものの言い換えとして包括行へ固定する。
+    # いずれも実データ(waste_items)に存在する行を指す。
+    "硫酸": "薬品(家庭医薬品でないもの)",
+    "塩酸": "薬品(家庭医薬品でないもの)",
+    "硝酸": "薬品(家庭医薬品でないもの)",
+    "化学薬品": "薬品(家庭医薬品でないもの)",
+    "劇物": "薬品(家庭医薬品でないもの)",
+    "毒物": "薬品(家庭医薬品でないもの)",
+    "農薬の空き容器": "農薬びん(家庭用)(中身のないもの)",
+    "農薬の容器": "農薬びん(家庭用)(中身のないもの)",
+    "注射器": "注射筒",
 }
 
 
@@ -1423,6 +1609,62 @@ def resolve_canonical_alias(query: str) -> str | None:
     `app/rag/tools.py`(agentic経路)の両方から呼ばれる共通の解決関数。
     """
     return _CANONICAL_ALIASES.get(_norm(query))
+
+
+def _resolve_embedded_alias(text: str) -> str | None:
+    """`text` の中に言い換え表のキーが「品名の主辞として」現れていれば、
+    対応する正式名を返す。
+
+    `resolve_canonical_alias` が候補文字列そのものの言い換えなのに対し、こちらは
+    「理科の実験で使った硫酸が残っているのですが」のように品名が質問文に埋もれ、
+    候補抽出(`_item_name_candidates`)で切り出せなかった場合の救済。呼び出し側は
+    完全一致・部分一致・埋め込み品名がすべて空振りしたあとにだけ試すので、
+    既存の品名一致を横取りしない。
+
+    直後の境界検査に `_AFTER_NAME_OK` を使うのは `_pick_embedded_item` と同じ理由。
+    これが無いと「テレビ台」(別品目)の中の「テレビ」を拾ってしまう。直前の境界は
+    見ない(「使った硫酸」のように直前が動詞の活用語尾でも品名は品名のため)。
+    長いキーから順に試し、最も具体的な言い換えを優先する。
+    """
+    norm = _norm(text)
+    if not norm:
+        return None
+    for key, target in sorted(
+        _CANONICAL_ALIASES.items(), key=lambda kv: len(kv[0]), reverse=True
+    ):
+        if len(key) < 2:
+            continue
+        start = 0
+        while True:
+            idx = norm.find(key, start)
+            if idx == -1:
+                break
+            rest = norm[idx + len(key):]
+            if _AFTER_NAME_OK.match(rest) or _PART_SUFFIX_RE.match(rest):
+                return target
+            start = idx + 1
+    return None
+
+
+def _resolve_alias_hit(
+    prompt: str, item_candidates: list[str], hits: list[ItemRecord]
+) -> "ItemRecord | None":
+    """ヒットが言い換え表の解決結果だった場合、その1件を返す。
+
+    `_resolve_named_hit` は「ヒット名が質問文にそのまま現れている」ことしか
+    見ないため、言い換え・物質名から包括行へ解決したケース(質問文に正式名が
+    現れない)では None になる。ヒット名と解決先が一致することを確認したうえで
+    返し、呼び出し側で exact へ上げられるようにする。
+    """
+    for probe in [*item_candidates, prompt]:
+        target = resolve_canonical_alias(probe) or _resolve_embedded_alias(probe)
+        if not target:
+            continue
+        q = _norm(target)
+        for h in hits:
+            if _norm(getattr(h, "item_name", "")) == q:
+                return h
+    return None
 
 
 def _override_analogy_hits(query: str, hits: list[ItemRecord]) -> list[ItemRecord]:
@@ -1781,6 +2023,10 @@ _RULES_DANGEROUS_REQUEST = (
     "- 検索結果に該当品目が無い場合でも、情報不足を理由に回答を避けない。"
     "その方法が禁止であることを明示したうえで、品名を具体的に尋ね、"
     "北九州市の窓口へ相談するよう案内する。\n"
+    "- 検索結果の『備考』に、条件によって区分が変わる記載(「割れたものは"
+    "家庭ごみ」「必ず中身を使い切ってから穴をあけずに」等)がある場合は、"
+    "書かれているとおりに伝えること。断定を強めたり、否定・反対の意味に"
+    "書き換えたりしてはならない。\n"
 )
 
 # 4-3 確度ゲート(_analogy_is_reliable)で弾いたとき用。意味の近い候補は
@@ -1831,12 +2077,30 @@ def _has_conditional_notes(ans: RoutedAnswer) -> bool:
     return any(_CONDITION_HINT_RE.search(getattr(h, "notes", "") or "") for h in ans.item_hits)
 
 
-def build_system_prompt(ans: RoutedAnswer) -> str:
+_RULES_USER_CONDITION = (
+    "- 利用者は品物の状態・内容物について条件を述べている(「水と魚が入った"
+    "まま」「洗わずにそのまま」等)。その条件を無視せず、一つずつ取り上げて"
+    "どうすればよいかを案内すること。\n"
+    "- 検索結果にその条件の扱いが書かれている場合は、書かれているとおりに伝える"
+    "(「必ず中身を使い切ってから」等)。書かれていない場合でも「問題ありません」"
+    "「そのままで大丈夫です」と断定してはならない。検索結果からは判断できない"
+    "ことを明示し、北九州市の窓口(お住まいの区の環境センター)での確認を案内する。\n"
+)
+
+
+def build_system_prompt(ans: RoutedAnswer, prompt: str = "") -> str:
     """`RoutedAnswer` からLLMへのシステムプロンプトを組み立てる。
 
     設計提案書 3-7(未識別時は憶測で断定しない)をここで強制する。
+
+    `prompt` は利用者の生の発話。品物の状態・内容物について条件を述べている
+    場合(`_has_stated_condition`)に、その条件へ一つずつ触れさせる規則を足す
+    (`apply_response_template` が同じ判定で項目表を外すのと対になっている)。
     """
     parts = [_BASE_RULES]
+
+    if prompt and _has_stated_condition(prompt):
+        parts.append(_RULES_USER_CONDITION)
 
     if ans.safety_gate == "6-2":
         # 検索結果の有無に関わらず、禁止の明示と正しい手順の提示を課す。

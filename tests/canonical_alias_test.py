@@ -19,7 +19,11 @@ B1実機の失敗トレース(ユーザー提供)で確認された、品名の�
 
 from __future__ import annotations
 
-from app.rag.router import _search_item, resolve_canonical_alias
+from app.rag.router import (
+    _resolve_embedded_alias,
+    _search_item,
+    resolve_canonical_alias,
+)
 from app.rag.tools import execute_tool
 
 
@@ -65,3 +69,71 @@ def test_cup_noodle_container_note_about_paper_containers_is_preserved():
     既存の備考にもう入っている ― 追加のテキストは要らない。"""
     result = execute_tool("search_waste_item", {"query": "カップめんの容器"})
     assert "紙製の容器は家庭ごみ" in result["items"][0]["notes"]
+
+
+# --- 第6回実採点(2026-09-10)で追加した別名 ---------------------------------
+# 化学物質名は早見表に品名として存在せず、包括行(「薬品(家庭医薬品でない
+# もの)」等)にしか対応が無い。ベクトル類似に任せると「硫酸」が
+# 「油(食用油)=家庭ごみ」に化けていた。
+
+
+def test_hazard_substance_aliases_resolve_to_the_consult_only_row():
+    for name in ("硫酸", "塩酸", "硝酸", "化学薬品", "劇物", "毒物"):
+        assert resolve_canonical_alias(name) == "薬品(家庭医薬品でないもの)"
+
+
+def test_syringe_and_pesticide_container_aliases():
+    assert resolve_canonical_alias("注射器") == "注射筒"
+    assert resolve_canonical_alias("農薬の空き容器") == "農薬びん(家庭用)(中身のないもの)"
+
+
+def test_sofa_alias_covers_the_long_vowel_variant():
+    assert resolve_canonical_alias("ソファ") == "ソファー"
+
+
+def test_embedded_alias_finds_the_substance_name_inside_a_sentence():
+    """候補抽出で切り出せない文でも、物質名が主辞として現れていれば解決する。"""
+    assert (
+        _resolve_embedded_alias("理科の実験で使った硫酸が残っているのですが")
+        == "薬品(家庭医薬品でないもの)"
+    )
+
+
+def test_embedded_alias_respects_the_after_boundary():
+    """「テレビ台」の中の「テレビ」は別品目なので拾わない。"""
+    assert _resolve_embedded_alias("テレビ台を捨てたいです") is None
+    assert _resolve_embedded_alias("ソファーベッドを捨てたいです") is None
+
+
+def test_embedded_alias_accepts_a_part_suffix():
+    """「の」+部位を表す語が続いても、指している品物は同じ。"""
+    assert _resolve_embedded_alias("注射器の本体は燃えるごみですか") == "注射筒"
+
+
+def test_deterministic_path_resolves_a_substance_through_the_embedded_alias():
+    hits, stage = _search_item(
+        "理科の実験で使った硫酸が残っているのですが、どう処分すればいいですか？"
+    )
+    assert stage == "exact"
+    assert [h.item_name for h in hits] == ["薬品(家庭医薬品でないもの)"]
+    assert hits[0].disposal_method == "市が収集しないもの"
+
+
+def test_agentic_tool_resolves_the_same_embedded_alias():
+    result = execute_tool(
+        "search_waste_item",
+        {"query": "理科の実験で使った硫酸が残っているのですが、どう処分すればいいですか？"},
+    )
+    assert result["match_stage"] == "exact"
+    assert result["items"][0]["item_name"] == "薬品(家庭医薬品でないもの)"
+
+
+def test_pesticide_container_resolves_to_the_household_waste_row():
+    """「資源ごみにそのまま出していい？」に対し、正しい区分は家庭ごみ。"""
+    result = execute_tool(
+        "search_waste_item",
+        {"query": "農薬の空き容器は、洗わずにそのまま資源ごみに出していいですか？"},
+    )
+    assert result["match_stage"] == "exact"
+    assert result["items"][0]["item_name"] == "農薬びん(家庭用)(中身のないもの)"
+    assert result["items"][0]["disposal_method"] == "家庭ごみ"

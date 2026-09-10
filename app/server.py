@@ -374,8 +374,26 @@ async def _route_safely(
               flush=True)
 
     try:
-        result = await router.handle_query(prompt, img, engine=engine, processor=processor)
-        return router.apply_response_template(_mark(result), prompt)
+        result = _mark(
+            await router.handle_query(prompt, img, engine=engine, processor=processor)
+        )
+        if router.needs_history_retry(result) and history:
+            # 決定論的経路は会話履歴を受け取らないため、品名を省いた追問
+            # (「え、知らなかったです。じゃあどうすればいいんですか？」)では
+            # 品目を特定できず6-3の固定文に落ちる。過去の利用者発言を前置して
+            # 一度だけ引き直し、品目か収集日が拾えたときだけ差し替える
+            # (2026-09-10 第6回採点回帰)。画像は現在の発話に添付されたもので、
+            # 引き直しの材料は履歴のテキスト側なので再分類させない。
+            combined = agent.build_history_query(history, prompt)
+            if combined:
+                retried = _mark(
+                    await router.handle_query(
+                        combined, None, engine=engine, processor=processor
+                    )
+                )
+                if retried.item_hits or retried.schedule_hits:
+                    result = retried
+        return router.apply_response_template(result, prompt)
     except Exception as exc:  # noqa: BLE001 — 生成の継続を最優先する
         print(f"[rag] handle_query failed, falling back to plain generation: {exc!r}",
               flush=True)
@@ -427,7 +445,7 @@ async def _stream_chat(
 
     if routed is not None:
         prompt_input = _build_prompt(
-            [{"role": "system", "content": router.build_system_prompt(routed)}] + messages
+            [{"role": "system", "content": router.build_system_prompt(routed, prompt)}] + messages
         )
     else:
         prompt_input = _build_prompt(messages)

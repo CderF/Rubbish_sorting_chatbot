@@ -36,6 +36,7 @@ from app.rag.router import (
     _district_groups,
     _partial_lookup_ok,
     _pick_embedded_item,
+    _resolve_embedded_alias,
     _uniform_district_schedule,
     _vector_query_ok,
     resolve_canonical_alias,
@@ -195,6 +196,15 @@ def _tool_search_waste_item(query: str) -> dict:
     embedded = _pick_embedded_item(query, lookup_item_contained_in(query))
     if embedded is not None:
         return {"match_stage": "exact", "items": [_serialize_item(embedded)]}
+
+    # 言い換え表の語が質問文にそのまま埋もれているケースの救済(router._search_item
+    # と同じ規則。「硫酸」→「薬品(家庭医薬品でないもの)」等)。完全一致・部分一致・
+    # 埋め込み品名がすべて空振りしたあとにだけ試し、既存の品名一致を横取りしない。
+    alias_target = _resolve_embedded_alias(query)
+    if alias_target:
+        alias_hit = lookup_item_exact(alias_target)
+        if alias_hit is not None:
+            return {"match_stage": "exact", "items": [_serialize_item(alias_hit)]}
 
     if not _vector_query_ok(query):
         return {"match_stage": "none", "items": []}

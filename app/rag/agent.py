@@ -66,9 +66,12 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 from app.rag.router import (
+    _AFTER_NAME_OK,
     _CURBSIDE_WASTE_TYPES,
     _KANA_ONLY_RE,
     _analogy_pick,
+    _base_name,
+    _listed_item_extras,
     _match_district,
     _override_analogy_hits,
     _shared_run_len,
@@ -76,7 +79,7 @@ from app.rag.router import (
     extract_region,
 )
 from app.rag.tool_call_parser import ToolCall, parse_tool_calls
-from app.rag.tools import TOOL_SCHEMAS, execute_tool
+from app.rag.tools import TOOL_SCHEMAS, _serialize_item, execute_tool
 from app.rag.types import RoutedAnswer
 
 _SYSTEM_PROMPT = (
@@ -97,6 +100,8 @@ _SYSTEM_PROMPT = (
     "「古紙を出したいです」のように、特定の品目ではなくごみ種別そのものの"
     "出し方・手続きを尋ねる質問でも呼んではならない"
     "(「ごみ箱」等、無関係な品目名を検索キーにしないこと)。\n"
+    "- 一度に複数の品目を尋ねられた場合(「たんすと布団と、あと段ボール」等)は、"
+    "列挙された品目を一つも省かず、それぞれについて search_waste_item を呼ぶ。\n"
     "- 収集曜日を調べるには lookup_collection_schedule を使う"
     "(区名と町名が分かっているときに呼ぶ。町名は丁目まで分からなくてもよく、"
     "「黒崎」のように丁目を省略した地区名でも解決できることがあるので、"
@@ -131,6 +136,29 @@ def _message_text(message: dict) -> str:
             if isinstance(part, dict) and part.get("type") == "text"
         )
     return ""
+
+
+def build_history_query(history: list[dict], prompt: str) -> str | None:
+    """会話履歴の利用者発言を、古い順にこのターンの発話へ前置した文字列。
+
+    決定論的経路(`router._blocking_route`)は会話履歴を受け取らないため、
+    「え、知らなかったです。じゃあどうすればいいんですか？」のように品名を
+    省いた追問では品目を特定できず6-3に落ちる。過去の利用者発言を一緒に
+    渡して品名の省略を補う(`app/server.py._route_safely` から呼ばれる。
+    2026-09-10 第6回採点回帰)。
+
+    直前の3発言までに限るのは、話題が変わった古い発言まで混ぜると、無関係な
+    品名を拾って別の回答になるため。利用者発言が1つも無ければ None を返し、
+    呼び出し側は引き直しを行わない。
+    """
+    past = [
+        text
+        for text in (_message_text(m) for m in history if m.get("role") == "user")
+        if text.strip()
+    ]
+    if not past:
+        return None
+    return "\n".join([*past[-3:], prompt])
 
 
 def _query_grounded_in_text(query: str, text: str) -> bool:
@@ -316,6 +344,35 @@ async def _run_loop(
                             sources.append(seg["source_url"])
 
     collected_items, match_stage = _narrow_item_hits(item_call_results, detected_item, user_content)
+
+    # 質問文に複数の品目が列挙されていても、モデルが全品目を検索したとは限らない
+    # (小型モデルは列挙の一部しか呼ばないことがある)。コード側で列挙を拾い直し、
+    # 回答から品目が抜け落ちないようにする(router._blocking_route と同じ規則。
+    # 2026-09-10 第6回採点回帰)。
+    if collected_items and match_stage == "exact":
+        exclude = {_norm(getattr(it, "item_name", "")) for it in collected_items}
+        if detected_item:
+            exclude.add(_norm(detected_item))
+        extras = _listed_item_extras(user_content, exclude)
+        if extras:
+            collected_items = collected_items + [
+                SimpleNamespace(**_serialize_item(r)) for r in extras
+            ]
+        if len(collected_items) > 1:
+            # `_build_routed_answer` は `query`(=detected_item)と品目名を突き合わせて
+            # exact/analogy を決めるため、detected_item が収集済みの品目に含まれて
+            # いないと analogy に落ち、context が `_analogy_pick` で1件に絞られて
+            # 他の品目が回答から消える。複数品目の質問では先頭の品目を代表にする。
+            detected_item = (
+                getattr(collected_items[0], "item_name", None) or detected_item
+            )
+
+    if collected_items:
+        # 品目が確定している質問では、無関係なページのチャンクを根拠から外す。
+        collected_explanations = _filter_explanations_to_items(
+            collected_explanations, collected_items
+        )
+
     for item in collected_items:
         if item.source_url:
             sources.append(item.source_url)
@@ -455,6 +512,76 @@ def _fill_schedule_for_waste_type(
 _MATCH_STAGE_RANK = {"exact": 3, "partial": 2, "vector": 1}
 
 
+def _items_mentioned_in_text(
+    text: str, items: list[SimpleNamespace]
+) -> list[SimpleNamespace]:
+    """`text` の中に品名(または括弧を外した主名)が主辞として現れている候補を
+    全部返す。
+
+    多品目の質問(「たんすと古い布団と、あと段ボールがたくさんあります」)では、
+    モデルが品目ごとに `search_waste_item` を呼んでいても、`_narrow_item_hits`
+    が1件に絞ると残りの品目が回答から抜け落ちる。質問文に実際に現れている候補は
+    根拠があるので全部残す。
+
+    境界検査は `router._pick_embedded_item` と同じ規則(`_AFTER_NAME_OK`)を使う。
+    これが無いと「テレビ台」の中の「テレビ」を拾ってしまう。
+    """
+    norm_text = _norm(text)
+    found: list[SimpleNamespace] = []
+    for it in items:
+        full = _norm(getattr(it, "item_name", ""))
+        if not full:
+            continue
+        for name in (full, _base_name(full)):
+            if len(name) < 2:
+                continue
+            idx = norm_text.find(name)
+            if idx == -1:
+                continue
+            if _AFTER_NAME_OK.match(norm_text[idx + len(name):]):
+                found.append(it)
+                break
+    return found
+
+
+def _filter_explanations_to_items(
+    explanations: list[dict], items: list[SimpleNamespace]
+) -> list[dict]:
+    """一般説明チャンクのうち、見つかった品目に関係するものだけを残す。
+
+    モデルは `search_general_info` を探索的に呼ぶため、無関係なページ
+    (「ふれあい収集」「ごみステーションの散乱対策」等)のチャンクが context に
+    混ざり、小型モデルがそれを回答に混ぜてしまう。品目が確定している質問では、
+    品目名(括弧を外した主名)か、その品目の分別区分に触れているチャンクだけを
+    根拠として残す。
+
+    品目名だけを条件にすると「粗大ごみの申込み方法」のような、品目名を含まない
+    が的確なページまで落ちてしまうため、分別区分も条件に含める。品目が
+    見つかっていない一般質問は対象外(絞り込む根拠が無い)。
+    """
+    if not items:
+        return explanations
+    names: list[str] = []
+    waste_types: list[str] = []
+    for it in items:
+        full = _norm(getattr(it, "item_name", ""))
+        for name in (full, _base_name(full)):
+            if len(name) >= 2 and name not in names:
+                names.append(name)
+        method = getattr(it, "disposal_method", "") or ""
+        if method and method not in waste_types:
+            waste_types.append(method)
+
+    kept: list[dict] = []
+    for entry in explanations:
+        text = _norm(entry.get("text") or "")
+        if any(name in text for name in names) or any(
+            wt in text for wt in waste_types
+        ):
+            kept.append(entry)
+    return kept
+
+
 def _narrow_item_hits(
     item_call_results: list[tuple[str | None, list[SimpleNamespace]]],
     detected_item: str | None,
@@ -502,6 +629,15 @@ def _narrow_item_hits(
         return [], None
     if len(best_items) == 1:
         return best_items, best_stage
+
+    if best_stage == "exact":
+        # 質問文に複数の品名がそのまま現れているなら、それは品目の列挙
+        # (「たんすと古い布団と、あと段ボール」)。完全一致の段でだけ、現れて
+        # いる候補を全部残す(部分一致・ベクトルの段では質問の品目が一意でなく、
+        # 複数残すとモデルが各候補の出し方を混ぜて答えてしまう)。
+        mentioned = _items_mentioned_in_text(prompt_text, best_items)
+        if len(mentioned) > 1:
+            return mentioned, best_stage
 
     if detected_item:
         q = _norm(detected_item)
