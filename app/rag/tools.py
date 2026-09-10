@@ -28,7 +28,21 @@ from typing import Any, Callable
 from app.data.lookup import lookup_collection_schedule, lookup_item_exact, lookup_item_partial
 from app.notices.lookup import pending_change
 from app.rag.router import _district_groups, _uniform_district_schedule
-from app.rag.vector_store import vector_search_explanations, vector_search_items
+
+# ベクトルRAGパスは重い依存(chromadb / sentence-transformers)を引く。
+# router.py と同じく、未インストール環境でもこのモジュールを import できるよう
+# フォールバックに留める(STAGE07 の MCP サーバは GPU なしホストで動かす前提で、
+# `search_general_info` を使わないなら chromadb 等は不要 — レビュー #47-6)。
+try:
+    from app.rag.vector_store import vector_search_explanations, vector_search_items
+except ImportError:  # pragma: no cover - 依存未導入時のみ
+    from app.rag.types import ChunkRecord, ItemRecord
+
+    def vector_search_items(query: str, top_k: int = 3) -> "list[ItemRecord]":
+        return []
+
+    def vector_search_explanations(query: str, top_k: int = 3) -> "list[ChunkRecord]":
+        return []
 
 # --- OpenAI-style function-calling スキーマ ---------------------------------
 # `processor.apply_chat_template(messages, tools=TOOL_SCHEMAS, ...)` にそのまま

@@ -44,7 +44,7 @@ STAGE05(マルチターン、PR #24)・STAGE06(安全対応、PR #43/#45)は本�
 | `lookup_collection_schedule(ward, town, waste_type)` | 同上(収集日パス。丁目省略の地区名解決込み) |
 | `lookup_item_change_notice(item_name)` | 同上(お知らせパス、STAGE04 4-2) |
 | `search_general_info(query)` | 同上(ベクトルRAGパス) |
-| `get_disposal_guidance(prompt, user_id=None)` | 1発の相談文を `router._blocking_route(prompt)` に通し、`context`・`sources`・マッチ段階・`missing`・表(markdown)を返す。**LLM生成は通さない**。`user_id` を渡すと7-4の記憶で地区を補う(§2.4) |
+| `get_disposal_guidance(prompt, user_id=None)` | 1発の相談文を `router._blocking_route(prompt)` に通し、`context`・`sources`・マッチ段階・`missing`・`canned_response`(確度ゲート等でルータが確定させた固定文)・表(markdown)を返す。**LLM生成は通さない**。`user_id` を渡すと7-4の記憶で地区を補う(§2.4) |
 | `remember_fact` / `recall_facts` / `forget_facts(user_id, …)` | 7-4 の記憶ストアへの明示的な読み書き |
 
 | リソース | 中身 |
@@ -91,10 +91,11 @@ FastAPIを使って `/chat` を自分たちで実装したのと同じ扱いと�
 }
 ```
 
-事前準備:
+事前準備(GPU なしホスト。`requirements.txt` は入れない — `vllm==0.28.0` が
+CUDA を要求するため):
 
 ```bash
-pip install -r requirements.txt -r requirements-mcp.txt
+pip install -r requirements-mcp.txt
 ```
 
 `var/kitakyushu_waste.db`(構造化DB)と `var/chroma/`(ベクトル索引)が要る。GPU・vLLMは不要

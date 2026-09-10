@@ -1,15 +1,29 @@
-# STAGE07 7-1/7-2: dependency for app/mcp_server.py only.
+# STAGE07 7-1/7-2: dependencies for `python -m app.mcp_server` only.
 #
 # Kept separate from requirements.txt on purpose: that file is "pinned to what
-# is running on the B1 server" (its own header comment) — B1 serves /chat via
-# vLLM and never runs the MCP server. This file is for whoever runs
-# `python -m app.mcp_server` (a mentor's machine, or a dev machine), which
-# needs the data layer (sqlite3, stdlib) + chroma (already in the main repo
-# venv if vector search is wanted) but NOT vllm/torch/pynvml.
+# is running on the B1 server" and pulls in vllm==0.28.0 (CUDA-only). B1 serves
+# /chat via vLLM and never runs the MCP server. This file is for whoever runs
+# the MCP server on a machine WITHOUT a GPU (a mentor's laptop, a dev box).
 #
-#   pip install -r requirements.txt -r requirements-mcp.txt
+# Install this file ALONE — do not combine it with requirements.txt:
 #
-# Pinned to the officially-supported v1 API (FastMCP). mcp>=2 renamed
-# FastMCP -> MCPServer with a different API; do not bump past 1.x without
-# updating app/mcp_server.py to match.
+#   pip install -r requirements-mcp.txt
+#
+# All pins below match requirements.txt exactly.
+
+# MCP protocol. Pinned to the officially-supported v1 API (FastMCP). mcp>=2
+# renamed FastMCP -> MCPServer with a different API; do not bump past 1.x
+# without updating app/mcp_server.py to match.
 mcp==1.30.0
+
+# data schema models (app/data/schema.py) — imported on every server path
+pydantic==2.13.5
+
+# ベクトルRAGパス(search_general_info / 早見表のベクトル fallback)。
+# app/rag/tools.py はこれらが無くても import できる(未導入ならその2ツールが
+# 空を返すだけ)が、mentor 環境では入れておく。sentence-transformers は CPU 版
+# torch を連れてくる(CUDA 不要、初回だけ数百MBのダウンロード)。
+chromadb==1.5.9
+sentence-transformers==6.0.1
+requests==2.34.2
+beautifulsoup4==4.15.0

@@ -168,7 +168,8 @@ def test_get_disposal_guidance_never_calls_the_llm(mcp_server):
     result = mcp_server.get_disposal_guidance("テレビはどう捨てますか")
     assert set(result) == {
         "context", "sources", "detected", "match_stage", "item_match",
-        "found", "missing", "markdown", "used_memory", "remembered",
+        "found", "missing", "canned_response", "markdown", "used_memory",
+        "remembered",
     }
     assert result["used_memory"] is False
     assert result["remembered"] is None  # user_id を渡していない
@@ -189,6 +190,32 @@ def test_get_disposal_guidance_reports_missing_town_for_schedule_only_ward(mcp_s
 
 def test_get_disposal_guidance_total_miss_has_no_markdown_table(mcp_server):
     result = mcp_server.get_disposal_guidance("これはごみ分別と無関係な架空の相談です")
+    assert result["found"] is False
+    assert result["markdown"] == ""
+
+
+def test_get_disposal_guidance_forwards_the_routers_canned_response(mcp_server, monkeypatch):
+    """レビュー指摘: 確度ゲート(4-3)・類別質問・安全拒否でルータが
+    `canned_response` を確定させても返り値に載せていなかったため、MCP
+    クライアントには `found=False` / `context=""` としか見えず、本当に見せる
+    べき固定文が消えていた。ルータが立てた文をそのまま透過する。
+
+    (`category_procedure_intent` の固定文自体は STAGE05 ブランチの
+    `fix/stage05-multiturn-state` にあり、この STAGE07 ブランチには未マージ
+    なので、ここではルータ出力を差し替えて「透過するか」だけを見る。)
+    """
+    from app.rag.types import RoutedAnswer
+
+    fixed = "早見表に個別の記載がなく、分別を断定できません。窓口でご確認ください。"
+    monkeypatch.setattr(
+        mcp_server.router,
+        "_blocking_route",
+        lambda *a, **k: RoutedAnswer(found=False, canned_response=fixed),
+    )
+
+    result = mcp_server.get_disposal_guidance("早見表にも類似品にも根拠がない品目")
+
+    assert result["canned_response"] == fixed
     assert result["found"] is False
     assert result["markdown"] == ""
 
@@ -219,6 +246,18 @@ def test_forget_facts_all(mcp_server):
 
     assert mcp_server.forget_facts("mentor-1") == {"removed": 2}
     assert mcp_server.recall_facts("mentor-1") == {"facts": {}}
+
+
+def test_forget_facts_rejects_empty_key_without_deleting_all(mcp_server):
+    mcp_server.remember_fact("mentor-1", "ward", "小倉北区")
+    mcp_server.remember_fact("mentor-1", "town", "浅野1丁目")
+
+    assert mcp_server.forget_facts("mentor-1", "") == {
+        "error": "key は空にできません"
+    }
+    assert mcp_server.recall_facts("mentor-1") == {
+        "facts": {"town": "浅野1丁目", "ward": "小倉北区"}
+    }
 
 
 def test_remember_fact_rejects_empty_key(mcp_server):
@@ -258,6 +297,52 @@ def test_get_disposal_guidance_without_a_saved_region_leaves_missing_alone(mcp_s
     result = mcp_server.get_disposal_guidance("収集日はいつですか", user_id="mentor-new")
     assert result["used_memory"] is False
     assert "区名と町名" in result["missing"] or "町名" in result["missing"]
+
+
+def test_memory_does_not_override_a_ward_written_in_the_question(mcp_server):
+    """レビュー #47-1: 記憶に別の区・町名があっても、質問文に区名が書かれて
+    いるターンでは記憶を注入しない。注入すると `extract_region` が WARDS の
+    並び順で1つ選ぶため記憶側が勝ち、ユーザーの区が黙って上書きされる。"""
+    mcp_server.remember_fact("mentor-1", "ward", "小倉北区")
+    mcp_server.remember_fact("mentor-1", "town", "浅野1丁目")
+
+    result = mcp_server.get_disposal_guidance(
+        "八幡西区の粗大ごみの収集日は?", user_id="mentor-1"
+    )
+
+    assert result["used_memory"] is False
+    # フィクスチャの収集日は小倉北区浅野1丁目のものだけ。記憶側の区に化けて
+    # その収集日(第2水曜日)を返していない。
+    assert "第2水曜日" not in result["markdown"]
+    assert "町名" in result["missing"]
+
+
+def test_memory_augmented_retry_that_still_finds_nothing_is_not_adopted(mcp_server):
+    """レビュー #47-2: 記憶で補って引き直しても空振りなら、その再検索結果は
+    採用しない。採用すると、ユーザーが一度も言っていない住所について
+    「データがありません」と答えてしまう。元の「町名を教えて」を保つ。"""
+    mcp_server.remember_fact("m2", "ward", "門司区")
+    mcp_server.remember_fact("m2", "town", "老松町")  # フィクスチャに収集日なし
+
+    result = mcp_server.get_disposal_guidance("粗大ごみの収集日は?", user_id="m2")
+
+    assert result["used_memory"] is False
+    assert result["found"] is False
+    assert any(("町名" in m) for m in result["missing"])
+
+
+def test_memory_is_not_corrupted_on_a_ward_only_turn(mcp_server):
+    """レビュー #47-3: 区だけ言った(町名なし)ターンで記憶の区を上書きすると、
+    記憶が「同時に存在したことのない区/町名の組」に壊れる。完全な住所を
+    言ったターンだけ書き戻す。"""
+    mcp_server.remember_fact("m3", "ward", "小倉北区")
+    mcp_server.remember_fact("m3", "town", "浅野1丁目")
+
+    mcp_server.get_disposal_guidance("八幡西区の粗大ごみの収集日は?", user_id="m3")
+
+    assert mcp_server.recall_facts("m3") == {
+        "facts": {"ward": "小倉北区", "town": "浅野1丁目"}
+    }
 
 
 # --------------------------------------------------------------------------
@@ -306,6 +391,17 @@ def test_render_week_svg_is_well_formed_and_highlights_marked_days(mcp_server):
     assert "#1a56b8" in svg  # 強調色が使われている(該当曜日あり)
 
 
+def test_render_week_svg_escapes_title_xml(mcp_server):
+    svg = mcp_server._render_week_svg([], "A < B & C")
+
+    assert "A &lt; B &amp; C" in svg
+    assert "A < B & C" not in svg
+
+
+def test_markdown_cell_escapes_table_delimiters(mcp_server):
+    assert mcp_server._markdown_cell("a|b\nc") == r"a\|b<br>c"
+
+
 def test_schedule_calendar_svg_resource_reflects_the_real_schedule(mcp_server):
     svg = mcp_server.schedule_calendar_svg("小倉北区", "浅野1丁目")
     assert svg.startswith("<svg")
@@ -316,3 +412,15 @@ def test_schedule_calendar_svg_resource_degrades_gracefully_when_no_hits(mcp_ser
     svg = mcp_server.schedule_calendar_svg("門司区", "存在しない町")
     assert svg.startswith("<svg")
     assert "#1a56b8" not in svg  # 強調無しの週表
+
+
+def test_schedule_calendar_svg_resource_shows_lookup_errors_distinctly(mcp_server):
+    """レビュー #47-5: lookup がエラー(空 town・DB 破損など)を返したときは、
+    「この地区に収集日がゼロ」の素の週表と混同しないよう、エラー文をタイトルに
+    出す。"""
+    svg = mcp_server.schedule_calendar_svg("小倉北区", "")
+
+    assert svg.startswith("<svg")
+    assert "#1a56b8" not in svg
+    assert "ward and town are both required" in svg  # エラーが見える形で出ている
+    assert "小倉北区 の収集日" not in svg  # 通常タイトルではない
