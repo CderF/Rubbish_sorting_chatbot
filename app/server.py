@@ -58,7 +58,8 @@ if _REPO_ROOT not in sys.path:
 
 from app.notices import admin as notice_admin  # noqa: E402
 from app.rag import agent, knowledge, router  # noqa: E402  (sys.path 調整後に import)
-from app.rag.session_state import DialogState  # noqa: E402
+from app.rag.session_state import DialogState, TurnInput  # noqa: E402
+from app.rag.session_state import normalize as normalize_text  # noqa: E402
 
 # ナレッジ管理API(お知らせの取り込み/削除)は waste_items を直接書き換えるが、
 # それだけではベクトル索引(var/chroma/)に反映されない。反映し忘れると、
@@ -129,6 +130,34 @@ states: "OrderedDict[str, DialogState]" = OrderedDict()
 _sessions_lock = asyncio.Lock()
 
 
+def _turn_from_agentic(routed, prompt: str) -> TurnInput:
+    """Agentic 経路の結果からスロット更新用の `TurnInput` を組む。
+
+    `router.extract_turn(prompt)` で代用してはいけない。あれが返す品名は文中の
+    最長断片で、早見表と突き合わせる前の形である。決定論的経路ではこの後
+    `_resolve_named_hit` がヒット名に寄せるが、Agentic 経路はそこを通らないため、
+    素で入れると「モバイルプロジェクターって何ゴミ」がスロットに載って会話中
+    ずっと残り、次ターンの引き直しが必ず外れる。
+
+    エージェントは `search_waste_item(query)` / `lookup_collection_schedule(ward,
+    town)` に既に絞り込んだ値を渡しているので、そちらを使う。実際に引けた行が
+    あればその `item_name` が最も正規化された形なので優先する。
+    """
+    item = None
+    if routed.item_hits:
+        item = getattr(routed.item_hits[0], "item_name", None)
+    item = item or routed.detected_item
+
+    text = normalize_text(prompt)
+    return TurnInput(
+        text=text,
+        item=item,
+        ward=routed.detected_ward,
+        town=routed.detected_town,
+        asks_schedule=router.asks_schedule(text),
+    )
+
+
 def _remember(session_id: str, prompt: str, messages: list, answer: str, routed) -> None:
     """Store one finished turn. Caller must hold `_sessions_lock`.
 
@@ -160,6 +189,10 @@ def _remember(session_id: str, prompt: str, messages: list, answer: str, routed)
     sessions.move_to_end(session_id)
 
     turn = routed.turn if routed is not None else None
+    if turn is None and routed is not None:
+        # Agentic 経路(#40)が当たったターン。`routed.turn` は無いが、エージェント
+        # がツールに渡した引数と実際に引けた行があるので、そこから組む。
+        turn = _turn_from_agentic(routed, prompt)
     if turn is None:
         try:
             turn, _, _ = router.extract_turn(prompt)
