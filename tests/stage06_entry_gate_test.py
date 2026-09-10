@@ -393,3 +393,47 @@ def test_waste_rule_does_not_misfire_on_normal_item_questions():
         "スプレー缶はどう捨てればいいですか",
     ):
         assert safety.check_entry_gate(prompt, ward=None, town=None) is None
+
+
+# --- STAGE05(本田)の必須項目テンプレートは 6-2 を対象外にする --------------
+# テンプレートは「市が収集しないもの」「粗大ごみ」で LLM を通さず固定の
+# 項目表を返す。これが 6-2(危険・違法な処分の誘導)に掛かると、
+# 「タイヤを庭で燃やしていいですか」への回答が「品目: タイヤ / 分別区分: …」
+# になり、「いいえ、燃やしてはいけません」という否定が消える(6-2 は
+# `_RULES_DANGEROUS_REQUEST` を LLM に課すことで 7/15 -> 11/15 に改善した)。
+def _not_collected_answer(safety_gate):
+    from types import SimpleNamespace
+
+    from app.rag.types import RoutedAnswer
+
+    ans = RoutedAnswer(
+        found=True,
+        item_match="exact",
+        item_hits=[
+            SimpleNamespace(
+                item_name="タイヤ",
+                disposal_method="市が収集しないもの",
+                notes="（注）販売店に相談",
+                source_url="https://www.city.kitakyushu.lg.jp/contents/924_10058.html",
+            )
+        ],
+    )
+    ans.safety_gate = safety_gate
+    return ans
+
+
+def test_response_template_does_not_override_dangerous_requests():
+    from app.rag.router import apply_response_template
+
+    ans = apply_response_template(_not_collected_answer("6-2"))
+    assert ans.canned_response is None  # LLM に否定+正しい手順を書かせる
+    assert ans.template_response is False
+
+
+def test_response_template_still_applies_to_ordinary_questions():
+    from app.rag.router import apply_response_template
+
+    ans = apply_response_template(_not_collected_answer(None))
+    assert ans.canned_response is not None
+    assert ans.template_response is True
+    assert "販売店" in ans.canned_response

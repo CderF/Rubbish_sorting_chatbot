@@ -83,9 +83,15 @@ _SYSTEM_PROMPT = (
     "あなたは北九州市のごみ分別・収集日を案内するアシスタントの検索エージェントです。\n"
     "ユーザーの質問に直接答えず、まずは提供されたツールを使って必要な情報を"
     "集めることに専念してください。\n"
+    "この会話では、現在の発話だけでなく、それまでの会話履歴も前提にして"
+    "検索条件を判断してください。過去の品目・地区が現在の発話で省略されて"
+    "いる場合は引き継ぎ、「追加」「も」「一緒に」は既存の条件を保持して追加、"
+    "「変更」「訂正」「やっぱり」「ではなく」は該当する過去の条件を今回の内容"
+    "に置き換えてください。品目と地区が会話全体で揃ったら、両方を使って"
+    "分別・出し方・収集日を検索してください。\n"
     "- 品目の分別方法を調べるには search_waste_item を使う。"
-    "本文に品目名として解釈できる語が一切含まれていない発言"
-    "(地域名や訂正だけの発言など)では、品目名を作り出して呼んではならない。"
+    "現在の発話にもそれまでの利用者の発言にも品目名として解釈できる語が"
+    "一切含まれていない場合は、品目名を作り出して呼んではならない。"
     "その場合は品目名が分からないものとして扱う。"
     "「粗大ごみってどうやって出すんですか」「粗大ごみの申込み方法は」"
     "「古紙を出したいです」のように、特定の品目ではなくごみ種別そのものの"
@@ -109,6 +115,22 @@ _TOOL_CALL_MAX_TOKENS = 300
 
 def _norm(s: str) -> str:
     return unicodedata.normalize("NFKC", s or "").strip()
+
+
+def _message_text(message: dict) -> str:
+    """会話履歴のメッセージから本文テキストだけを取り出す(画像付きのターンは
+    `content` が `[{"type": "image", ...}, {"type": "text", "text": ...}]` の
+    リスト形式になる)。"""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
 
 
 def _query_grounded_in_text(query: str, text: str) -> bool:
@@ -156,8 +178,13 @@ async def route_agentically(
     sampling_params: Any,
     image_item_name: str | None = None,
     max_iterations: int = _MAX_ITERATIONS_DEFAULT,
+    history: list[dict] | None = None,
 ) -> RoutedAnswer | None:
     """Function Calling でツールを呼びながら検索する。
+
+    `history` は同じ `session_id` の過去の user/assistant ターン。検索条件の
+    省略・追加・変更・訂正をFunction Calling側でも解釈できるよう、現在の
+    発話と一緒に検索エージェントへ渡す。
 
     成功すれば `RoutedAnswer` を、失敗すれば None を返す(呼び出し側は None の
     とき決定論的経路にフォールバックすること)。この関数自体は例外を投げない
@@ -165,7 +192,8 @@ async def route_agentically(
     """
     try:
         return await _run_loop(
-            prompt, engine, build_prompt, sampling_params, image_item_name, max_iterations
+            prompt, engine, build_prompt, sampling_params, image_item_name,
+            history, max_iterations
         )
     except Exception as exc:  # noqa: BLE001 — 呼び出し側のフォールバックに委ねる
         print(f"[agent] route_agentically failed: {exc!r}", flush=True)
@@ -178,6 +206,7 @@ async def _run_loop(
     build_prompt: Callable[..., dict],
     sampling_params: Any,
     image_item_name: str | None,
+    history: list[dict] | None,
     max_iterations: int,
 ) -> RoutedAnswer | None:
     user_content = prompt
@@ -193,8 +222,25 @@ async def _run_loop(
         else category_procedure_intent(prompt, _pre_ward, _pre_town)
     )
 
+    # search_waste_item の query が「利用者が実際に言った語」かを検査する対象
+    # (5-1 ガード、`_query_grounded_in_text`)。STAGE05 では過去ターンの品目を
+    # 会話履歴から引き継いで検索させる(「ソファを捨てたい」→「え、じゃあ
+    # どうすれば」)ため、今回の発話だけを見ると引き継いだ品目名が必ず弾かれて
+    # しまう。このセッションで利用者が話した全ターンを対象にする。
+    # assistant の発言は含めない — 案内文中の例示(6-3 の定型文にある
+    # 「電子レンジ」「ソファ」等)を根拠に、利用者が一度も言っていない品目を
+    # 「本文から拾った」と誤認しないため。
+    grounding_text = "\n".join(
+        [_message_text(m) for m in (history or []) if m.get("role") == "user"]
+        + [user_content]
+    )
+
+    # `server.sessions` stores only user/assistant turns. Copy the list so the
+    # tool-call loop can append its own assistant/tool messages without
+    # modifying the session history that is concurrently used by `/chat`.
     messages: list[dict] = [
         {"role": "system", "content": _SYSTEM_PROMPT},
+        *(list(history) if history else []),
         {"role": "user", "content": user_content},
     ]
 
@@ -225,11 +271,12 @@ async def _run_loop(
 
             if call.name == "search_waste_item":
                 query = call.arguments.get("query") or ""
-                if category_intent is not None or not _query_grounded_in_text(query, user_content):
+                if category_intent is not None or not _query_grounded_in_text(query, grounding_text):
                     # このターンが特定品目ではなくごみ種別そのものの質問
-                    # (category_intent)か、本文に無い品目名をモデルが
-                    # 作り出した(5-1 ガード)。ツール応答はループの文脈には
-                    # 残すが、検索結果としては採用しない。
+                    # (category_intent)か、利用者がこのセッションで一度も
+                    # 言っていない品目名をモデルが作り出した(5-1 ガード)。
+                    # ツール応答はループの文脈には残すが、検索結果としては
+                    # 採用しない。
                     continue
                 if not detected_item:
                     detected_item = query

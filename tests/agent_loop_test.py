@@ -454,6 +454,33 @@ def test_image_item_name_is_passed_through_as_context():
     asyncio.run(body())
 
 
+def test_conversation_history_is_passed_to_function_calling_prompt():
+    captured_messages = []
+
+    def capturing_build_prompt(messages, tools=None):
+        captured_messages.append(messages)
+        return {"messages": messages, "tools": tools}
+
+    history = [
+        {"role": "user", "content": "ペットボトルの分別を教えて"},
+        {"role": "assistant", "content": "ペットボトルは資源ごみです。"},
+    ]
+
+    async def body():
+        await agent.route_agentically(
+            "小倉北区浅野1丁目です。収集日も教えてください。",
+            engine=_ScriptedEngine([_PLAIN_TEXT]),
+            build_prompt=capturing_build_prompt,
+            sampling_params=object(),
+            history=history,
+        )
+
+    asyncio.run(body())
+    messages = captured_messages[0]
+    assert messages[1:3] == history
+    assert messages[3]["content"].startswith("小倉北区浅野1丁目")
+
+
 def test_district_fallback_note_reaches_context_and_states_the_weekday(monkeypatch):
     """丁目を省略した地区名(「黒崎」等)で lookup_collection_schedule を呼んだ
     場合、`tools._tool_lookup_collection_schedule` が付ける `district_note` が
@@ -701,3 +728,82 @@ def test_pure_general_info_question_without_item_search_still_succeeds(monkeypat
         assert "防鳥ネット" in result.context
 
     asyncio.run(body())
+
+
+# --------------------------------------------------------------------------
+# STAGE05(本田) × 5-1 グラウンディングガード(周)の統合
+# --------------------------------------------------------------------------
+# 本田の方式では過去ターンの品目を会話履歴から引き継いで検索させる。一方
+# `_query_grounded_in_text` は「モデルが利用者の言っていない品目名を作り
+# 出した」ことを弾くガードで、以前は今回の発話だけを見ていたため、履歴から
+# 引き継いだ品目名(下の「ソファ」)を必ず弾いてしまい、本田の多ターン対応を
+# 丸ごと無効化していた。比較対象を「このセッションで利用者が話した全ターン」
+# に広げたことの回帰。
+_TOOL_CALL_SOFA_FROM_HISTORY = (
+    "<tool_call>\n"
+    '{"name": "search_waste_item", "arguments": {"query": "ソファ"}}\n'
+    "</tool_call>"
+)
+
+
+def _sofa_tool(name, arguments):
+    if name == "search_waste_item":
+        return {
+            "match_stage": "exact",
+            "items": [
+                {
+                    "item_name": "ソファ",
+                    "disposal_method": "粗大ごみ",
+                    "notes": "事前申込制",
+                    "source_url": "https://example.test/sofa",
+                }
+            ],
+        }
+    return {}
+
+
+def test_item_carried_over_from_user_history_passes_the_grounding_guard(monkeypatch):
+    monkeypatch.setattr(agent, "execute_tool", _sofa_tool)
+    history = [
+        {"role": "user", "content": "ソファを捨てたいです"},
+        {"role": "assistant", "content": "ソファは粗大ごみです。"},
+    ]
+
+    async def body():
+        return await agent.route_agentically(
+            "え、じゃあどうすればいいですか？",
+            engine=_ScriptedEngine([_TOOL_CALL_SOFA_FROM_HISTORY, _PLAIN_TEXT]),
+            build_prompt=_build_prompt, sampling_params=object(),
+            history=history,
+        )
+
+    result = asyncio.run(body())
+    assert result is not None
+    assert [h.item_name for h in result.item_hits] == ["ソファ"]
+
+
+def test_item_mentioned_only_by_the_assistant_is_still_rejected(monkeypatch):
+    """assistant の発言(案内文中の例示等)は根拠にしない。利用者が一度も
+    言っていない品目名は、履歴があっても従来どおり弾く。"""
+    monkeypatch.setattr(agent, "execute_tool", _sofa_tool)
+    history = [
+        {"role": "user", "content": "これ燃えるゴミで合ってますよね？"},
+        {"role": "assistant", "content": "品物の名前を教えてください(例:「ソファ」など)。"},
+    ]
+
+    async def body():
+        return await agent.route_agentically(
+            "え、じゃあどうすればいいですか？",
+            engine=_ScriptedEngine([_TOOL_CALL_SOFA_FROM_HISTORY, _PLAIN_TEXT]),
+            build_prompt=_build_prompt, sampling_params=object(),
+            history=history,
+        )
+
+    # 採用された検索結果が1件も無いので、呼び出し側へフォールバック(None)。
+    assert asyncio.run(body()) is None
+
+
+def test_message_text_extracts_text_from_image_turns():
+    msg = {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "ソファ"}]}
+    assert agent._message_text(msg) == "ソファ"
+    assert agent._message_text({"role": "user", "content": "傘"}) == "傘"

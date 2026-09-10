@@ -1191,6 +1191,13 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     if ans.item_match == "analogy" and ans.analogy_unreliable:
         ans.canned_response = _ANALOGY_UNRELIABLE_REPLY
 
+    # 必須項目テンプレート(`apply_response_template`)はここでは適用しない。
+    # `app/server.py._route_safely` が決定論的経路・Agentic経路の共通出口で、
+    # STAGE06 の 6-2 の印(`_mark`)を付けた**後**に適用する。ここで先に
+    # 適用すると 6-2 の印が付く前にテンプレートが確定し、危険な処分の誘導への
+    # 回答から「いいえ、〜してはいけません」が消える(テンプレートは 6-2 を
+    # 対象外にするが、その判定には印が必要)。
+
     # --- 6-3 fallback hook (STAGE06 proposal §7.3 / 担当B) ---
     # 完全空振り(品目も収集日もヒットせず、6-1a/6-2 も 4-3 確度ゲートも未発火)。
     # 検索結果ゼロを LLM に渡して「見つかりませんでした」と言わせると、モデルが
@@ -1214,6 +1221,82 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
             ans.canned_response = reply
             ans.safety_gate = "6-3"
     return ans
+
+
+def apply_response_template(ans: RoutedAnswer) -> RoutedAnswer:
+    """高リスク回答に必須項目テンプレートを適用して返す。
+
+    決定論的ルートだけでなく Function Calling ルートにも同じ制約を
+    適用するため、サーバーの共通出口から呼び出せる公開関数にしている。
+
+    STAGE06 の 6-2(危険・違法な処分の誘導、`safety_gate == "6-2"`)は対象外。
+    テンプレートは項目表を固定文で返すため、「タイヤを庭で燃やしていいですか」
+    への回答から「いいえ、燃やしてはいけません」という明確な否定が消えて
+    しまう。6-2 は `_RULES_DANGEROUS_REQUEST` を課した LLM 生成で、否定と
+    正しい手順(検索結果の相談先)をセットで答える。
+    """
+    if ans.safety_gate == "6-2":
+        return ans
+    if ans.canned_response is None:
+        templated = _build_required_fields_response(ans)
+        if templated is not None:
+            ans.canned_response = templated
+            ans.template_response = True
+    return ans
+
+
+def _build_required_fields_response(ans: RoutedAnswer) -> str | None:
+    """高リスクカテゴリを必須項目テンプレートで回答する。
+
+    早見表・収集日検索の結果だけを材料にするため、LLMが申込・手数料・
+    収集対象外などを省略したり、根拠のない条件を補ったりする余地を減らす。
+    """
+    if not ans.item_hits or ans.item_match == "analogy" or ans.timeline_change:
+        return None
+
+    item = ans.item_hits[0]
+    item_name = getattr(item, "item_name", "") or ans.detected_item or "この品目"
+    method = getattr(item, "disposal_method", "") or "記載なし"
+    notes = (getattr(item, "notes", "") or "").strip()
+    lines = [f"品目: {item_name}", f"分別区分: {method}"]
+
+    schedules = ans.schedule_hits
+    has_bulky = method == "粗大ごみ" or any(
+        getattr(s, "waste_type", "") == "粗大ごみ" for s in schedules
+    )
+    not_collected = method == "市が収集しないもの"
+    no_weekday = ans.no_weekday_schedule or (
+        not schedules and method not in _CURBSIDE_WASTE_TYPES
+    )
+
+    if has_bulky:
+        lines.append("出し方・条件: " + (notes or "早見表の備考を確認してください。"))
+        if schedules:
+            lines.append("収集日: " + "、".join(
+                f"{getattr(s, 'ward', '')}{getattr(s, 'town', '')}は{getattr(s, 'weekday', '')}"
+                for s in schedules
+            ))
+        else:
+            lines.append("収集日: 検索結果に記載なし")
+        lines.append("申込・手数料: 備考に記載された申込・手数料の条件に従ってください。")
+        lines.append("注意事項: 粗大ごみは事前申込が必要です。申込なしで収集日に出さないでください。")
+        return "\n".join(lines)
+
+    if not_collected:
+        lines.append("出し方・条件: 市が収集しない品目です。")
+        lines.append("収集日: 市による決まった収集曜日はありません。")
+        lines.append("申込・手数料: 早見表の備考に記載された条件に従ってください。")
+        lines.append("相談先・注意事項: " + (notes or "販売店・専門業者等への相談が必要です。"))
+        return "\n".join(lines)
+
+    if no_weekday:
+        lines.append("出し方・条件: " + (notes or "早見表の備考に記載された方法に従ってください。"))
+        lines.append("収集日: 決まった収集曜日はありません。")
+        lines.append("申込・手数料: 検索結果に記載なし")
+        lines.append("注意事項: 備考に記載されていない方法や条件は追加できません。")
+        return "\n".join(lines)
+
+    return None
 
 
 # データ層のクエリは必ずこの1本のスレッドで実行する。
@@ -1889,6 +1972,7 @@ def build_trace_record(prompt: str, ans: RoutedAnswer) -> dict:
         "schedule_hits": len(ans.schedule_hits),
         "missing": list(ans.missing),
         "canned_response": bool(ans.canned_response),
+        "template_response": ans.template_response,
         "safety_gate": ans.safety_gate,  # STAGE06 6-4: 発火した安全ゲート("6-1a"/"6-2"/"6-3")
         "sources": list(ans.sources),
     }

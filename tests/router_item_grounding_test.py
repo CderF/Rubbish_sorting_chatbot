@@ -9,8 +9,8 @@
 DB(`var/kitakyushu_waste.db`)に対して `_blocking_route` を実行すると、
 地域だけの発言・地域訂正だけの発言から正規表現の残骸を品目候補として拾い、
 ベクトル検索で無関係な品目を見つけてしまうことを確認した(このファイルの
-テストはロジックだけを検証し、実DBへの依存は
-`tests/agent_loop_test.py`/`tests/multiturn_test.py` 側に留める)。
+テストはロジックだけを検証し、実DBへの依存は `tests/agent_loop_test.py` 側に
+留める)。
 """
 
 from __future__ import annotations

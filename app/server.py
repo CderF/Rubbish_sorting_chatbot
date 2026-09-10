@@ -59,7 +59,6 @@ if _REPO_ROOT not in sys.path:
 from app import trace_view  # noqa: E402
 from app.notices import admin as notice_admin  # noqa: E402
 from app.rag import agent, knowledge, router, safety  # noqa: E402  (sys.path 調整後に import)
-from app.rag.multiturn import SessionState, merge_with_state, update_state  # noqa: E402
 from app.rag.types import RoutedAnswer  # noqa: E402
 
 # ナレッジ管理API(お知らせの取り込み/削除)は waste_items を直接書き換えるが、
@@ -120,17 +119,6 @@ _gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 # session_id -> list of chat messages (multi-turn state, stages 5 / 6-3)
 sessions: "OrderedDict[str, list]" = OrderedDict()
 _sessions_lock = asyncio.Lock()
-
-# session_id -> SessionState (確立済みの品目・地域。STAGE05 5-1/5-2、
-# app/rag/multiturn.py 参照)。`sessions` と同じライフサイクルで管理する。
-session_states: "OrderedDict[str, SessionState]" = OrderedDict()
-
-# session_id -> asyncio.Lock。`session_states[session_id]` の「読む→合算する
-# →書き戻す」を1つの単位として直列化するための専用ロック(2026-09-10
-# レビュー指摘: 同一 session_id への同時リクエストが `_blocking_merge` の
-# 実行順とHTTPリクエストの到着順とで食い違うと、片方の更新を取りこぼしうる)。
-# ロック自体の取得は同期的な dict 操作なので `_sessions_lock` で守る。
-_session_state_locks: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
 
 # Most recently completed request, shown on the WebUI (STAGE 1-2).
 last_timing = {"first_token_s": None, "total_s": None, "tokens": None,
@@ -306,7 +294,9 @@ def _write_trace(session_id: str, prompt: str, routed, final_text: str) -> None:
         print(f"[trace] write failed: {exc!r}", flush=True)
 
 
-async def _route_safely(prompt: str, img: str | None, has_history: bool = False):
+async def _route_safely(
+    prompt: str, img: str | None, history: list[dict] | None = None
+):
     """検索パスを呼ぶ。失敗しても生成は止めない。
 
     RAG側の例外で 5xx を返すとステージ全体が中断してしまう(冒頭の契約メモ参照)
@@ -324,13 +314,14 @@ async def _route_safely(prompt: str, img: str | None, has_history: bool = False)
     素通りしてしまう(STAGE06 proposal §7.1 の足場でこの位置に確定)。
     足場では `check_entry_gate` が常に None を返すため挙動は変わらない。
 
-    `has_history`: このセッションに既に会話履歴があるか。呼び出し元
-    (`_stream_chat`)が `sessions[session_id]` の有無から渡す。STAGE06は
-    STAGE05のセッション状態(スロット)には依存しないが、この1ビットだけは
-    「最初の発話か、追い返しか」を区別するために必要(2026-09-10 実採点trace
-    回帰: `app/rag/safety.py` 冒頭のコメント参照)。
+    `history`: 同じ `session_id` の過去の user/assistant ターン(`sessions`)。
+    STAGE05 ではエージェント経路に渡して、品目・地区の省略・追加・訂正を
+    会話履歴から解釈させる。STAGE06 の入口ゲートはその有無だけを使い、
+    「最初の発話か、追い返しか」を区別する(2026-09-10 実採点trace回帰:
+    `app/rag/safety.py` 冒頭のコメント参照)。
     """
     # --- 6-1a/6-2 gate (STAGE06 proposal §7.2 / 担当A) ---
+    has_history = bool(history)
     ward, town = router.extract_region(prompt)
     verdict = safety.check_entry_gate(prompt, ward, town, has_history=has_history)
     if verdict is not None and verdict.blocks_search:
@@ -373,63 +364,22 @@ async def _route_safely(prompt: str, img: str | None, has_history: bool = False)
                 temperature=0.0, max_tokens=AGENTIC_TOOL_CALL_MAX_TOKENS
             ),
             image_item_name=image_item_name,
+            history=history,
         )
         if agentic_result is not None:
-            return _mark(agentic_result)
+            # 6-2 の印を先に付けてからテンプレートを判定する(テンプレートは
+            # 6-2 を対象外にする。`router.apply_response_template` 参照)。
+            return router.apply_response_template(_mark(agentic_result))
         print("[agent] route_agentically returned None, falling back to deterministic router",
               flush=True)
 
     try:
-        return _mark(
-            await router.handle_query(prompt, img, engine=engine, processor=processor)
-        )
+        result = await router.handle_query(prompt, img, engine=engine, processor=processor)
+        return router.apply_response_template(_mark(result))
     except Exception as exc:  # noqa: BLE001 — 生成の継続を最優先する
         print(f"[rag] handle_query failed, falling back to plain generation: {exc!r}",
               flush=True)
         return None
-
-
-def _blocking_merge(state: SessionState, prompt: str, routed: RoutedAnswer) -> RoutedAnswer:
-    """`app.rag.multiturn` のセッション状態更新・合算(SQLite を触るため
-    同期関数のまま `router._db_executor` に投げる。`_route_safely` と同じ
-    スレッドプールを共有する)。"""
-    update_state(state, prompt, routed)
-    return merge_with_state(prompt, state, routed)
-
-
-async def _get_session_state_lock(session_id: str) -> asyncio.Lock:
-    """`session_id` 用のロックを取得する(無ければ作る)。
-
-    `session_states[session_id]` の「読む→今回のターンを合算する→書き戻す」
-    を1つの単位として直列化するためのロック。同一 `session_id` への同時
-    リクエストは(採点仕様上は想定されていないが)`_route_safely` の所要
-    時間がリクエストごとに揺れるため、HTTP到着順と `_blocking_merge` の
-    実行順が入れ替わりうる。ロックで「一度に1ターンだけ」を保証する。
-    ロック自体の作成・trim は `sessions`/`session_states` と同じく
-    `_sessions_lock` で守る(同期的な dict 操作のみ)。
-    """
-    async with _sessions_lock:
-        lock = _session_state_locks.get(session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            _session_state_locks[session_id] = lock
-        _session_state_locks.move_to_end(session_id)
-
-        # 使用中(取得済み)のロックを間引くと、それを握っているコルーチンが
-        # 居る間に同じ session_id への次のリクエストが新しい Lock を作って
-        # しまい、相互排他が壊れる(2026-09-10 レビュー指摘)。使用中でない
-        # 最古のものから順に、上限を下回るまでだけ間引く — 全部使用中なら
-        # 今回は諦めて上限を一時的に超えたままにする(次の呼び出しで再試行
-        # される。実害は辞書のメモリがわずかに増えるだけ)。
-        if len(_session_state_locks) > MAX_SESSIONS:
-            for sid in list(_session_state_locks.keys()):
-                if len(_session_state_locks) <= MAX_SESSIONS:
-                    break
-                if sid == session_id or _session_state_locks[sid].locked():
-                    continue
-                del _session_state_locks[sid]
-
-        return lock
 
 
 # --------------------------------------------------------------------------
@@ -448,30 +398,14 @@ async def _stream_chat(
 
     # 検索結果はシステムメッセージとして毎ターン先頭に差し込む。会話履歴には
     # 残さない(ターンごとに検索結果が変わるうえ、積み重なると文脈を圧迫するため)。
-    routed = await _route_safely(prompt, img, has_history=bool(history))
-
-    # STAGE05 5-1/5-2: このターンだけの検索結果に、セッションで既に確立した
-    # 品目・地域を上書きされずに合算する(app/rag/multiturn.py 参照)。
-    # SQLite を触るので、決定論的経路と同じ専用スレッドで実行しイベント
-    # ループを塞がない。固定回答・安全ゲートは対象外(multiturn 側で判定)。
-    if routed is not None:
-        state_lock = await _get_session_state_lock(session_id)
-        async with state_lock:
-            async with _sessions_lock:
-                state = session_states.setdefault(session_id, SessionState())
-            loop = asyncio.get_running_loop()
-            routed = await loop.run_in_executor(
-                router._db_executor, _blocking_merge, state, prompt, routed
-            )
-            async with _sessions_lock:
-                session_states.move_to_end(session_id)
-                while len(session_states) > MAX_SESSIONS:
-                    session_states.popitem(last=False)
+    routed = await _route_safely(prompt, img, history=history)
 
     # 確定回答(4-3 確度ゲート等): LLM に言い換え・脚色・補足をさせず、
     # そのまま1フレームで返す。engine.generate は通さない。
     if routed is not None and routed.canned_response:
         text = routed.canned_response
+        citations = router.format_citations(routed) if routed.template_response else ""
+        text += citations
         yield f"data: {json.dumps({'delta': text}, ensure_ascii=False)}\n\n"
         async with _sessions_lock:
             sessions[session_id] = messages + [

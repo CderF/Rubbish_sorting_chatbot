@@ -110,6 +110,9 @@ class RoutedAnswer:
     空でなければ、LLMには不足項目の再入力を促す回答を書かせる。
     """
 
+    template_response: bool = False
+    """`canned_response` が必須項目テンプレートから生成されたか。"""
+
     item_hits: list[ItemRecord] = field(default_factory=list)
     schedule_hits: list[ScheduleRecord] = field(default_factory=list)
 
