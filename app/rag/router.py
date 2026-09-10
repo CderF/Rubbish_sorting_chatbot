@@ -139,6 +139,12 @@ _QUESTION_TAIL = re.compile(
     r"(?:は|の|を|、)\s*"
     r"(?:捨て方|出し方|処分方法|処分の仕方|分別方法|分別|区分|"
     r"回収して|収集して|処分して|廃棄して|回収の|処分の|回収方法|処分を)"
+    r"|"
+    # 「〜を捨てたい」「〜を処分したいのですが」「〜を出したい」「〜を捨てよう」
+    # (サ変「処分する」は 処分+し+たい なので「し」を挟めるようにする)
+    r"(?:は|の|を|、|って)?\s*"
+    r"(?:捨て|出し|処分|廃棄|分別|回収|収集|処理|片付け)し?"
+    r"(?:たい|よう)"
     r")"
     r".*$"
 )
@@ -147,6 +153,97 @@ _QUESTION_TAIL = re.compile(
 _PARTICLES = r"はがをにへとでもやのねよかっ、。？?!！\s"
 _LEADING = re.compile(rf"^[{_PARTICLES}]+")
 _TRAILING = re.compile(rf"[{_PARTICLES}]+$")
+
+# `_LEADING` は文字クラスの貪欲マッチなので、「やかん」「ねじ回し」「かばん」
+# 「のこぎり」のように内容語自体が助詞と同じ仮名(や・ね・か・の 等)で始まる
+# 品名の頭まで削ってしまう(実測: 「やかんを処分したい」→「んを処分したい」、
+# 「ねじ回しはどう捨てますか」→「じ回し」、「小倉北区でかばんを捨てたい」→
+# 「ばんを捨てたい」)。
+#
+# そこで断片の「位置」で剥がし方を変える:
+#   (a) 発話の真の冒頭 / 区切り記号の直後  → 利用者が書いた内容語の頭。
+#       閉じたつなぎ言葉(_LEADING_FILLERS「でも」等)と「助詞1文字+読点」
+#       (「で、」)だけ剥がす。1文字の助詞は「はさみ」「やかん」と紛れるので
+#       文字クラスでは剥がさない。
+#   (b) 接缝: 区名・町名・ごみ種別語を除去した直後  → そこに残るのはつなぎの
+#       助詞1文字(「…丁目で」の「で」、「…丁目の」の「の」)なので1文字だけ
+#       落とす。貪欲に落とすと「でかばん」→「ばん」になる。
+#   (c) どちらでもない(語の途中で切れた残骸)  → 従来どおり `_LEADING` を貪欲に。
+_FRAGMENT_BOUNDARY = r"[\s、。「」()（）]"
+_LEADING_PUNCT = re.compile(r"^[\s、。「」()（）？?!！]+")
+# 発話の冒頭にだけ現れるつなぎ言葉(閉じた集合)。品名の頭にこれらが来ることは
+# 無いので剥がしてよい。1文字の助詞は「はさみ」「やかん」「のこぎり」等と
+# 区別が付かないため、ここでは剥がさない(文字クラスは使わない)。
+_LEADING_FILLERS = (
+    "それとも", "それから", "それと", "そして", "ちなみに",
+    "でも", "また", "なお", "あと", "あのう", "あの", "えっと", "ええと",
+)
+# 接缝(区名・町名・ごみ種別語を除去した直後)に残る助詞1文字。丁目の直後の
+# 「の」は所有格、区名の直後の「で」は格助詞、というように、除去された実語の
+# 後ろに付くつなぎなので1文字だけ落とす。「は」は「はさみ」等と紛れるので外す。
+_SEAM_PARTICLE_CHARS = frozenset("をにへとでのが")
+
+
+def _word_start_offsets(
+    original: str, removed_spans: "list[tuple[int, int]]"
+) -> "set[int]":
+    """`original` の中で「利用者が語を書き始めた」候補位置。
+
+    文頭 / 区切り記号の直後 / 除去した区名・町名・ごみ種別語の直後。
+    """
+    offs = {0}
+    for m in re.finditer(_FRAGMENT_BOUNDARY, original):
+        offs.add(m.end())
+    for _start, end in removed_spans:
+        offs.add(end)
+    return offs
+
+
+def _trim_particles(
+    text: str,
+    original: str,
+    word_starts: "set[int] | None" = None,
+    seam_offsets: "set[int] | None" = None,
+) -> str:
+    """文頭・文末に残った助詞・記号を落とす。利用者が書いた内容語の頭は削らない。
+
+    `original` は正規化しただけの発話全文(区名・町名等の除去より前)。
+    `word_starts` は `_word_start_offsets` の結果、`seam_offsets` はそのうち
+    「除去でむき出しになった位置」だけ。省略時は発話冒頭のみを語頭とみなす。
+    """
+    text = text.strip()
+    if not text:
+        return ""
+    if word_starts is None:
+        word_starts = {0}
+    seam_offsets = seam_offsets or set()
+
+    text = _LEADING_PUNCT.sub("", text)
+    at_seam = any(original.startswith(text, o) for o in seam_offsets)
+    at_word_start = at_seam or any(
+        original.startswith(text, o) for o in word_starts
+    )
+
+    if at_seam:
+        # 除去された実語の後ろに付いていたつなぎの助詞1文字だけを落とす
+        # (「…丁目で」の「で」、「…丁目の」の「の」)。貪欲に落とすと
+        # 「でかばん」→「ばん」のように内容語まで削れる。
+        if len(text) >= 2 and text[0] in _SEAM_PARTICLE_CHARS:
+            text = text[1:]
+    elif at_word_start:
+        # 利用者が書いた内容語の頭。閉じたつなぎ言葉だけ剥がす。
+        for filler in _LEADING_FILLERS:
+            if text.startswith(filler) and len(text) > len(filler):
+                text = text[len(filler):].lstrip()
+                break
+        # 「で、ソファ」= 助詞1文字 + 読点。内容語の頭に読点は付かないので、
+        # この助詞はつなぎと見て落とす。
+        text = re.sub(r"^[はがをにへとでもや][、,]\s*", "", text)
+    else:
+        # 語の途中で切れた残骸。従来どおり `_LEADING` を貪欲に当てる。
+        text = _LEADING.sub("", text)
+    return _TRAILING.sub("", text).strip()
+
 
 _TOWN = re.compile(r"([一-龥ぁ-んァ-ヶa-zA-Z]{1,10}(?:\d{1,3}丁目|丁目|町|台|ケ丘|ヶ丘))")
 
@@ -334,6 +431,12 @@ def _item_name_candidates(
     if not text:
         return [], None
 
+    # 断片が発話中で「語の書き出し」の位置に来ているかを後で判定するため、
+    # 原文と、除去した区名・町名・ごみ種別語の位置を控えておく
+    # (`_trim_particles` 参照)。
+    original = text
+    removed_spans: list[tuple[int, int]] = []
+
     if strip_waste_words is None:
         strip_waste_words = asks_schedule(text)
 
@@ -341,17 +444,26 @@ def _item_name_candidates(
     ward, town = extract_region(text)
     for part in (ward, town):
         if part:
+            idx = original.find(part)
+            if idx != -1:
+                removed_spans.append((idx, idx + len(part)))
             text = text.replace(part, " ")
 
     # 収集日の質問なら「家庭ごみ」「燃えるごみ」などは品名ではないので落とす。
     # 長い語から消して部分一致の取りこぼしを防ぐ。
     if strip_waste_words:
         for word in sorted(_WASTE_WORDS, key=len, reverse=True):
-            text = text.replace(word, " ")
+            if word and word in text:
+                idx = original.find(word)
+                if idx != -1:
+                    removed_spans.append((idx, idx + len(word)))
+                text = text.replace(word, " ")
+
+    word_starts = _word_start_offsets(original, removed_spans)
+    seam_offsets = {end for _start, end in removed_spans}
 
     text = _QUESTION_TAIL.sub(r"\1", text)
-    text = _LEADING.sub("", text)
-    text = _TRAILING.sub("", text).strip()
+    text = _trim_particles(text, original, word_starts, seam_offsets)
 
     # 記号・空白で切り、断片ごとに「原文」と「修飾語を落とした形」の両方を
     # 候補化する。原文だけだと「壊れたテレビ」が完全一致しない一方、加工後
@@ -363,7 +475,7 @@ def _item_name_candidates(
     raw_fragments: list[str] = [text]
     candidates: list[str] = [text]
     for frag in re.split(r"[\s、。「」()（）]+", text):
-        frag = _TRAILING.sub("", _LEADING.sub("", frag))
+        frag = _trim_particles(frag, original, word_starts, seam_offsets)
         if not frag:
             continue
         raw_fragments.append(frag)
