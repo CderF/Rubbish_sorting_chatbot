@@ -27,6 +27,7 @@ from typing import Any, Callable
 
 from app.data.lookup import lookup_collection_schedule, lookup_item_exact, lookup_item_partial
 from app.notices.lookup import pending_change
+from app.rag.router import _district_groups, _uniform_district_schedule
 from app.rag.vector_store import vector_search_explanations, vector_search_items
 
 # --- OpenAI-style function-calling スキーマ ---------------------------------
@@ -67,10 +68,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "lookup_collection_schedule",
             "description": (
-                "区名・町名(丁目まで)・ごみ種別から、収集曜日を検索する"
-                "(収集日パス)。ごみ種別が分かっている場合はそれで絞り込むと"
-                "精度が上がる。町名が分からない場合はこのツールを呼ばず、"
-                "利用者に町名を尋ねること。"
+                "区名・町名・ごみ種別から、収集曜日を検索する(収集日パス)。"
+                "ごみ種別が分かっている場合はそれで絞り込むと精度が上がる。"
+                "町名は丁目まで分からなくてもよい(「黒崎」のように丁目を"
+                "省略した地区名でも、地区内の全丁目で収集日が一致する場合は"
+                "解決できる)。区名も町名も一切分からない場合だけこのツールを"
+                "呼ばず、利用者に尋ねること。"
             ),
             "parameters": {
                 "type": "object",
@@ -78,7 +81,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "ward": {"type": "string", "description": "区名(例: '小倉北区')"},
                     "town": {
                         "type": "string",
-                        "description": "町名・丁目(例: '浅野1丁目')。省略不可。",
+                        "description": (
+                            "町名・丁目、または丁目を省略した地区名"
+                            "(例: '浅野1丁目'、または単に '黒崎')。省略不可。"
+                        ),
                     },
                     "waste_type": {
                         "type": "string",
@@ -174,9 +180,30 @@ def _tool_lookup_collection_schedule(
         return {"error": "ward and town are both required"}
 
     hits = lookup_collection_schedule(ward, town, waste_type or None)
+    district_note: str | None = None
+    if not hits:
+        # 丁目を省略した地区名(「黒崎」等)の可能性を試す。地区内の全ての町
+        # (丁目)で収集日が完全に一致する場合に限り、それをそのまま使う
+        # (`router.py` の `_match_district`/`_uniform_district_schedule` と
+        # 同じ規則。エージェント経路にはこの絞り込みが元々無く、モデルが
+        # `town="黒崎"` のように丁目無しで呼んだ場合に空振りしたまま収集日を
+        # 一切案内しない不具合があった。2026-09-10、実機で
+        # 「八幡西区黒崎でソファを処分する方法」に再現・確認済み)。
+        towns = _district_groups(ward).get(town)
+        if towns:
+            uniform = _uniform_district_schedule(ward, towns, waste_type or None)
+            if uniform:
+                hits = uniform
+                district_note = (
+                    f"「{town}」は丁目の指定がなかったが、地区内の全ての町"
+                    f"({'・'.join(towns)})で収集日が一致することを確認済み。"
+                    "上記の収集日をそのまま案内してよい"
+                    "(特定の1丁目だけを見て答えたわけではない)。"
+                )
+
     if not hits:
         return {"schedules": []}
-    return {
+    result: dict = {
         "schedules": [
             {
                 "ward": h.ward,
@@ -188,6 +215,9 @@ def _tool_lookup_collection_schedule(
             for h in hits
         ]
     }
+    if district_note:
+        result["district_note"] = district_note
+    return result
 
 
 def _tool_search_general_info(query: str) -> dict:

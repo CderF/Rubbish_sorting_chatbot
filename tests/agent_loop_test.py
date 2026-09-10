@@ -273,3 +273,77 @@ def test_image_item_name_is_passed_through_as_context():
         assert "テレビ" in user_msg
 
     asyncio.run(body())
+
+
+def test_district_fallback_note_reaches_context_and_states_the_weekday(monkeypatch):
+    """丁目を省略した地区名(「黒崎」等)で lookup_collection_schedule を呼んだ
+    場合、`tools._tool_lookup_collection_schedule` が付ける `district_note` が
+    最終的な context に載り、収集日そのものは省略されないことを確認する。
+
+    2026-09-10、実機で「八幡西区黒崎でソファを処分する方法を教えてください」
+    に対し、town="黒崎"(丁目無し)で lookup_collection_schedule を呼んでも
+    直接一致する行が無いため何も返らず、収集日が一切案内されない不具合が
+    見つかった(router.py の決定論的経路には既にあった `_match_district`/
+    `_uniform_district_schedule` による丁目省略地区名の解決が、エージェント
+    経路の `tools.py` には無かったのが原因)。"""
+
+    def fake_execute_tool(name, arguments):
+        if name == "search_waste_item":
+            return {
+                "match_stage": "analogy",
+                "items": [
+                    {
+                        "item_name": "ソファーベッド",
+                        "disposal_method": "粗大ごみ",
+                        "notes": "事前申込制",
+                        "source_url": "https://example.test/sofa",
+                    }
+                ],
+            }
+        if name == "lookup_collection_schedule":
+            assert arguments == {"ward": "八幡西区", "town": "黒崎"}
+            return {
+                "schedules": [
+                    {
+                        "ward": "八幡西区",
+                        "town": "黒崎1丁目",
+                        "waste_type": "粗大ごみ",
+                        "weekday": "第2水曜日",
+                        "source_url": "https://example.test/schedule",
+                    }
+                ],
+                "district_note": (
+                    "「黒崎」は丁目の指定がなかったが、地区内の全ての町"
+                    "(黒崎1丁目・黒崎2丁目)で収集日が一致することを確認済み。"
+                ),
+            }
+        raise AssertionError(f"unexpected tool call: {name}")
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    _TOOL_CALL_SOFA = (
+        "<tool_call>\n"
+        '{"name": "search_waste_item", "arguments": {"query": "ソファ"}}\n'
+        "</tool_call>"
+    )
+    _TOOL_CALL_SCHEDULE = (
+        "<tool_call>\n"
+        '{"name": "lookup_collection_schedule", '
+        '"arguments": {"ward": "八幡西区", "town": "黒崎"}}\n'
+        "</tool_call>"
+    )
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_SOFA, _TOOL_CALL_SCHEDULE, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "八幡西区黒崎でソファを処分する方法を教えてください",
+            engine=engine, build_prompt=_build_prompt, sampling_params=object(),
+        )
+
+        assert result is not None
+        assert len(result.schedule_hits) == 1
+        assert result.schedule_hits[0].weekday == "第2水曜日"
+        assert "第2水曜日" in result.context
+        assert "地区内の全ての町" in result.context
+
+    asyncio.run(body())

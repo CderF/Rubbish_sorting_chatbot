@@ -76,7 +76,10 @@ _SYSTEM_PROMPT = (
     "集めることに専念してください。\n"
     "- 品目の分別方法を調べるには search_waste_item を使う。\n"
     "- 収集曜日を調べるには lookup_collection_schedule を使う"
-    "(区名・町名の両方が分かっているときだけ呼ぶこと。町名が不明なら呼ばない)。\n"
+    "(区名と町名が分かっているときに呼ぶ。町名は丁目まで分からなくてもよく、"
+    "「黒崎」のように丁目を省略した地区名でも解決できることがあるので、"
+    "丁目が不明というだけで呼ぶのをやめない。区名も町名も分からないときだけ"
+    "呼ばない)。\n"
     "- 品目や収集日に当てはまらない一般的な質問には search_general_info を使う。\n"
     "- search_waste_item で品目が見つかったら、その品目名で"
     "lookup_item_change_notice も必ず呼び、出し方が変わる予定が無いか確認する。\n"
@@ -138,6 +141,7 @@ async def _run_loop(
     collected_schedules: list[SimpleNamespace] = []
     collected_explanations: list[dict] = []
     collected_notices: list[dict] = []
+    district_notes: list[str] = []
     sources: list[str] = []
     detected_item: str | None = image_item_name
     detected_ward: str | None = None
@@ -169,6 +173,8 @@ async def _run_loop(
                     collected_schedules.append(SimpleNamespace(**sched))
                     if sched.get("source_url"):
                         sources.append(sched["source_url"])
+                if result.get("district_note"):
+                    district_notes.append(result["district_note"])
 
             elif call.name == "search_general_info":
                 for chunk in result.get("results", []):
@@ -198,6 +204,7 @@ async def _run_loop(
         schedules=collected_schedules,
         explanations=collected_explanations,
         notices=collected_notices,
+        district_notes=district_notes,
         sources=sources,
         match_stage=match_stage,
         detected_item=detected_item,
@@ -295,6 +302,7 @@ def _build_context_text(
     schedules: list[SimpleNamespace],
     explanations: list[dict],
     notices: list[dict],
+    district_notes: list[str] | None = None,
 ) -> str:
     blocks: list[str] = []
 
@@ -311,6 +319,21 @@ def _build_context_text(
         lines = ["## 収集日の検索結果(エージェントが検索)"]
         for s in schedules:
             lines.append(f"- {s.ward}{s.town} / {s.waste_type}: {s.weekday}")
+        if any(s.waste_type == "粗大ごみ" for s in schedules):
+            # router.py の同じ注記と揃える(2026-09-10 追加)。粗大ごみは
+            # 事前申込制だが、申込の説明だけで済ませて収集曜日そのものを
+            # 省略されると「具体的な収集曜日を漏らす」という別の問題になる。
+            # 曜日の明記を先に、申込の要否は追加条件として明示する順で書く
+            # (どちらも必須、二択にしない)。
+            lines.append(
+                "  ※ 事前申込制。上記の収集曜日(申込後にこの曜日に収集される)を"
+                "必ず回答に明記すること。申込の説明だけで済ませて曜日を省略しない。"
+                "その上で、申込なしにはこの曜日へ出せないこと、"
+                "事前に粗大ごみ受付センター(電話: 093-513-3005)へ電話、"
+                "またはインターネットで申込む必要があることも併せて伝える。"
+            )
+        for note in district_notes or ():
+            lines.append(f"  ※ {note}")
         blocks.append("\n".join(lines))
 
     if explanations:
@@ -346,6 +369,7 @@ def _build_routed_answer(
     detected_item: str | None,
     detected_ward: str | None,
     detected_town: str | None,
+    district_notes: list[str] | None = None,
 ) -> RoutedAnswer:
     q = _norm(query)
     item_match = "none"
@@ -364,5 +388,5 @@ def _build_routed_answer(
         timeline_change=bool(notices),
         sources=_dedupe(sources),
     )
-    ans.context = _build_context_text(items, schedules, explanations, notices)
+    ans.context = _build_context_text(items, schedules, explanations, notices, district_notes)
     return ans
