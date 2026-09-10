@@ -8,7 +8,7 @@
 from dataclasses import dataclass, field
 from typing import Protocol, TypedDict
 
-from app.rag.session_state import DialogState
+from app.rag.session_state import DialogState, TurnInput
 
 
 class ItemRecord(Protocol):
@@ -170,6 +170,14 @@ class RoutedAnswer:
     state: "DialogState | None" = None
     """このターン終了時点の会話スロット(STAGE05)。`server.py` がセッションに
     保存し、次のターンで `handle_query` に渡し直す。"""
+
+    turn: "TurnInput | None" = None
+    """このターンの抽出結果(畳み込み**前**)。
+
+    `state` は「このターン開始時点のスロット + `turn`」の結果なので、保存の
+    時点で別のターンが先に書き込んでいると、`state` をそのまま入れると相手の
+    更新を消してしまう(レビュー指摘8)。`turn` を持たせておくと、保存側が
+    その時点の最新スロットへ畳み込み直せる。"""
 
     detected_item: str | None = None
     """プロンプト(または画像)から抽出した品名。デバッグ・WebUI表示用。"""

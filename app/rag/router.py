@@ -346,14 +346,34 @@ def _clean_fragment(frag: str) -> str:
     return frag.strip()
 
 
-def _trim_particles(text: str, original: str) -> str:
-    """文頭・文末に残った助詞を落とす。ただし発話の先頭は削らない。
+_FRAGMENT_BOUNDARY = r"[\s、。「」()（）]"
 
-    `original` は正規化しただけの発話全文。`text` がまだその先頭から始まって
-    いる(=区名・町名・種別語の除去でずれていない)なら、1文字目は助詞の
-    残骸ではなく内容語の一部なので `_LEADING` を当てない。
+
+def _written_from_the_start(frag: str, original: str) -> bool:
+    """`frag` が発話の中で「語の書き出し」の位置に現れているか。
+
+    発話の先頭、または断片分割に使う区切り(空白・読点・括弧)の直後に現れて
+    いれば、その1文字目は利用者が実際に書いた内容語の頭であって、除去の
+    残骸ではない。
+
+    以前は `original.startswith(frag)` で判定していたが、これでは発話の
+    **最初の**断片しか守れず、「ドライバー、ねじ回し、はさみを捨てたい」の
+    断片「ねじ回し」が「じ回し」に削られていた(レビュー指摘7)。
     """
-    if not original.startswith(text):
+    if not frag:
+        return False
+    return re.search(rf"(?:^|{_FRAGMENT_BOUNDARY}){re.escape(frag)}", original) is not None
+
+
+def _trim_particles(text: str, original: str) -> str:
+    """文頭・文末に残った助詞を落とす。ただし利用者が書いた語の頭は削らない。
+
+    `original` は正規化しただけの発話全文。`text` がその中で語の書き出しとして
+    現れているなら、1文字目は助詞の残骸ではなく内容語の一部なので `_LEADING`
+    を当てない。区名・町名・種別語を除去した「跡」(「…丁目でソファを…」の
+    「でソファを…」)は語の書き出しではないので、従来どおり当たる。
+    """
+    if not _written_from_the_start(text, original):
         text = _LEADING.sub("", text)
     return _TRAILING.sub("", text).strip()
 
@@ -845,7 +865,17 @@ def _route_schedule(ans: RoutedAnswer, state: DialogState, prompt: str) -> None:
     """
     ward, town = state.ward, state.town
     if not ward:
-        if state.wants_schedule:
+        # 「収集日を知りたいが地区がまだ分からない」ことを伝えるのは、この
+        # ターンが収集日を尋ねているか、あるいは以前の収集日の問いに未回答の
+        # まま**同じ話題が続いている**ときだけ。
+        #
+        # `state.wants_schedule` はセッション中ずっと真のままなので、これだけを
+        # 見ると、地区を一度も言わずに収集日を尋ねた後は、無関係な質問
+        # (「ペットボトルの捨て方は?」)にも毎ターン「区名と町名が必要」が
+        # 付き続ける(レビュー指摘6)。新しい品目が出てきたターンは話題が
+        # 移ったとみなして黙る。
+        pending = state.wants_schedule and state.last_item_update in ("none", "refocus")
+        if asks_schedule(_norm(prompt)) or pending:
             ans.missing.append("区名と町名")
         return
 
@@ -862,13 +892,23 @@ def _route_schedule(ans: RoutedAnswer, state: DialogState, prompt: str) -> None:
     ans.no_weekday_schedule = any(r.no_weekday for r in ans.item_results)
 
     if not queried:
-        if ans.item_results and all(r.no_weekday for r in ans.item_results):
+        if (
+            ans.item_results
+            and all(r.no_weekday for r in ans.item_results)
+            and not state.waste_type
+        ):
             # 相談中の品目が「すべて」決まった収集曜日を持たない区分のときだけ
             # 検索を省く。ここは以前 `queried` が空であることと同じ条件を
             # 書いており、区分を特定できない品目(部分一致が割れて
             # `disposal_method` が None)と no_weekday の品目が同時にいる相談で
             # 誤発火していた。会話で種別が判明していても検索前に return して
             # しまい、収集日が無言で落ちる(レビュー指摘1)。
+            #
+            # 会話で種別が判明している(`state.waste_type`)ときも省かない。
+            # 「粗大ごみの日は?」で種別だけ聞いた後に「蛍光管も」と
+            # no_weekday の品目が足されると、`ans.item_results` が蛍光管だけに
+            # なって all(no_weekday) が真になり、1ターン目に尋ねた粗大ごみの
+            # 収集日が無言で落ちていた(レビュー指摘4)。
             return
         # 早見表がヒットしていない、または区分が割れて特定できない。会話中に
         # 明示された種別があればそれで絞る(無ければ全種別)。
@@ -1053,10 +1093,15 @@ def _blocking_route(
     _route_schedule(ans, state, prompt)
 
     # 地区名から町名を解決できていれば状態に書き戻す。次ターン以降は再解決なしに引ける。
+    # `turn` にも載せるのは、保存側(`server._remember`)がその時点の最新スロットへ
+    # `turn` を畳み込み直すため。ここで `state` にしか書かないと、解決した町名が
+    # 畳み込み直しで消える。
     if ans.district_schedule and ans.detected_town:
         state = replace(state, town=ans.detected_town)
+        turn = replace(turn, town=ans.detected_town)
 
     ans.state = state
+    ans.turn = turn
     ans.item_from_image = turn.from_image
     ans.found = bool(ans.item_hits or ans.schedule_hits)
     ans.sources = _collect_sources(ans)
@@ -1121,7 +1166,11 @@ def _collect_sources(ans: RoutedAnswer) -> list[str]:
                 urls.append(pick.source_url)
         else:
             urls += [h.source_url for h in r.hits]
-    if not any(r.timeline_change for r in ans.item_results):
+    # 収集日の参照を落とすのは、相談中の品目が**すべて**変更予定のときだけ。
+    # 品目が1つなら STAGE04 と同じ判定になる。複数品目で片方だけが 4-2 の
+    # ときに落とすと、もう片方の収集日案内が引用なしで出てしまい、STAGE02
+    # 2-2「根拠を参照ページまで示せる」に反する(レビュー指摘5)。
+    if not (ans.item_results and all(r.timeline_change for r in ans.item_results)):
         urls += [r.source_url for r in ans.schedule_hits]
     return _dedupe(urls)
 
@@ -1460,6 +1509,16 @@ def _item_block(result: ItemResult, label: bool) -> str:
     if not result.hits:
         # 引き継いだ品目が早見表に無かった場合。黙って落とすと、LLM が前ターンの
         # 記憶から補って断定する余地が生まれる(STAGE05 5-1)。
+        #
+        # ただし出すのは品目が2件以上(`label`)のときだけ。品目が1つの相談で
+        # ヒット0件なら、それは STAGE02〜04 と同じ「早見表に無い品物の単発
+        # 質問」であり、main は context を空にして `_RULES_NO_CONTEXT` だけで
+        # 答えさせていた。ここでブロックを足すと、`ans.found` が偽のまま
+        # 「# 検索結果」セクションだけが付く矛盾した形になる(レビュー指摘1)。
+        # 対応づけが要るのは複数品目のときだけなので、条件も `suffix` と同じ
+        # `label` に揃える。
+        if not label:
+            return ""
         return (
             f"## 分別早見表の検索結果{suffix}\n"
             "- 該当する品目は見つかりませんでした(推測で分別を断定しない)"
@@ -1545,7 +1604,9 @@ def _build_context(ans: RoutedAnswer) -> str:
     #  規則として答えたり片方を落としたりする)。
     for result in ans.item_results:
         if not result.timeline_change:
-            blocks.append(_item_block(result, label))
+            block = _item_block(result, label)
+            if block:
+                blocks.append(block)
 
     if ans.schedule_hits:
         lines = ["## 収集日の検索結果"]
@@ -1712,6 +1773,14 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
     elif ans.timeline_change:
         # 4-2。_RULES_WITH_CONTEXT は当てない(上のコメント参照)。
         parts.append(_RULES_TIMELINE)
+        # ただし品目が複数あり、変更予定を持つのがその一部だけのときは、
+        # 変更予定の無い品目まで _RULES_TIMELINE だけで答えることになり、
+        # 「備考は一つも省略せず全て」等の指示が外れる(レビュー指摘3)。
+        # 通常のヒットを持つ品目が別にいるなら、そちら向けの規則も当てる。
+        # 品目が1つの相談では `others` が空になり、STAGE04 と同じ動作。
+        others = [r for r in ans.item_results if not r.timeline_change]
+        if any(r.hits and r.item_match != "analogy" for r in others):
+            parts.append(_RULES_WITH_CONTEXT)
     elif ans.found and ans.item_match != "analogy":
         parts.append(_RULES_WITH_CONTEXT)
     elif ans.found:

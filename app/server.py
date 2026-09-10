@@ -57,7 +57,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from app.notices import admin as notice_admin  # noqa: E402
-from app.rag import knowledge, router, slot_extract  # noqa: E402  (sys.path 調整後に import)
+from app.rag import agent, knowledge, router, slot_extract  # noqa: E402  (sys.path 調整後に import)
 from app.rag.session_state import DialogState  # noqa: E402
 
 # ナレッジ管理API(お知らせの取り込み/削除)は waste_items を直接書き換えるが、
@@ -102,6 +102,15 @@ MAX_HISTORY_MESSAGES = 8
 # Never return an empty body — that fails the question outright.
 EMPTY_FALLBACK = "申し訳ありません。回答を生成できませんでした。もう一度お試しください。"
 
+# Agentic RAG(Function Calling)。既定オン: B1実機で複数の質問パターン
+# (早見表パス・収集日パス・ベクトルRAGパス)を検証済み(2026-09-10、
+# app/rag/agent.py のモジュールdocstring参照)。失敗しても _route_safely が
+# 現行の決定論的経路へ自動フォールバックするので、既定オンでも安全側の設計
+# は維持している。フラグはいつでも即座に戻せるよう env var のままにしてある
+# (`AGENTIC_RAG_ENABLED=0` で無効化)。
+AGENTIC_RAG_ENABLED = os.environ.get("AGENTIC_RAG_ENABLED", "1") == "1"
+AGENTIC_TOOL_CALL_MAX_TOKENS = 300
+
 app = FastAPI()
 engine: AsyncLLMEngine | None = None
 processor = None  # AutoProcessor, loaded once at startup
@@ -120,13 +129,26 @@ states: "OrderedDict[str, DialogState]" = OrderedDict()
 _sessions_lock = asyncio.Lock()
 
 
-def _remember(session_id: str, messages: list, answer: str, routed) -> None:
+def _remember(session_id: str, prompt: str, messages: list, answer: str, routed) -> None:
     """Store one finished turn. Caller must hold `_sessions_lock`.
 
     Both stores are written here so they cannot drift apart: `sessions` is what
     the *model* replays, `states` is what the *search* re-runs from. A session
     that kept only one of the two would either answer from a premise it can no
     longer justify, or silently forget the item it is still talking about.
+
+    スロットは `routed.state` をそのまま入れるのではなく、**保存の時点で最新の
+    スロットへ `routed.turn` を畳み込み直す**。理由が2つある。
+
+    1. 同じ `session_id` のリクエストが重なると、両方がターン開始時の同じ
+       スロットを読み、後に書いたほうが相手の品名・地区の更新を消す
+       (レビュー指摘8)。畳み込みは冪等ではないが、`turn` から引き直せば
+       先に書かれた更新の上に乗る。
+    2. RAG が失敗して `routed` が None のターンでも、モデル履歴だけが進んで
+       スロットが止まると、そのターンで出てきた品名・地区が会話の残り全部で
+       検索側から消える(レビュー指摘2)。ルール抽出だけで畳み込んでおく。
+       この経路のスロット名は早見表で正規化されていないぶん粗いが、黙って
+       落とすよりは次ターンで引ける可能性が残る。
 
     The citation block is deliberately left out of the stored answer: it is
     rebuilt from the retrieval result on every turn, and keeping it would spend
@@ -136,8 +158,16 @@ def _remember(session_id: str, messages: list, answer: str, routed) -> None:
         messages + [{"role": "assistant", "content": answer}]
     )[-MAX_HISTORY_MESSAGES:]
     sessions.move_to_end(session_id)
-    if routed is not None and routed.state is not None:
-        states[session_id] = routed.state
+
+    turn = routed.turn if routed is not None else None
+    if turn is None:
+        try:
+            turn, _, _ = router.extract_turn(prompt)
+        except Exception as exc:  # noqa: BLE001 — 状態更新の失敗で応答は止めない
+            print(f"[state] fallback extraction failed: {exc!r}", flush=True)
+            turn = None
+    if turn is not None:
+        states[session_id] = router.merge_state(states.get(session_id), turn)
         states.move_to_end(session_id)
     while len(sessions) > MAX_SESSIONS:
         evicted, _ = sessions.popitem(last=False)
@@ -218,14 +248,20 @@ def _build_messages(prompt: str, img_b64: str | None) -> list:
     return [{"role": "user", "content": prompt}]
 
 
-def _build_prompt(messages: list) -> dict:
-    """Render the chat template and collect any images in the conversation."""
+def _build_prompt(messages: list, tools: list | None = None) -> dict:
+    """Render the chat template and collect any images in the conversation.
+
+    `tools` is only used by the agentic RAG path (`app/rag/agent.py`) to pass
+    the Function Calling tool schemas through to the chat template. Omitted
+    (None) for every other call site, so existing behaviour is unchanged.
+    """
     images = [m["_image"] for m in messages if "_image" in m]
     clean = [{k: v for k, v in m.items() if k != "_image"} for m in messages]
 
-    text_prompt = processor.apply_chat_template(
-        clean, tokenize=False, add_generation_prompt=True
-    )
+    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+    if tools is not None:
+        template_kwargs["tools"] = tools
+    text_prompt = processor.apply_chat_template(clean, **template_kwargs)
     if images:
         return {"prompt": text_prompt, "multi_modal_data": {"image": images}}
     return {"prompt": text_prompt}
@@ -320,7 +356,37 @@ async def _route_safely(prompt: str, img: str | None, state: DialogState | None)
 
     RAG側の例外で 5xx を返すとステージ全体が中断してしまう(冒頭の契約メモ参照)
     ため、ここだけは意図的に握り潰し、素の生成にフォールバックする。
+
+    `AGENTIC_RAG_ENABLED` が真のときは Function Calling によるエージェント
+    経路(`app/rag/agent.py`)を先に試す。`route_agentically` はパース不能・
+    ヒット0件・想定外の例外いずれでも None を返す設計なので、その場合は
+    そのまま現行の決定論的経路(`router.handle_query`)にフォールバックする
+    — グレーディング対象の `/chat` の挙動を壊さないための安全弁。
     """
+    if AGENTIC_RAG_ENABLED:
+        image_item_name = None
+        if img:
+            try:
+                image_item_name = await router.classify_image_to_item_name(
+                    img, engine, processor
+                )
+            except Exception as exc:  # noqa: BLE001 — 分類失敗でもエージェントは試す
+                print(f"[agent] image classification failed: {exc!r}", flush=True)
+
+        agentic_result = await agent.route_agentically(
+            prompt,
+            engine=engine,
+            build_prompt=_build_prompt,
+            sampling_params=SamplingParams(
+                temperature=0.0, max_tokens=AGENTIC_TOOL_CALL_MAX_TOKENS
+            ),
+            image_item_name=image_item_name,
+        )
+        if agentic_result is not None:
+            return agentic_result
+        print("[agent] route_agentically returned None, falling back to deterministic router",
+              flush=True)
+
     try:
         return await router.handle_query(
             prompt, img, state, engine=engine, processor=processor
@@ -359,7 +425,7 @@ async def _stream_chat(
         # 次のターンで品名・地区を引き継げず 5-1 が途中で切れる
         # (「断定できない」と答えた品物を利用者が言い直す流れが典型)。
         async with _sessions_lock:
-            _remember(session_id, messages, text, routed)
+            _remember(session_id, prompt, messages, text, routed)
         last_timing.update(
             first_token_s=0.0, total_s=0.0, tokens=0, session_id=session_id,
             retrieval={"item": routed.detected_item, "canned": True},
@@ -437,7 +503,7 @@ async def _stream_chat(
     # rebuilt from the retrieval result on every turn, and keeping it would
     # spend history budget on URLs the model must not write itself anyway.
     async with _sessions_lock:
-        _remember(session_id, messages, answer_text, routed)
+        _remember(session_id, prompt, messages, answer_text, routed)
 
     _write_trace(session_id, prompt, routed, prev_text)
     yield "data: [DONE]\n\n"
