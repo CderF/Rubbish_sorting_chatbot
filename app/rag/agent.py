@@ -65,6 +65,7 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
+from app.rag.router import _analogy_pick, _override_analogy_hits
 from app.rag.tool_call_parser import ToolCall, parse_tool_calls
 from app.rag.tools import TOOL_SCHEMAS, execute_tool
 from app.rag.types import RoutedAnswer
@@ -131,12 +132,13 @@ async def _run_loop(
         {"role": "user", "content": user_content},
     ]
 
-    collected_items: list[SimpleNamespace] = []
+    # search_waste_item の呼び出しごとの結果(match_stage, items)。ループを跨いで
+    # 単純に collected_items へ extend しない理由は `_narrow_item_hits` 参照。
+    item_call_results: list[tuple[str | None, list[SimpleNamespace]]] = []
     collected_schedules: list[SimpleNamespace] = []
     collected_explanations: list[dict] = []
     collected_notices: list[dict] = []
     sources: list[str] = []
-    match_stage: str | None = None
     detected_item: str | None = image_item_name
     detected_ward: str | None = None
     detected_town: str | None = None
@@ -155,14 +157,10 @@ async def _run_loop(
             messages.append({"role": "tool", "content": json.dumps(result, ensure_ascii=False)})
 
             if call.name == "search_waste_item":
-                if "match_stage" in result:
-                    match_stage = result["match_stage"]
                 if not detected_item:
                     detected_item = call.arguments.get("query")
-                for item in result.get("items", []):
-                    collected_items.append(SimpleNamespace(**item))
-                    if item.get("source_url"):
-                        sources.append(item["source_url"])
+                items = [SimpleNamespace(**item) for item in result.get("items", [])]
+                item_call_results.append((result.get("match_stage"), items))
 
             elif call.name == "lookup_collection_schedule":
                 detected_ward = detected_ward or call.arguments.get("ward")
@@ -185,6 +183,11 @@ async def _run_loop(
                         if seg and seg.get("source_url"):
                             sources.append(seg["source_url"])
 
+    collected_items, match_stage = _narrow_item_hits(item_call_results, detected_item, user_content)
+    for item in collected_items:
+        if item.source_url:
+            sources.append(item.source_url)
+
     if not (collected_items or collected_schedules or collected_explanations):
         # 何も拾えなければ、呼び出し側で決定論的経路にフォールバックさせる。
         return None
@@ -201,6 +204,70 @@ async def _run_loop(
         detected_ward=detected_ward,
         detected_town=detected_town,
     )
+
+
+_MATCH_STAGE_RANK = {"exact": 3, "partial": 2, "vector": 1}
+
+
+def _narrow_item_hits(
+    item_call_results: list[tuple[str | None, list[SimpleNamespace]]],
+    detected_item: str | None,
+    prompt_text: str,
+) -> tuple[list[SimpleNamespace], str | None]:
+    """search_waste_item の全呼び出し結果から、最終回答の context に載せてよい
+    品目を絞り込む。
+
+    `router.py`(決定論的経路)は `_search_item` が1回しか呼ばれず、しかも
+    `item_match == "analogy"` のときは `_override_analogy_hits`/`_analogy_pick`
+    で候補を1件に絞ってから context・`_has_conditional_notes` の判定に渡す
+    (line 996〜1018, 1226〜1238)。Agentic 経路はモデル自身がツールを何度でも
+    呼べるため、素朴に全呼び出しの `items` を集約すると、質問された品目とは
+    無関係な候補(モデルが確認のために追加で呼んだ検索の結果)の備考
+    ―特に材質・サイズによる分別区分の条件文― まで context に混入し、
+    `_has_conditional_notes` が誤って発火して「この品目にはサイズ条件がある」
+    という事実に基づかない回答を生む(2026-09-10、実機で「たんす」の質問に
+    「かご」等の50センチ条件が紛れ込む形で再現・確認済み)。
+
+    決定論的経路と同じ絞り込みをここでも適用する:
+    1. match_stage が最も良い(exact > partial > vector)呼び出しの結果だけを
+       採用し、それより弱い呼び出しの結果は捨てる(モデルが探索的に呼んだ
+       追加の検索が本命の結果を汚さないようにする)。
+    2. その中に品目名が `detected_item` と正規化一致するものがあれば、それ
+       1件だけに絞る(完全一致)。
+    3. 複数件のままなら `_override_analogy_hits`/`_analogy_pick` で1件に
+       絞る(router.py と同じ規則)。
+    """
+    if not item_call_results:
+        return [], None
+
+    best_stage: str | None = None
+    best_items: list[SimpleNamespace] = []
+    best_rank = -1
+    for stage, items in item_call_results:
+        if not items:
+            continue
+        rank = _MATCH_STAGE_RANK.get(stage, 0)
+        if rank > best_rank:
+            best_rank = rank
+            best_stage = stage
+            best_items = items
+
+    if not best_items:
+        return [], None
+    if len(best_items) == 1:
+        return best_items, best_stage
+
+    if detected_item:
+        q = _norm(detected_item)
+        named = [it for it in best_items if _norm(getattr(it, "item_name", "")) == q]
+        if named:
+            return named[:1], best_stage
+
+    narrowed = _override_analogy_hits(detected_item or prompt_text, best_items)
+    if len(narrowed) == 1:
+        return narrowed, best_stage
+    pick = _analogy_pick(narrowed, detected_item)
+    return ([pick] if pick is not None else narrowed[:1]), best_stage
 
 
 async def _generate_once(engine: Any, prompt_input: dict, sampling_params: Any) -> str:

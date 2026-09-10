@@ -144,7 +144,81 @@ def test_hits_max_iterations_still_uses_whatever_was_collected(monkeypatch):
         )
         assert result is not None
         assert engine.call_count == 3  # 上限で打ち切られる
-        assert len(result.item_hits) == 3  # 3回分の結果を集めている
+        # 3回とも同じ品目の exact ヒットなので、素朴に集約した重複3件ではなく
+        # 絞り込み後の1件になる(`_narrow_item_hits` 参照)。
+        assert len(result.item_hits) == 1
+        assert result.item_hits[0].item_name == "テレビ"
+
+    asyncio.run(body())
+
+
+def test_unrelated_extra_search_call_does_not_pollute_context(monkeypatch):
+    """モデルが本命の品目を見つけた後、探索的に別の(無関係な)品目を検索
+    しても、その備考が最終的な item_hits に混ざらないことを確認する。
+
+    2026-09-10、実機で「たんす」の質問に無関係な品目(かご等)の「50センチ
+    未満なら…」という材質・サイズ条件が context に紛れ込み、たんす自体には
+    無いはずの条件をLLMが答えに書いてしまう不具合が見つかった。原因は
+    `search_waste_item` の呼び出しごとの結果を単純に全部 collected_items へ
+    足し込んでいたこと。"""
+
+    responses = iter(
+        [
+            {
+                "match_stage": "exact",
+                "items": [
+                    {
+                        "item_name": "たんす",
+                        "disposal_method": "粗大ごみ",
+                        "notes": "事前申込制",
+                        "source_url": "https://example.test/tansu",
+                    }
+                ],
+            },
+            {
+                "match_stage": "vector",
+                "items": [
+                    {
+                        "item_name": "かご",
+                        "disposal_method": "家庭ごみ",
+                        "notes": "プラスチックだけでできており、1辺の長さが50センチ未満のもので指定袋に入る大きさのものは、プラスチック",
+                        "source_url": "https://example.test/kago",
+                    }
+                ],
+            },
+        ]
+    )
+
+    def fake_execute_tool(name, arguments):
+        return next(responses)
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    _TOOL_CALL_TANSU = (
+        "<tool_call>\n"
+        '{"name": "search_waste_item", "arguments": {"query": "たんす"}}\n'
+        "</tool_call>"
+    )
+    _TOOL_CALL_KAGO = (
+        "<tool_call>\n"
+        '{"name": "search_waste_item", "arguments": {"query": "かご"}}\n'
+        "</tool_call>"
+    )
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_TANSU, _TOOL_CALL_KAGO, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "たんすを捨てたいです", engine=engine, build_prompt=_build_prompt,
+            sampling_params=object(),
+        )
+
+        assert result is not None
+        # exact(たんす)の方が vector(かご)より match_stage の順位が高いので、
+        # かご の50センチ条件は item_hits にも context にも残らない。
+        assert len(result.item_hits) == 1
+        assert result.item_hits[0].item_name == "たんす"
+        assert "センチ" not in result.context
+        assert "https://example.test/kago" not in result.sources
 
     asyncio.run(body())
 
