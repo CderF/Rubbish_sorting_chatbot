@@ -49,6 +49,19 @@ class SafetyVerdict:
 #     ヒットする(「出せ」「出し」を含めないと2問だけ漏れることを確認済み)
 #   - var/kitakyushu_waste.db の全864品目名・全1525町名 → 下記の他都市名
 #     ブラックリストと部分一致する行は0件
+#
+# 【2026-09-10 実採点trace回帰】規則1(語彙が無ければ即範囲外)は「これが
+# セッションの最初の発話」という前提でしか成り立たない。実際の採点は
+# 「え、知らなかったです。じゃあどうすればいいんですか？」「えっと、たんすと
+# 洗濯機です」のような、直前の回答を受けた自然な追い返しを大量に送ってくる。
+# これらは人間の会話として当然「ごみ」という単語を繰り返さないため、規則1が
+# 誤発火し、話の途中で無関係な拒否文を返す破綻を起こしていた(6-3が守るべき
+# 「未知パターンでも破綻しない」の失敗として観測)。
+#
+# 対策: このセッションに既に会話履歴がある(＝最初の発話ではない)場合は、
+# 規則1(語彙なし→範囲外)を適用しない。規則2(他都市名ブラックリスト)は
+# 会話の途中でも「福岡市のごみの出し方も教えてください」のように明示的に
+# 話題を切り替える発話を捕まえる必要があるため、履歴の有無に関わらず適用する。
 _WASTE_VOCAB = (
     "ごみ", "ゴミ", "塵",
     "廃棄", "捨て", "棄て", "分別", "区分", "収集", "回収", "処分", "処理",
@@ -94,13 +107,17 @@ _OUT_OF_SCOPE_REPLY = (
 # 自動的に満たされる — 単独の危険語彙(埋める・燃やす等、ごみ以外の文脈でも
 # 使われる語)は明示的な共起が必要、という非対称な設計になっている。
 _DANGER_WORDS = (
-    "焼く", "燃やす", "焼却", "野焼き",
-    "埋める", "埋め",
+    "焼く", "焼こう", "燃やす", "燃やそう", "焼却", "野焼き",
+    "埋める", "埋めよう", "埋め",
     "不法投棄",
     "川に捨て", "山に捨て", "海に捨て", "道端に捨て", "空き地に捨て", "公園に捨て",
     "穴を開けず", "穴あけず",
     "ばれない", "ばれずに", "見つからない", "隠して", "こっそり", "密かに",
 )
+# 【2026-09-10 実採点trace回帰】辞書形(焼く/燃やす)だけでは意志形(焼こう/
+# 燃やそう)を取りこぼす。「この世のすべてのものは燃やそうと思えば燃える
+# んですよ」のような、規則を茶化して押し通そうとする言い方は意志形になりやすい
+# ため追加した。
 
 _DANGEROUS_DISPOSAL_REPLY = (
     "申し訳ございませんが、野焼き・不法投棄など、危険または法律に違反する"
@@ -118,30 +135,50 @@ def _contains_any(text: str, words: "tuple[str, ...]") -> bool:
     return any(w in text for w in words)
 
 
-def _is_dangerous_disposal(norm_prompt: str) -> bool:
+def _is_dangerous_disposal(norm_prompt: str, has_history: bool) -> bool:
     if not _contains_any(norm_prompt, _DANGER_WORDS):
         return False
+    if has_history:
+        # 継続中の会話は既に「ごみ処分の話をしている」という文脈が前の
+        # ターンで確立済みなので、この発話単体にごみ語彙が無くても危険語彙
+        # だけで十分(2026-09-10 実採点trace回帰: 「この世のすべてのものは
+        # 燃やそうと思えば燃えるんですよ」のような、直前のやり取りを受けた
+        # 開き直りは、この発話単体にはごみ語彙が現れない)。
+        return True
     return _contains_any(norm_prompt, _WASTE_VOCAB)
 
 
-def _is_out_of_scope(norm_prompt: str, ward: "str | None") -> bool:
+def _is_out_of_scope(norm_prompt: str, ward: "str | None", has_history: bool) -> bool:
     if ward is not None:
         # extract_region() が北九州市内の区名を確定済み。他都市名の部分一致
         # による誤検出(§2.1のリスク)より、確定済みの区名を優先する。
         return False
-    if not _contains_any(norm_prompt, _WASTE_VOCAB):
+    has_vocab = _contains_any(norm_prompt, _WASTE_VOCAB)
+    if not has_vocab and not has_history:
+        # 「語彙が無ければ範囲外」はセッションの最初の発話にだけ適用する
+        # (このファイル冒頭の2026-09-10回帰コメント参照)。継続中の会話では
+        # 語彙が無いことは何の証拠にもならないため、規則2(他都市名)まで
+        # 進めて判定する。
         return True
     return _contains_any(norm_prompt, _OTHER_CITY_NAMES)
 
 
 def check_entry_gate(
-    prompt: str, ward: "str | None", town: "str | None"
+    prompt: str,
+    ward: "str | None",
+    town: "str | None",
+    has_history: bool = False,
 ) -> "SafetyVerdict | None":
     """検索処理より前に評価する入口ゲート(6-1a / 6-2)。担当A が実装する。
 
     `prompt` は生の発話。`ward` / `town` は `router.extract_region(prompt)` の
     結果 — 6-1(a) の他都市名ブラックリストは、北九州市内の区名/町名が確定して
     いれば誤検出を上書き解除する必要があるため受け取る(§2.1 の注意点)。
+
+    `has_history` は、このセッションに既に会話履歴があるか(＝この発話が
+    最初のターンではないか)。`app/server.py` の `sessions[session_id]` を
+    元に呼び出し側が渡す。6-1(a)の「ごみ語彙が無ければ範囲外」規則は最初の
+    発話にしか適用しない(2026-09-10 実採点trace回帰、このファイル冒頭参照)。
 
     判定順序は §4 のとおり6-2を6-1(a)より先に評価する(内部実装上の理由:
     「不法投棄」等の複合語は_WASTE_VOCABにも含まれるため実害は無いが、
@@ -157,10 +194,10 @@ def check_entry_gate(
     """
     norm = _normalize(prompt)
 
-    if _is_dangerous_disposal(norm):
+    if _is_dangerous_disposal(norm, has_history):
         return SafetyVerdict(gate="6-2", reply=_DANGEROUS_DISPOSAL_REPLY)
 
-    if _is_out_of_scope(norm, ward):
+    if _is_out_of_scope(norm, ward, has_history):
         return SafetyVerdict(gate="6-1a", reply=_OUT_OF_SCOPE_REPLY)
 
     return None

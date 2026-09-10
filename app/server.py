@@ -294,7 +294,7 @@ def _write_trace(session_id: str, prompt: str, routed, final_text: str) -> None:
         print(f"[trace] write failed: {exc!r}", flush=True)
 
 
-async def _route_safely(prompt: str, img: str | None):
+async def _route_safely(prompt: str, img: str | None, has_history: bool = False):
     """検索パスを呼ぶ。失敗しても生成は止めない。
 
     RAG側の例外で 5xx を返すとステージ全体が中断してしまう(冒頭の契約メモ参照)
@@ -311,10 +311,16 @@ async def _route_safely(prompt: str, img: str | None):
     を経由しないため、ゲートを `router` 側に置くと既定オンのエージェント応答が
     素通りしてしまう(STAGE06 proposal §7.1 の足場でこの位置に確定)。
     足場では `check_entry_gate` が常に None を返すため挙動は変わらない。
+
+    `has_history`: このセッションに既に会話履歴があるか。呼び出し元
+    (`_stream_chat`)が `sessions[session_id]` の有無から渡す。STAGE06は
+    STAGE05のセッション状態(スロット)には依存しないが、この1ビットだけは
+    「最初の発話か、追い返しか」を区別するために必要(2026-09-10 実採点trace
+    回帰: `app/rag/safety.py` 冒頭のコメント参照)。
     """
     # --- 6-1a/6-2 gate (STAGE06 proposal §7.2 / 担当A) ---
     ward, town = router.extract_region(prompt)
-    verdict = safety.check_entry_gate(prompt, ward, town)
+    verdict = safety.check_entry_gate(prompt, ward, town, has_history=has_history)
     if verdict is not None:
         ans = RoutedAnswer()
         ans.detected_ward, ans.detected_town = ward, town
@@ -370,7 +376,7 @@ async def _stream_chat(
 
     # 検索結果はシステムメッセージとして毎ターン先頭に差し込む。会話履歴には
     # 残さない(ターンごとに検索結果が変わるうえ、積み重なると文脈を圧迫するため)。
-    routed = await _route_safely(prompt, img)
+    routed = await _route_safely(prompt, img, has_history=bool(history))
 
     # 確定回答(4-3 確度ゲート等): LLM に言い換え・脚色・補足をさせず、
     # そのまま1フレームで返す。engine.generate は通さない。

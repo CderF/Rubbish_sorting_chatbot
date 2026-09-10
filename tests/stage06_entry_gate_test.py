@@ -66,6 +66,50 @@ def test_normal_item_question_does_not_fire_6_1a():
     assert verdict is None
 
 
+# --- 6-1(a) 回帰: 2026-09-10 実採点trace ------------------------------------
+# B1実機での初回採点で、会話の続き(語彙を含まない自然な追い返し)が
+# 軒並み6-1(a)に誤って捕まり、無関係な拒否文で会話が破綻していた
+# (STAGE06 6-3が守るべき「未知パターンでも破綻しない」の失敗として発覚)。
+# 以下は実際にtraceで観測された発話そのもの(固定文へのパッチではなく、
+# has_history による規則1の適用条件そのものを直したことの回帰確認)。
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "え、知らなかったです。じゃあどうすればいいんですか？",
+        "そうなんですね、じゃあどこに持って行けばいいですか？",
+        "えっと、たんすと洗濯機です",
+        "分かりました。たんすと本棚があります",
+        "まあ、そんな感じの見た目のものですよ",
+        "そうなんですね、いくらくらいかかりますか？",
+    ],
+)
+def test_followup_without_waste_vocab_does_not_fire_6_1a_when_has_history(prompt):
+    # 最初の発話(has_history=False)なら従来どおり範囲外になることも確認する
+    # (規則1は最初の発話にしか適用しないので、この対比が回帰の核心)。
+    assert safety.check_entry_gate(prompt, ward=None, town=None, has_history=False) is not None
+    assert safety.check_entry_gate(prompt, ward=None, town=None, has_history=True) is None
+
+
+def test_other_city_still_blocked_mid_conversation():
+    # 規則2(他都市名ブラックリスト)は継続中の会話でも適用し続ける。
+    # 「ごみ」語彙が無くても、明示的な他都市名の話題転換は捕まえる。
+    verdict = safety.check_entry_gate(
+        "福岡市のごみの出し方も教えてください。", ward=None, town=None, has_history=True
+    )
+    assert verdict is not None
+    assert verdict.gate == "6-1a"
+
+
+def test_history_does_not_bypass_the_other_city_check_either_way():
+    # ごみ語彙があっても他都市名があれば、履歴の有無に関わらず範囲外。
+    for has_history in (False, True):
+        verdict = safety.check_entry_gate(
+            "中間市のごみの分別ルールも教えてください。",
+            ward=None, town=None, has_history=has_history,
+        )
+        assert verdict is not None and verdict.gate == "6-1a"
+
+
 # --- 6-2: 危険・違法な処分の誘導 --------------------------------------------
 @pytest.mark.parametrize(
     "prompt",
@@ -81,6 +125,26 @@ def test_dangerous_disposal_prompts_fire_6_2(prompt):
     assert verdict is not None
     assert verdict.gate == "6-2"
     assert verdict.reply
+
+
+def test_volitional_form_burning_argument_fires_6_2_mid_conversation():
+    # 2026-09-10 実採点trace回帰: 「この世のすべてのものは燃やそうと思えば
+    # 燃えるんですよ」は実際のtraceでは直前のやり取り(何かを燃やすなと
+    # 言われた後の開き直り)を受けた発話で、この発話単体にはごみ語彙が
+    # 現れない。2つの取りこぼしが複合していた:
+    #   (a) 辞書形(燃やす)だけでは意志形(燃やそう)を取りこぼす
+    #   (b) 継続中の会話なのに、発話単体でのごみ語彙共起を要求していた
+    # (a)は_DANGER_WORDSへの追加、(b)はhas_historyでの緩和で対応した。
+    prompt = "この世のすべてのものは燃やそうと思えば燃えるんですよ"
+
+    # 最初の発話(文脈が無い)なら、ごみ語彙が無い以上6-2は発火しない
+    # (単語単体で発火させない設計は維持する)。
+    first_turn = safety.check_entry_gate(prompt, ward=None, town=None, has_history=False)
+    assert first_turn is None or first_turn.gate != "6-2"
+
+    verdict = safety.check_entry_gate(prompt, ward=None, town=None, has_history=True)
+    assert verdict is not None
+    assert verdict.gate == "6-2"
 
 
 def test_legit_hazardous_item_question_does_not_fire_6_2():
