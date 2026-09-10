@@ -168,3 +168,11 @@ class RoutedAnswer:
     誤りなので、代わりにこのフラグを見て「決まった収集曜日はない」と明示
     させる(STAGE03採点フィードバック: 品目ごとの「収集枠」の違いを反映
     できていなかった実例が根拠)。"""
+
+    safety_gate: str | None = None
+    """STAGE06: 発火した安全ゲートの識別子("6-1a" / "6-2" / "6-3")、未発火なら None。
+
+    `app/rag/safety.py` の判定結果を `describe_sources()` / `build_trace_record()`
+    に載せて、どの安全ゲートで固定回答になったのかをメンターが後から追える
+    ようにするためのフィールド(要件6-4)。ゲート発火時は `canned_response` も
+    同時に立つ。STAGE06 proposal §7.1(足場)で追加。"""
