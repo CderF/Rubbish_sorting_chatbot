@@ -278,6 +278,33 @@ def test_image_item_name_is_passed_through_as_context():
     asyncio.run(body())
 
 
+def test_conversation_history_is_passed_to_function_calling_prompt():
+    captured_messages = []
+
+    def capturing_build_prompt(messages, tools=None):
+        captured_messages.append(messages)
+        return {"messages": messages, "tools": tools}
+
+    history = [
+        {"role": "user", "content": "ペットボトルの分別を教えて"},
+        {"role": "assistant", "content": "ペットボトルは資源ごみです。"},
+    ]
+
+    async def body():
+        await agent.route_agentically(
+            "小倉北区浅野1丁目です。収集日も教えてください。",
+            engine=_ScriptedEngine([_PLAIN_TEXT]),
+            build_prompt=capturing_build_prompt,
+            sampling_params=object(),
+            history=history,
+        )
+
+    asyncio.run(body())
+    messages = captured_messages[0]
+    assert messages[1:3] == history
+    assert messages[3]["content"].startswith("小倉北区浅野1丁目")
+
+
 def test_district_fallback_note_reaches_context_and_states_the_weekday(monkeypatch):
     """丁目を省略した地区名(「黒崎」等)で lookup_collection_schedule を呼んだ
     場合、`tools._tool_lookup_collection_schedule` が付ける `district_note` が

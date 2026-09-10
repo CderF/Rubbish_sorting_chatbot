@@ -291,7 +291,9 @@ def _write_trace(session_id: str, prompt: str, routed, final_text: str) -> None:
         print(f"[trace] write failed: {exc!r}", flush=True)
 
 
-async def _route_safely(prompt: str, img: str | None):
+async def _route_safely(
+    prompt: str, img: str | None, history: list[dict] | None = None
+):
     """検索パスを呼ぶ。失敗しても生成は止めない。
 
     RAG側の例外で 5xx を返すとステージ全体が中断してしまう(冒頭の契約メモ参照)
@@ -337,6 +339,7 @@ async def _route_safely(prompt: str, img: str | None):
                 temperature=0.0, max_tokens=AGENTIC_TOOL_CALL_MAX_TOKENS
             ),
             image_item_name=image_item_name,
+            history=history,
         )
         if agentic_result is not None:
             return agentic_result
@@ -367,7 +370,7 @@ async def _stream_chat(
 
     # 検索結果はシステムメッセージとして毎ターン先頭に差し込む。会話履歴には
     # 残さない(ターンごとに検索結果が変わるうえ、積み重なると文脈を圧迫するため)。
-    routed = await _route_safely(prompt, img)
+    routed = await _route_safely(prompt, img, history=history)
 
     # 確定回答(4-3 確度ゲート等): LLM に言い換え・脚色・補足をさせず、
     # そのまま1フレームで返す。engine.generate は通さない。
