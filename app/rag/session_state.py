@@ -33,9 +33,12 @@ MAX_TURN_LOG = 20
 
 # --- 発話の分類に使う語 -----------------------------------------------------
 # 5-2「追加なら前の案内を保ったまま足し、変更・訂正なら新しい前提で組み直す」を
-# 判別するための手がかり。ここは決定的に動くヒューリスティクスに留める
-# (LLMに判定させるとテストが書けず、6-3「想定外でも破綻しない」の下限も
-#  確保できないため)。
+# 判別するための手がかり。判定の本体は LLM (`app/rag/slot_extract.py` の
+# `intent`) に移した — 日本語の言い直しは語彙リストで覆えず、リストに無い
+# 「あ、冷蔵庫でした」を取りこぼす一方で「間違いなく粗大ごみですか」を訂正と
+# 誤判定していた。以下は LLM を呼べない呼び出し(エンジン未接続・オフライン)
+# 向けのフォールバックとして残す。迷ったら "add" に倒れるので、6-3
+# 「想定外でも破綻しない」の下限はこちらが受け持つ。
 _CORRECTION_WORDS = (
     "やっぱり",
     "やっぱ",
@@ -156,6 +159,15 @@ class TurnInput:
     asks_schedule: bool = False
     from_image: bool = False
 
+    intent: str | None = None
+    """このターンが「追加」なのか「訂正・変更」なのかのLLM判定
+    (`app/rag/slot_extract.py`)。"add" / "correct" / "new" のいずれか。
+
+    `None` はLLMに訊いていない、あるいは判定が読めなかったことを表し、その場合は
+    語彙マーカー(`has_correction_marker`)へフォールバックする。エンジンを渡さない
+    オフラインの呼び出しは常にこの経路を通る。
+    """
+
 
 @dataclass(frozen=True)
 class DialogState:
@@ -239,10 +251,31 @@ def _merge_items(state: DialogState, turn: TurnInput) -> tuple[tuple[str, ...], 
         reordered = tuple(i for i in state.items if i != item) + (item,)
         return reordered, "none" if reordered == state.items else "refocus"
 
-    if state.items and has_correction_marker(turn.text) and not has_add_marker(turn.text, item):
+    if state.items and _is_correction(turn, item):
         return state.items[:-1] + (item,), "replace"
 
     return (state.items + (item,))[-MAX_ITEMS:], "add"
+
+
+def _is_correction(turn: TurnInput, item: str) -> bool:
+    """このターンが訂正・変更か。LLM判定があればそれを、無ければ語彙で決める。
+
+    語彙マーカーだけで決めていた頃は、リストに無い言い直し(「ソファじゃない、
+    冷蔵庫の話」「あ、冷蔵庫でした」「さっきのなし」)を取りこぼす一方で、
+    「間違いなく粗大ごみですか」のような無関係な発話を訂正と誤判定していた。
+    誤判定の実害は非対称で、追加を訂正と誤ると前ターンで案内済みの品目が
+    スロットから消える。判定そのものはLLMに任せ、ここは受け取った答えを
+    適用するだけにする。
+
+    `intent` が無い場合(エンジン未接続・判定失敗)は従来の語彙判定に戻る。
+    そちらは迷ったら "add" に倒れるので、5-2 の「追加なら前の案内を保ったまま
+    足す」を壊さない安全側の既定になっている。
+    """
+    if turn.intent == "correct":
+        return True
+    if turn.intent in ("add", "new"):
+        return False
+    return has_correction_marker(turn.text) and not has_add_marker(turn.text, item)
 
 
 def _merge_region(state: DialogState, turn: TurnInput) -> tuple[str | None, str | None, str]:
@@ -282,6 +315,7 @@ def merge(state: DialogState | None, turn: TurnInput) -> DialogState:
                 "town": turn.town,
                 "waste_type": turn.waste_type,
                 "from_image": turn.from_image,
+                "intent": turn.intent,
             },
             "item_update": item_update,
             "region_update": region_update,

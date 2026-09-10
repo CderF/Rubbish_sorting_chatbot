@@ -35,17 +35,34 @@ import uuid
 # 生成させるのは短いJSON1個だけ。制約付きデコードなので閉じ括弧まで必ず出る。
 _MAX_TOKENS = 128
 
+_INTENTS = ("correct", "add", "new")
+
 _INSTRUCTION = """あなたは北九州市のごみ分別相談の受付です。
-利用者の発言から、次の3つだけを読み取ってJSONで出力してください。
+利用者の発言から、次の4つだけを読み取ってJSONで出力してください。
 
 - item: 捨てたい品物の一般的な名称。1つだけ。発言に品物が出てこない、または
   「これ」「それ」のような指示語しか無い場合は null。
 - ward: 北九州市の区名。発言に出てこなければ null。
 - town: 区より下の町名・地区名。発言に出てこなければ null。
+- intent: この発言が、それまでの相談に対して何をしているか。
+  - "correct": 前に挙げた品物・地区を**言い直している**。前の話は取り下げる。
+    例:「ソファじゃない、冷蔵庫の話」「あ、冷蔵庫でした」「さっきのなし」
+    「やっぱり八幡西区です」
+  - "add": 前の品物の相談を続けたまま、別の品物を**足している**。
+    例:「冷蔵庫も捨てたい」「あとテレビはどうですか」
+  - "new": それまでの相談と関係のない、新しい話を始めている。
+  - 判断がつかない場合、および前の品物を取り下げたと読み切れない場合は "add"
+    にしてください。前の案内を消してしまうより、残すほうが安全です。
 
 推測で埋めないでください。発言に書かれていないものは null にします。
 品名は「大きいソファ」ではなく「ソファ」のように、修飾語を落とした
 一般的な名称にしてください。"""
+
+_KNOWN_ITEMS_TEMPLATE = "すでにこの相談に出ている品物: {items}"
+"""intent を判定するには「何を言い直そうとしているのか」が要る。発言だけでは
+「冷蔵庫でした」が言い直しなのか新規なのか決まらないため、スロットに入っている
+品名だけを文脈として渡す。回答の材料ではなく分岐の材料なので、「検索結果に
+書かれている内容だけを使う」規則(設計提案書 3-7)には触れない。"""
 
 
 def slot_schema(wards: "tuple[str, ...]") -> dict:
@@ -61,18 +78,34 @@ def slot_schema(wards: "tuple[str, ...]") -> dict:
             "item": {"type": ["string", "null"]},
             "ward": {"enum": [*wards, None]},
             "town": {"type": ["string", "null"]},
+            "intent": {"enum": ["correct", "add", "new"]},
         },
-        "required": ["item", "ward", "town"],
+        "required": ["item", "ward", "town", "intent"],
         "additionalProperties": False,
     }
 
 
-def needs_fallback(turn) -> bool:
-    """このターンでLLM抽出を走らせるべきか。
+def needs_extraction(turn, state=None) -> bool:
+    """このターンでLLM抽出を走らせるべきか。理由は2つある。
 
-    ルールが品名・区・町名のどれか1つでも取れていれば False。決定的な抽出が
-    効いているターンに確率的な経路を混ぜない、という切り分けをここ1箇所に
-    閉じ込める。
+    1. **ルールが何も取れなかった**(`needs_fallback`)。品名が指示語に
+       置き換わっているターンなど。ここは補完が目的。
+    2. **訂正か追加かが発言だけでは決まらない**(`_intent_is_ambiguous`)。
+       既に品目を追っている相談に新しい品名が出てきたターン。ここは分岐の
+       判定が目的で、ルールが品名を取れていても呼ぶ。
+
+    2 を足したのは、語彙マーカーによる訂正判定に取りこぼしと誤爆の両方が
+    あったため(`session_state._is_correction` のコメント参照)。呼ぶのは
+    「既に追っている品目があり、かつ新しい品名が出てきた」ターンだけなので、
+    1ターン目や、品名の出てこないターンではエンジンを踏まない。
+    """
+    return needs_fallback(turn) or _intent_is_ambiguous(turn, state)
+
+
+def needs_fallback(turn) -> bool:
+    """ルール抽出が空振りしたか。
+
+    ルールが品名・区・町名のどれか1つでも取れていれば False。
 
     画像から品名が来ているターン(`from_image`)も対象外。画像分類が既に
     エンジンを1回使っており、そこで取れた品名のほうが確度が高い。
@@ -84,6 +117,20 @@ def needs_fallback(turn) -> bool:
     # 「はい」「ありがとう」のような相槌でエンジンを回さないための下限。
     # 指示語だけの質問(「これって何ゴミ？」)は8文字あるので通る。
     return len(turn.text.strip()) >= 6
+
+
+def _intent_is_ambiguous(turn, state) -> bool:
+    """「追加」か「訂正」かをLLMに訊く必要があるターンか。
+
+    訊く価値があるのは、取り下げられうる品目が既にあり、かつ今のターンに
+    その候補となる**別の**品名が出てきた場合だけ。同じ品名の再登場
+    (`refocus`)は品目の増減を起こさないので判定の余地が無い。
+    """
+    if state is None or not getattr(state, "items", ()):
+        return False
+    if turn.from_image or not turn.item:
+        return False
+    return turn.item not in state.items
 
 
 def parse_slot_output(raw_text: str) -> dict | None:
@@ -113,16 +160,25 @@ def parse_slot_output(raw_text: str) -> dict | None:
         else:
             # 数値・配列・真偽値が来たら採用しない(null と同じ扱い)。
             out[key] = None
+
+    # 想定外の値は None にする。呼び出し側は語彙判定にフォールバックする。
+    intent = data.get("intent")
+    out["intent"] = intent if intent in _INTENTS else None
     return out
 
 
-def _build_prompt_input(processor, text: str) -> dict:
+def _build_prompt_input(processor, text: str, known_items: "tuple[str, ...]" = ()) -> dict:
     """`app/server.py` の `_build_messages`/`_build_prompt` と同型のプロンプト構築。
 
     抽出専用のインストラクションを使う点と、画像を載せない点だけが異なる。
+    `known_items` はスロットに入っている品名で、intent の判定にだけ使う。
     """
+    instruction = _INSTRUCTION
+    if known_items:
+        instruction += "\n\n" + _KNOWN_ITEMS_TEMPLATE.format(items="、".join(known_items))
+
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": _INSTRUCTION}]},
+        {"role": "system", "content": [{"type": "text", "text": instruction}]},
         {"role": "user", "content": [{"type": "text", "text": text}]},
     ]
     text_prompt = processor.apply_chat_template(
@@ -149,7 +205,13 @@ def sampling_params(wards: "tuple[str, ...]"):
     )
 
 
-async def extract_slots(text: str, wards: "tuple[str, ...]", engine, processor) -> dict | None:
+async def extract_slots(
+    text: str,
+    wards: "tuple[str, ...]",
+    engine,
+    processor,
+    known_items: "tuple[str, ...]" = (),
+) -> dict | None:
     """発話1つをLLMに投げ、スロットのJSONを受け取る。失敗時は None。
 
     `engine`/`processor` は `server.py` が起動時に初期化する共有vLLMエンジン。
@@ -161,7 +223,7 @@ async def extract_slots(text: str, wards: "tuple[str, ...]", engine, processor) 
     """
     try:
         params = sampling_params(wards)
-        prompt_input = _build_prompt_input(processor, text)
+        prompt_input = _build_prompt_input(processor, text, known_items)
         request_id = f"slots-{uuid.uuid4().hex[:8]}"
 
         final = None

@@ -925,42 +925,48 @@ def _route_schedule(ans: RoutedAnswer, state: DialogState, prompt: str) -> None:
 
 
 def _apply_llm_slots(
-    turn: TurnInput, slots: dict
+    turn: TurnInput,
+    candidates: list[str],
+    vector_query: "str | None",
+    slots: dict,
 ) -> "tuple[TurnInput, list[str], str | None]":
-    """ルールが空振りしたターンに、LLM抽出の結果を重ねる(STAGE05)。
+    """LLM抽出の結果をターンに重ねる(STAGE05)。
 
-    呼ばれるのは `slot_extract.needs_fallback()` が True だったターンだけなので、
-    品名・区・町名はいずれもルール側が空である。したがってここは「上書き」では
-    なく「空欄を埋める」操作にしかならない — 決定的に取れた値がLLMの推測で
-    置き換わることは無い。
+    重ねかたは2種類あり、どちらも**ルールの結果を上書きしない**。
 
-    候補列を `[item]` の1本に差し替えるのは画像パスと同じ理由による。LLMが返す
-    のは「傘」のような一般名で、発話(「これって何ゴミ？」)の部分文字列とは限ら
-    ないため、`_item_name_candidates` が作った断片列をそのまま使えない。
+    1. **空欄の補完** — ルールが取れなかった品名・区・町名だけを埋める。
+       ルールが取れている値には触らない。main が積み上げた候補生成
+       (括弧分割・修飾語落とし・ベクトルクエリの使い分け)は採点フィード
+       バックで調整した部分なので、そこが動いているターンは素通しする。
+    2. **intent の反映** — 「追加」か「訂正」かの判定。こちらはルール側に
+       対応する値が無い(語彙マーカーは `_is_correction` の中で見るだけで、
+       `TurnInput` には載っていない)ので、常に載せる。畳み込みの分岐は
+       `session_state._is_correction` が行う。
+
+    候補列を `[item]` の1本に差し替えるのは、品名を **1 で埋めたときだけ**。
+    LLMが返すのは「傘」のような一般名で、発話(「これって何ゴミ？」)の部分
+    文字列とは限らないため、`_item_name_candidates` が作った断片列を使えない。
+    ルールが品名を取れているターンでは候補列をそのまま残す。
 
     なお、ここで入れた品名がそのまま採用されるとは限らない。`_blocking_route`
     は地区を伴うターンで、候補が完全一致・部分一致のどちらにも掛からなければ
     品名を捨てる。LLMの推測も同じ検査を通るので、早見表に無い名前を勝手に
     答え始めることはない。
     """
-    item = slots.get("item")
-    ward = slots.get("ward")
-    town = slots.get("town")
-
-    if not (item or ward or town):
-        return turn, [], None
+    filled_item = slots.get("item") if not turn.item else None
 
     turn = replace(
         turn,
-        item=item or turn.item,
-        ward=ward or turn.ward,
-        town=town or turn.town,
+        item=turn.item or filled_item,
+        ward=turn.ward or slots.get("ward"),
+        town=turn.town or slots.get("town"),
+        intent=slots.get("intent"),
     )
-    # 品名がLLM由来なら候補列も作り直す。ベクトルクエリは発話全体ではなく
-    # 抽出された一般名のほうが当たるので、そちらを渡す。
-    if item:
-        return turn, [item], item
-    return turn, [], None
+
+    if filled_item:
+        # ベクトルクエリは発話全体ではなく、抽出された一般名のほうが当たる。
+        return turn, [filled_item], filled_item
+    return turn, candidates, vector_query
 
 
 def _blocking_route(
@@ -990,7 +996,9 @@ def _blocking_route(
     """
     turn, candidates, vector_query = extract_turn(prompt, image_item_name)
     if llm_slots is not None:
-        turn, candidates, vector_query = _apply_llm_slots(turn, llm_slots)
+        turn, candidates, vector_query = _apply_llm_slots(
+            turn, candidates, vector_query, llm_slots
+        )
 
     # 今のターンの品目は、スロットへ畳み込む前に1回だけ引く。理由が2つある。
     #
@@ -1163,16 +1171,23 @@ async def handle_query(
     if img_b64 and engine is not None and processor is not None:
         image_item_name = await classify_image_to_item_name(img_b64, engine, processor)
 
-    # ルール抽出が1つもスロットを取れなかったターンだけ、LLMに読ませ直す。
-    # ここで `extract_turn` を先に1回回すのは、空振りかどうかを知るのに
-    # それが要るため。純粋な文字列処理でGPUもDBも踏まないので、`_blocking_route`
-    # 内でもう一度呼ばれることのコストは無視できる。
+    # LLMに読ませ直すのは (a) ルールが1つもスロットを取れなかったターンと、
+    # (b) 既に追っている品目がある相談に別の品名が出てきて、追加か訂正かが
+    # 発言だけでは決まらないターン。判定は `slot_extract.needs_extraction`。
+    #
+    # ここで `extract_turn` を先に1回回すのは、どちらの条件も「ルールが何を
+    # 取れたか」を見ないと判定できないため。純粋な文字列処理でGPUもDBも
+    # 踏まないので、`_blocking_route` 内でもう一度呼ばれるコストは無視できる。
     llm_slots = None
     if engine is not None and processor is not None:
         probe, _, _ = extract_turn(prompt, image_item_name)
-        if slot_extract.needs_fallback(probe):
+        if slot_extract.needs_extraction(probe, state):
             llm_slots = await slot_extract.extract_slots(
-                probe.text, WARDS, engine, processor
+                probe.text,
+                WARDS,
+                engine,
+                processor,
+                known_items=() if state is None else state.items,
             )
 
     loop = asyncio.get_running_loop()
