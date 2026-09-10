@@ -466,7 +466,12 @@ def test_blocking_route_recovers_item_from_polluted_candidate(monkeypatch):
     assert ans.item_match == "exact"
     assert ans.detected_item == "スプレー缶"
     assert ans.analogy_unreliable is False
-    assert ans.canned_response is None
+    # PR #49 以降、粗大ごみ等の高リスク品目は検索結果からコード側で組み立てた
+    # 必須項目テンプレートが canned_response に入る。これは「類推不能の断り文」
+    # ではないので、汚れた候補からの exact 復帰という本テストの検証には影響しない。
+    assert ans.canned_response != router._ANALOGY_UNRELIABLE_REPLY
+    assert ans.template_response is True
+    assert "スプレー缶" in ans.canned_response
 
 
 # --- _analogy_pick: 主辞・語彙関連で選ぶ(trace回帰) --------------------
