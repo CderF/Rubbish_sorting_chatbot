@@ -129,13 +129,26 @@ states: "OrderedDict[str, DialogState]" = OrderedDict()
 _sessions_lock = asyncio.Lock()
 
 
-def _remember(session_id: str, messages: list, answer: str, routed) -> None:
+def _remember(session_id: str, prompt: str, messages: list, answer: str, routed) -> None:
     """Store one finished turn. Caller must hold `_sessions_lock`.
 
     Both stores are written here so they cannot drift apart: `sessions` is what
     the *model* replays, `states` is what the *search* re-runs from. A session
     that kept only one of the two would either answer from a premise it can no
     longer justify, or silently forget the item it is still talking about.
+
+    スロットは `routed.state` をそのまま入れるのではなく、**保存の時点で最新の
+    スロットへ `routed.turn` を畳み込み直す**。理由が2つある。
+
+    1. 同じ `session_id` のリクエストが重なると、両方がターン開始時の同じ
+       スロットを読み、後に書いたほうが相手の品名・地区の更新を消す
+       (レビュー指摘8)。畳み込みは冪等ではないが、`turn` から引き直せば
+       先に書かれた更新の上に乗る。
+    2. RAG が失敗して `routed` が None のターンでも、モデル履歴だけが進んで
+       スロットが止まると、そのターンで出てきた品名・地区が会話の残り全部で
+       検索側から消える(レビュー指摘2)。ルール抽出だけで畳み込んでおく。
+       この経路のスロット名は早見表で正規化されていないぶん粗いが、黙って
+       落とすよりは次ターンで引ける可能性が残る。
 
     The citation block is deliberately left out of the stored answer: it is
     rebuilt from the retrieval result on every turn, and keeping it would spend
@@ -145,8 +158,16 @@ def _remember(session_id: str, messages: list, answer: str, routed) -> None:
         messages + [{"role": "assistant", "content": answer}]
     )[-MAX_HISTORY_MESSAGES:]
     sessions.move_to_end(session_id)
-    if routed is not None and routed.state is not None:
-        states[session_id] = routed.state
+
+    turn = routed.turn if routed is not None else None
+    if turn is None:
+        try:
+            turn, _, _ = router.extract_turn(prompt)
+        except Exception as exc:  # noqa: BLE001 — 状態更新の失敗で応答は止めない
+            print(f"[state] fallback extraction failed: {exc!r}", flush=True)
+            turn = None
+    if turn is not None:
+        states[session_id] = router.merge_state(states.get(session_id), turn)
         states.move_to_end(session_id)
     while len(sessions) > MAX_SESSIONS:
         evicted, _ = sessions.popitem(last=False)
@@ -400,7 +421,7 @@ async def _stream_chat(
         # 次のターンで品名・地区を引き継げず 5-1 が途中で切れる
         # (「断定できない」と答えた品物を利用者が言い直す流れが典型)。
         async with _sessions_lock:
-            _remember(session_id, messages, text, routed)
+            _remember(session_id, prompt, messages, text, routed)
         last_timing.update(
             first_token_s=0.0, total_s=0.0, tokens=0, session_id=session_id,
             retrieval={"item": routed.detected_item, "canned": True},
@@ -478,7 +499,7 @@ async def _stream_chat(
     # rebuilt from the retrieval result on every turn, and keeping it would
     # spend history budget on URLs the model must not write itself anyway.
     async with _sessions_lock:
-        _remember(session_id, messages, answer_text, routed)
+        _remember(session_id, prompt, messages, answer_text, routed)
 
     _write_trace(session_id, prompt, routed, prev_text)
     yield "data: [DONE]\n\n"
