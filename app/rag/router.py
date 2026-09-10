@@ -16,6 +16,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
+from app.rag import safety
 from app.rag.types import ItemRecord, RoutedAnswer, ScheduleRecord
 
 # --- データ層の解決 --------------------------------------------------------
@@ -735,9 +736,15 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         ans.canned_response = _ANALOGY_UNRELIABLE_REPLY
 
     # --- 6-3 fallback hook (STAGE06 proposal §7.3 / 担当B) ---
-    # ここに: ans.found が False かつ ans.canned_response が未設定かつ
-    # ans.safety_gate が None のとき、safety.no_result_reply() を canned_response
-    # に立てて「完全空振り」を LLM 生成に回さず固定文で返す。足場では未実装。
+    # 完全空振り(品目も収集日もヒットせず、6-1a/6-2 も 4-3 確度ゲートも未発火)。
+    # 検索結果ゼロを LLM に渡して「見つかりませんでした」と言わせると、モデルが
+    # 自前の知識で埋める失敗モード(4-3 で繰り返し確認)が未知の入力でも起きる。
+    # コード側で固定文を立て、engine.generate を通さず返す。
+    if not ans.found and ans.canned_response is None and ans.safety_gate is None:
+        reply = safety.no_result_reply()
+        if reply:
+            ans.canned_response = reply
+            ans.safety_gate = "6-3"
     return ans
 
 
@@ -1334,6 +1341,8 @@ def build_trace_record(prompt: str, ans: RoutedAnswer) -> dict:
     return {
         "prompt": prompt,
         "detected_item": ans.detected_item,
+        "detected_ward": ans.detected_ward,  # STAGE06 6-4: /trace の「検出した地区」表示用
+        "detected_town": ans.detected_town,
         "item_candidates": list(ans.item_candidates),
         "item_match_stage": ans.item_match_stage,
         "item_match": ans.item_match,

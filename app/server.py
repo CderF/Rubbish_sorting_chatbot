@@ -56,6 +56,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from app import trace_view  # noqa: E402
 from app.notices import admin as notice_admin  # noqa: E402
 from app.rag import agent, knowledge, router, safety  # noqa: E402  (sys.path 調整後に import)
 from app.rag.types import RoutedAnswer  # noqa: E402
@@ -79,6 +80,8 @@ MODEL_PATH = os.environ.get(
 )
 # webui.html sits next to this file in the repo.
 WEBUI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui.html")
+# STAGE06 6-4: 判断過程の事後確認ページ(webui.html と同じ場所)。
+TRACE_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trace.html")
 
 # --- access control -------------------------------------------------------
 # /chat must stay unauthenticated (the grading server sends no auth headers),
@@ -687,3 +690,28 @@ async def webui(request: Request, creds: HTTPBasicCredentials | None = Depends(_
     if not _authed(request, creds):
         return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
     return FileResponse(WEBUI_PATH)
+
+
+# --------------------------------------------------------------------------
+# STAGE06 6-4: 判断過程の事後確認(トレース閲覧)
+#   「どう調べて・どう判断してその回答に至ったか」をメンターが後から確認できる。
+#   /knowledge ページと同じ require_login。生のプロンプト・回答を含むため
+#   未認証公開はしない。
+# --------------------------------------------------------------------------
+@app.get("/trace", response_class=HTMLResponse)
+async def trace_page(request: Request, creds: HTTPBasicCredentials | None = Depends(_basic)):
+    if not _authed(request, creds):
+        return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
+    return FileResponse(TRACE_HTML_PATH)
+
+
+@app.get("/trace/data")
+async def trace_data(limit: int = 100, _=Depends(require_login)):
+    """直近 `limit` 件のトレース(新しい順)。"""
+    limit = max(1, min(limit, 500))
+    rows = await asyncio.to_thread(trace_view.read_trace_tail, _TRACE_PATH, limit)
+    return {
+        "rows": trace_view.summarize_trace_rows(rows),
+        "path": _TRACE_PATH,
+        "enabled": _TRACE_ENABLED,
+    }
