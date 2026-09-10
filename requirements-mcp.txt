@@ -1,0 +1,15 @@
+# STAGE07 7-1/7-2: dependency for app/mcp_server.py only.
+#
+# Kept separate from requirements.txt on purpose: that file is "pinned to what
+# is running on the B1 server" (its own header comment) — B1 serves /chat via
+# vLLM and never runs the MCP server. This file is for whoever runs
+# `python -m app.mcp_server` (a mentor's machine, or a dev machine), which
+# needs the data layer (sqlite3, stdlib) + chroma (already in the main repo
+# venv if vector search is wanted) but NOT vllm/torch/pynvml.
+#
+#   pip install -r requirements.txt -r requirements-mcp.txt
+#
+# Pinned to the officially-supported v1 API (FastMCP). mcp>=2 renamed
+# FastMCP -> MCPServer with a different API; do not bump past 1.x without
+# updating app/mcp_server.py to match.
+mcp==1.30.0
