@@ -347,6 +347,28 @@ def _write_trace(session_id: str, prompt: str, routed, final_text: str) -> None:
         print(f"[trace] write failed: {exc!r}", flush=True)
 
 
+def _conversation_in_progress(state: DialogState | None) -> bool:
+    """このセッションが既に複数ターンに渡って話題を積んでいるか。
+
+    `agent.route_agentically` は `DialogState` を一切受け取らず、渡した
+    このターン1文だけで検索先を決める(#40)。一方 STAGE05 の多ターン対応
+    (#24)は「品名・地区が数ターンに分かれても引き継ぐ」ために、検索の
+    入力を1文からセッション全体のスロットへ差し替えている。Agentic 経路が
+    ヒットしてそのまま返ると `routed.state` が None のまま返る、すなわち
+    スロットが読まれも書かれもしない — 会話が積み上がっている途中のターンで
+    これが起きると 5-1 がそのターンだけ途切れる。
+
+    そのため、既にスロットに何か積まれている(=このセッションは単発の
+    質問ではなく会話の途中)場合は Agentic 経路を最初から試さず、実績のある
+    決定論的経路(`router.handle_query`、`state` を正しく読み書きする)に
+    直行する。初回ターン(`state is None`、または何も積まれていない)は
+    従来どおり Agentic を試す。
+    """
+    if state is None:
+        return False
+    return bool(state.items or state.ward or state.town or state.wants_schedule)
+
+
 async def _route_safely(prompt: str, img: str | None, state: DialogState | None):
     """検索パスを呼ぶ。失敗しても生成は止めない。
 
@@ -358,8 +380,13 @@ async def _route_safely(prompt: str, img: str | None, state: DialogState | None)
     ヒット0件・想定外の例外いずれでも None を返す設計なので、その場合は
     そのまま現行の決定論的経路(`router.handle_query`)にフォールバックする
     — グレーディング対象の `/chat` の挙動を壊さないための安全弁。
+
+    会話が既に進行中のセッションでは Agentic 経路自体を試さない
+    (`_conversation_in_progress` 参照)。Agentic 経路は `state` を認識
+    しないため、途中のターンで当たると STAGE05 のスロットがそのターンだけ
+    更新されず、多ターンの引き継ぎが切れてしまう。
     """
-    if AGENTIC_RAG_ENABLED:
+    if AGENTIC_RAG_ENABLED and not _conversation_in_progress(state):
         image_item_name = None
         if img:
             try:
