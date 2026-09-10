@@ -1246,9 +1246,13 @@ def _shared_run_len(a: str, b: str) -> int:
 _KANA_ONLY_RE = re.compile(r"^[ぁ-ん]+$")
 _PAREN_TAIL_RE = re.compile(r"[(（].*$")
 _KANJI_RE = re.compile(r"[一-龥々]")
-# `_has_plausible_item_text` が地区名除去後の残りを判定する際、文中のどこに
-# あっても句読点・空白を取り除いてから見るための正規表現。
-_PUNCT_OR_SPACE_RE = re.compile(r"[\s、。「」()（）]+")
+# `_has_plausible_item_text`/`category_procedure_intent` が地区名・種別語
+# 除去後の残りを判定する際、文中のどこにあっても句読点・空白を取り除いてから
+# 見るための正規表現。全角/半角の「？」「！」も対象(2026-09-14 レビュー
+# 指摘: 「粗大ごみってどうやって出すんですか？」のように文末に全角疑問符が
+# 付くと、除去後の残りに「？」が残って「実質的な内容がある」と誤判定され、
+# category_procedure_intent が None を返してしまっていた)。
+_PUNCT_OR_SPACE_RE = re.compile(r"[\s、。「」()（）？?!！]+")
 # 末尾一致(上位語)判定で、品名の本体ではない「サイズ・動力・用途」の接頭語。
 # これらを剥がした残りに内容語(漢字2つ以上)が残るなら、末尾一致でも別品目。
 _STRENGTH_PREFIX_MODS = (

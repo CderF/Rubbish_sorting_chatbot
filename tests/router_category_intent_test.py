@@ -114,3 +114,19 @@ def test_procedure_question_canned_reply_does_not_mention_unrelated_systems():
     ans = _blocking_route("粗大ごみってどうやって申し込むんですか", None)
     assert "ふれあい収集" not in (ans.canned_response or "")
     assert "ごみ箱" not in (ans.canned_response or "")
+
+
+def test_category_question_with_punctuation():
+    """2026-09-14 レビュー指摘の回帰: 全角「？」「。」が付くと
+    `_PUNCT_OR_SPACE_RE` が拾わず、除去後の残りに記号が残って「実質的な
+    内容がある」と誤判定され、category_procedure_intent が None を返して
+    しまっていた(=固定回答が発火せず自由生成に落ちる経路が残っていた)。"""
+    for prompt in [
+        "粗大ごみってどうやって出すんですか？",
+        "粗大ごみってどうやって申し込むんですか？",
+        "古紙を出したいです。",
+    ]:
+        ans = _blocking_route(prompt, None)
+        assert ans.canned_response == (
+            "具体的な品目名と、お住まいの区・町名を教えてください。"
+        )
