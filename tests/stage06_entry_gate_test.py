@@ -270,3 +270,54 @@ def test_ward_only_without_town_asks_for_town_name(routed_db):
     # (既存挙動、router.py の `ans.missing.append("町名")`)。
     ans = routed_db._blocking_route("小倉北区の粗大ごみの収集日を教えてください")
     assert "町名" in ans.missing
+
+
+# --- 6-2 は検索を止めない(2026-09-10 採点フィードバック対応) -----------------
+# 以前は 6-2 が検索前に短絡して固定文を返していたため、早見表に正しい相談先が
+# ある品目でも「危険な処分方法はご案内できません」だけで終わっていた。実採点の
+# trace では、同じ『農薬』が
+#   「使い残した農薬を処分したいのですが」        -> 専門業者を案内(通過)
+#   「農薬が余っているので庭に埋めて…」          -> 具体策なしの定型拒否
+# と割れていた。禁止の明示は指示として足し、検索結果は捨てない方式に変えた。
+def test_dangerous_request_does_not_block_the_search():
+    danger = safety.check_entry_gate(
+        "エアコンを庭に埋めて処分していいですか？", ward=None, town=None
+    )
+    assert danger is not None and danger.gate == "6-2"
+    assert danger.blocks_search is False, "6-2 は検索を止めてはいけない"
+
+    # 6-1a(担当範囲外)は従来どおり検索せず即返す。
+    out_of_scope = safety.check_entry_gate(
+        "今日の天気を教えてください。", ward=None, town=None
+    )
+    assert out_of_scope is not None and out_of_scope.gate == "6-1a"
+    assert out_of_scope.blocks_search is True
+
+
+def test_dangerous_request_still_resolves_the_real_item(routed_db):
+    """検索を止めなくなったので、危険な聞き方でも品目本体には当たること。
+
+    これにより「いいえ、埋めてはいけません」+ 早見表の備考にある正しい相談先
+    (販売店・専門業者等)をセットで答えられる。
+    """
+    ans = routed_db._blocking_route("エアコンを庭に埋めて処分していいですか？")
+
+    assert [getattr(h, "item_name", "") for h in ans.item_hits] == ["エアコン"]
+    assert "リサイクル受付センター" in ans.item_hits[0].notes
+
+
+def test_dangerous_request_rule_reaches_the_system_prompt():
+    from app.rag.router import build_system_prompt
+    from app.rag.types import RoutedAnswer
+
+    ans = RoutedAnswer()
+    ans.safety_gate = "6-2"
+    prompt = build_system_prompt(ans)
+    # 禁止の明示と、正しい手順をセットで出すことの両方を課している
+    assert "いいえ" in prompt
+    assert "セットで示す" in prompt
+    # 情報不足を理由に回答を避けない(2026-09-10 フィードバックの核心)
+    assert "情報不足を理由に回答を避けない" in prompt
+
+    # 6-2 以外では出さない
+    assert "セットで示す" not in build_system_prompt(RoutedAnswer())

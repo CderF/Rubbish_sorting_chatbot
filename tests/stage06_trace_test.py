@@ -25,13 +25,25 @@ from app.rag import safety
 # --------------------------------------------------------------------------
 # 6-3: safety.no_result_reply
 # --------------------------------------------------------------------------
-def test_no_result_reply_is_a_non_empty_safe_message():
+def test_no_result_reply_guides_instead_of_refusing():
+    """2026-09-10 採点フィードバック対応:
+    「情報の不足を理由に回答を避けるのではなく、ルールに沿った適切な誘導を
+    徹底しましょう」。
+
+    以前の文面は「確認できませんでした。推測での回答は控えます」という純粋な
+    拒否で、実採点64問中15問がこれで終わっていた。品名が特定できないときも
+    (1) 品名を具体的に尋ね (2) 品名に依存せず成立するルールと具体的な排出
+    ルートを示す、の2点を必ず含める。
+    """
     reply = safety.no_result_reply()
     assert reply
-    assert "確認できませんでした" in reply
-    assert ("公式" in reply) and ("窓口" in reply)
-    # §5 未決事項が確定するまで電話番号は載せない方針。
-    assert not any(ch.isdigit() for ch in reply)
+    # (1) 品名を尋ねている
+    assert "品物の名前" in reply
+    # (2) 具体的な排出ルートを示している
+    assert "粗大ごみ" in reply and "093-513-3005" in reply
+    assert "市が収集しないもの" in reply and "販売店" in reply
+    # 回避的な締め方をしない
+    assert "推測での回答は控えます" not in reply
 
 
 # --------------------------------------------------------------------------
