@@ -25,8 +25,8 @@ from app.notices import store
 from app.notices.ingest import ingest_notice_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ADDITIONS = REPO_ROOT / "knowledge" / "incoming" / "お知らせ-4-1.md"
-CHANGES = REPO_ROOT / "knowledge" / "incoming" / "お知らせ-4-2.md"
+ADDITIONS = REPO_ROOT / "tests" / "fixtures" / "notices" / "お知らせ-4-1.md"
+CHANGES = REPO_ROOT / "tests" / "fixtures" / "notices" / "お知らせ-4-2.md"
 INGEST_AT = dt.datetime(2026, 9, 8, 3, 0, 0, tzinfo=timezone.utc)
 TODAY = date(2026, 9, 8)
 

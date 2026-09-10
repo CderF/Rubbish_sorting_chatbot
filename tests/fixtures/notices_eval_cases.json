@@ -17,8 +17,8 @@
   "change_start": "2026-10-01",
   "prior_valid_until": "2026-09-30",
   "knowledge_files": [
-    "knowledge/incoming/お知らせ-4-1.md",
-    "knowledge/incoming/お知らせ-4-2.md"
+    "tests/fixtures/notices/お知らせ-4-1.md",
+    "tests/fixtures/notices/お知らせ-4-2.md"
   ],
   "additions": [
     {

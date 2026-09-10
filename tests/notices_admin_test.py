@@ -16,7 +16,7 @@ from app.data.schema import WasteItem
 from app.notices import admin, store
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-KNOWLEDGE = REPO_ROOT / "knowledge" / "incoming"
+KNOWLEDGE = REPO_ROOT / "tests" / "fixtures" / "notices"
 ADDITIONS = KNOWLEDGE / "お知らせ-4-1.md"
 CHANGES = KNOWLEDGE / "お知らせ-4-2.md"
 SEED = Path(__file__).resolve().parent / "fixtures" / "hayamihyo_seed.json"
