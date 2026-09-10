@@ -16,6 +16,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
+from app.rag import safety
 from app.rag.types import ItemRecord, RoutedAnswer, ScheduleRecord
 
 # --- データ層の解決 --------------------------------------------------------
@@ -24,6 +25,7 @@ from app.rag.types import ItemRecord, RoutedAnswer, ScheduleRecord
 try:
     from app.data.lookup import (  # type: ignore[import-not-found]
         lookup_collection_schedule,
+        lookup_item_contained_in,
         lookup_item_exact,
         lookup_item_partial,
         lookup_towns,
@@ -37,6 +39,9 @@ except ImportError:
         lookup_item_partial,
         lookup_towns,
     )
+
+    def lookup_item_contained_in(text: str, min_length: int = 2):  # noqa: ARG001
+        return None
 
     _USING_STUBS = True
 
@@ -543,6 +548,74 @@ _JUNK_MODIFIERS = (
 )
 _ETC_SUFFIX = re.compile(r"(?:など|等|とか)$")
 
+# 2026-09-10 実採点trace回帰: 「これ燃えるゴミで合ってますよね？」「さっき
+# 聞いたやつ、結局何ごみでしたっけ？」のように `_QUESTION_TAIL` の定型に
+# 一致しない言い回しでは、文全体がそのまま vector_query になり、
+# `vector_search_items` が(無関係でも)何かしら最近傍の品目を返してしまい、
+# 4-3類推が根拠薄弱なまま分別区分を断定していた。
+#
+# 一方で「廃車にした自動車を処分したいのですが」のように、文中に実在の
+# 品名がそのまま埋め込まれているケースは `lookup_item_contained_in`
+# (app/data/lookup.py)で正確に拾える。この判定(_looks_like_a_sentence)は
+# その救済が失敗した**後**、ベクトル検索に回すか諦めるかの最終ゲートとして
+# `_search_item` の中でだけ使う — `_item_name_candidates` の候補生成自体は
+# 変更しない(候補を削ると `lookup_item_contained_in` の入力も減ってしまう)。
+#
+# 実データ検証: waste_items の全864品名にこれらの語(述語マーカー・語尾の
+# 指示語・相槌)は1件も含まれない。
+_SENTENCE_MARKERS = (
+    "です", "ます", "でしょう", "ください", "んです",
+    "でした", "ました", "ません", "っけ",
+    "分からない", "わからない", "たらいいか", "ばいいか",
+)
+_VAGUE_REFERENCE_SUFFIXES = ("やつ", "もの", "これ", "それ", "あれ")
+_FILLER_WORDS = frozenset({
+    "あの", "あのー", "えっと", "えーと", "まあ", "そうそう", "うーん",
+    "なんか", "ええ", "はい", "うん", "そう", "そうですね", "ちょっと",
+})
+
+
+def _looks_like_a_sentence(candidate: str) -> bool:
+    """候補が品名ではなく、文(述語)・漠然とした代名詞参照・相槌らしいかを判定する。"""
+    if any(m in candidate for m in _SENTENCE_MARKERS):
+        return True
+    if candidate.endswith(_VAGUE_REFERENCE_SUFFIXES):
+        return True
+    return candidate in _FILLER_WORDS
+
+
+def _partial_lookup_ok(candidate: str) -> bool:
+    """その候補を部分一致(`LIKE '%候補%'`)に渡してよいか。
+
+    2026-09-10 実採点trace回帰: 「え、知らなかったです。じゃあどうすれば
+    いいんですか？」のような相槌だけの追い返しは、断片分割の結果として
+    1文字の候補(「え」)を生む。これを部分一致に渡すと
+    `LIKE '%え%'` が「砂(鉢植え…)」「つえ」「ふえ(ホイッスル)」等に
+    無差別にヒットし、根拠皆無のまま analogy として断定してしまう。
+
+    完全一致は1文字でも意味がある(「傘」「畳」「鍵」等、実データに1文字の
+    品名が15件ある)ため制限しない。制限するのは部分一致だけ。
+    """
+    return len(candidate) >= 2 and candidate not in _FILLER_WORDS
+
+
+def _vector_query_ok(candidate: str) -> bool:
+    """その候補をベクトル検索に渡してよいか(決定論的経路・Agentic経路 共通)。
+
+    ベクトル検索は「必ず最近傍を返す」ので、根拠にならない文字列を渡すと
+    無関係な品目を掴んだまま断定してしまう。渡してよいのは:
+
+    - 2文字以上(1文字のクエリは意味のある近傍を持たない。「傘」「畳」等の
+      1文字の実在品名は完全一致で先に拾えるため、ここで弾いても影響しない)
+    - 文・代名詞参照・相槌でないこと(`_looks_like_a_sentence`)
+
+    Agentic経路(`app/rag/tools.py`)はモデルが任意の文字列を query として
+    渡してくるため、決定論的経路と同じ判定をこの1関数に集約して共有する
+    (2026-09-10 実採点trace回帰。実際にモデルが「え」だけを query にした
+    ケースが観測され、`LIKE '%え%'` とベクトル検索の両方が誤爆していた)。
+    """
+    return len(candidate) >= 2 and not _looks_like_a_sentence(candidate)
+
 
 def _clean_fragment(frag: str) -> str:
     """断片から修飾語(先頭)・「〜など」(末尾)を落とす。
@@ -677,19 +750,48 @@ def _search_item(
     exact = lookup_item_exact(item_name)
     if exact:
         return [exact], "exact"
-    partial = lookup_item_partial(item_name)[:5]
-    if partial:
-        return partial, "partial"
+    if _partial_lookup_ok(item_name):
+        partial = lookup_item_partial(item_name)[:5]
+        if partial:
+            return partial, "partial"
     for cand in extra_candidates or []:
         if cand == item_name:
             continue
         exact = lookup_item_exact(cand)
         if exact:
             return [exact], "exact"
+        if not _partial_lookup_ok(cand):
+            continue
         partial = lookup_item_partial(cand)[:5]
         if partial:
             return partial, "partial"
-    vector = vector_search_items(vector_query or item_name, top_k=3)
+
+    # 2026-09-10 実採点trace回帰の救済: `_QUESTION_TAIL` の定型に一致せず
+    # item_name が文全体のままでも、その中に実在の品名がそのまま埋め込まれて
+    # いれば(「廃車にした自動車を処分したいのです」の「自動車」)、ベクトル
+    # 検索より先に正確な一致として拾う(埋め込み一致の方が意味的近似より
+    # 遥かに確実な根拠のため)。`lookup_item_contained_in` は単純な部分文字列
+    # 一致(語境界を見ない)なので、ここで `_pick_embedded_item` により
+    # 「直後が文末・助詞・質問定型」の境界チェックをかける(「捨てたらいいか」
+    # に「たらい」が偶然含まれる、のような事故を防ぐ)。
+    embedded = _pick_embedded_item(item_name, lookup_item_contained_in(item_name))
+    if embedded is None:
+        for cand in extra_candidates or []:
+            embedded = _pick_embedded_item(cand, lookup_item_contained_in(cand))
+            if embedded is not None:
+                break
+    if embedded is not None:
+        return [embedded], "exact"
+
+    # 埋め込み品名も見つからず、ベクトル検索に渡すクエリ自体が文・代名詞
+    # 参照・相槌らしいなら(`_looks_like_a_sentence`)、ベクトル検索にも
+    # 回さない。根拠の無い文字列をそのまま embedding にかけても、無関係な
+    # 最近傍を拾って断定してしまうだけ(2026-09-10 実採点trace回帰)。
+    final_query = vector_query or item_name
+    if not _vector_query_ok(final_query):
+        return [], None
+
+    vector = vector_search_items(final_query, top_k=3)
     return vector, ("vector" if vector else None)
 
 
@@ -709,6 +811,45 @@ _AFTER_NAME_OK = re.compile(
     r"|(?:は|の|を|、)?\s*(?:捨て|出せ|出し|処分|廃棄|分別|区分|回収|収集|処理|片付け)"
     r")"
 )
+
+
+def _pick_embedded_item(text: str, candidates: list[ItemRecord]) -> "ItemRecord | None":
+    """`lookup_item_contained_in` が返した(語境界を見ていない)候補群から、
+    `text` 中で実際に品名の主辞として現れているものを選ぶ。
+
+    `_resolve_named_hit` と違い、直前の境界は見ない(「使わなくなった電子
+    レンジ」「〜にした自動車」のように、直前が助詞ではなく動詞の活用語尾
+    でも品名は品名のため)。直後の境界だけを `_AFTER_NAME_OK` でチェックする
+    ことで、「捨てたらいいか」に「たらい」が偶然含まれる、のような事故は
+    排除できる(直後が「いいか」で `_AFTER_NAME_OK` に一致しない)。
+
+    複数該当すれば最長一致(最も具体的な品名)を優先する。
+    """
+    if not candidates:
+        return None
+    norm_text = _norm(text)
+    best: "ItemRecord | None" = None
+    best_len = -1
+    for item in candidates:
+        full_name = _norm(getattr(item, "item_name", ""))
+        if not full_name:
+            continue
+        # `lookup_item_contained_in` は括弧書き手前(base name)だけの一致でも
+        # 候補に含める(「蛍光管(環型、直型)」候補が「蛍光管を割って…」で
+        # 選ばれる)。境界チェックもどちらで見つかったかに合わせて行う。
+        for name in (full_name, _base_name(full_name)):
+            if not name:
+                continue
+            idx = norm_text.find(name)
+            if idx == -1:
+                continue
+            end = idx + len(name)
+            if not _AFTER_NAME_OK.match(norm_text[end:]):
+                continue
+            if len(name) > best_len:
+                best, best_len = item, len(name)
+            break
+    return best
 
 
 def _resolve_named_hit(prompt: str, hits: list[ItemRecord]) -> "ItemRecord | None":
@@ -1051,9 +1192,27 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         ans.canned_response = _ANALOGY_UNRELIABLE_REPLY
 
     # --- 6-3 fallback hook (STAGE06 proposal §7.3 / 担当B) ---
-    # ここに: ans.found が False かつ ans.canned_response が未設定かつ
-    # ans.safety_gate が None のとき、safety.no_result_reply() を canned_response
-    # に立てて「完全空振り」を LLM 生成に回さず固定文で返す。足場では未実装。
+    # 完全空振り(品目も収集日もヒットせず、6-1a/6-2 も 4-3 確度ゲートも未発火)。
+    # 検索結果ゼロを LLM に渡して「見つかりませんでした」と言わせると、モデルが
+    # 自前の知識で埋める失敗モード(4-3 で繰り返し確認)が未知の入力でも起きる。
+    # コード側で固定文を立て、engine.generate を通さず返す。
+    #
+    # `ans.missing` が非空(区名はあるが町名が無い等)のときは対象外にする
+    # (コードレビューで発見: 修正前は6-3がここを素通りせず全部拾ってしまい、
+    # build_system_prompt() の「不足している{missing}を推測せず利用者に
+    # 追加入力を促す」という既存の指示(3-1由来)を握りつぶしていた。
+    # 「本当に何も手がかりが無い」場合と「あと一歩の情報が要る」場合は
+    # 区別し、後者は従来どおりLLMに追加入力を促させる)。
+    if (
+        not ans.found
+        and not ans.missing
+        and ans.canned_response is None
+        and ans.safety_gate is None
+    ):
+        reply = safety.no_result_reply()
+        if reply:
+            ans.canned_response = reply
+            ans.safety_gate = "6-3"
     return ans
 
 
@@ -1496,6 +1655,25 @@ _RULES_NO_CONTEXT = (
     "北九州市の公式ページや窓口での確認を案内する。\n"
 )
 
+# 6-2(危険・違法な処分の誘導)。2026-09-10 の採点フィードバック
+# 「不適切な処理方法や誤った分別区分を肯定するような案内を避け…禁止事項や
+# 例外事項を明確に伝える」「専門業者への相談や正しい排出ルートの提示など、
+# 具体的な代替案を漏れなく案内する」に対応する。以前は検索前に固定文で
+# 断っていたが、それでは『農薬』のように早見表に正しい相談先があるケースでも
+# 具体策の無い拒否になってしまうため、検索は通したうえでこの指示を足す。
+_RULES_DANGEROUS_REQUEST = (
+    "- 利用者は、危険または法律に違反する処分方法(野焼き・不法投棄・排水口や"
+    "土壌への投棄・中身の残った容器への穴あけ等)をしてよいか尋ねている。"
+    "まず「いいえ、〜してはいけません」と明確に否定すること。"
+    "危険な方法の手順は一切書かない。\n"
+    "- 否定だけで終わらせず、正しい処分方法を必ずセットで示す。検索結果に"
+    "販売店・専門の処理業者・粗大ごみ受付センター・回収ボックス等の具体的な"
+    "相談先や排出ルートがあれば、一つも省略せず挙げること。\n"
+    "- 検索結果に該当品目が無い場合でも、情報不足を理由に回答を避けない。"
+    "その方法が禁止であることを明示したうえで、品名を具体的に尋ね、"
+    "北九州市の窓口へ相談するよう案内する。\n"
+)
+
 # 4-3 確度ゲート(_analogy_is_reliable)で弾いたとき用。意味の近い候補は
 # あるが質問品と語彙的に関連づかず、区分の根拠にできないケース。
 #
@@ -1550,6 +1728,10 @@ def build_system_prompt(ans: RoutedAnswer) -> str:
     設計提案書 3-7(未識別時は憶測で断定しない)をここで強制する。
     """
     parts = [_BASE_RULES]
+
+    if ans.safety_gate == "6-2":
+        # 検索結果の有無に関わらず、禁止の明示と正しい手順の提示を課す。
+        parts.append(_RULES_DANGEROUS_REQUEST)
 
     if ans.found and ans.item_match == "analogy" and ans.analogy_unreliable:
         # 4-3 確度ゲートで弾いた候補。類推で断定させず、確認を促す。
@@ -1693,6 +1875,8 @@ def build_trace_record(prompt: str, ans: RoutedAnswer) -> dict:
     return {
         "prompt": prompt,
         "detected_item": ans.detected_item,
+        "detected_ward": ans.detected_ward,  # STAGE06 6-4: /trace の「検出した地区」表示用
+        "detected_town": ans.detected_town,
         "item_candidates": list(ans.item_candidates),
         "item_match_stage": ans.item_match_stage,
         "item_match": ans.item_match,

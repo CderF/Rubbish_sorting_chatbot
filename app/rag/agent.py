@@ -317,7 +317,24 @@ async def _run_loop(
                 if note:
                     district_notes.append(note)
 
-    if not (collected_items or collected_schedules or collected_explanations):
+    # コードレビュー(PR #45)で発見: 品目・収集日がどちらもヒットせず、
+    # search_general_info だけが何か(弱関連かもしれない説明チャンク)を拾った
+    # 場合、_build_routed_answer は found=True を確定させてしまい、STAGE06
+    # 6-3(完全空振りの固定拒絶)が `_blocking_route` 側にしか無いため素通り
+    # していた(4-3 確度ゲートが防ぐはずの「モデルが弱い根拠から自由に
+    # 生成する」失敗モードが、Agentic 経路からだけ再現する)。
+    #
+    # 「search_general_info だけを使う一般説明質問」(ごみステーションの
+    # ルール等、ベクトルRAGパスが正規に担当する範囲)は壊さないよう、
+    # search_waste_item が一度も呼ばれていない(＝最初から一般質問として
+    # 扱われた)場合はそのまま found=True にする。search_waste_item が
+    # 呼ばれたのに品目が確定しなかった場合(＝品目質問のつもりが失敗した)
+    # だけ、explanations があっても解決済み扱いにせず決定論的経路へ回す
+    # (そちらの `_blocking_route` 末尾フックが6-3を正しく発火させる)。
+    item_search_attempted_and_failed = bool(item_call_results) and not collected_items
+    if not (collected_items or collected_schedules) and (
+        not collected_explanations or item_search_attempted_and_failed
+    ):
         # 何も拾えなければ、呼び出し側で決定論的経路にフォールバックさせる。
         return None
 
