@@ -202,13 +202,15 @@ STAGE04で確立した検証フローを踏襲する:
 
 ## 7. 分担(2名並行開発)
 
-`_blocking_route`への共有編集を1箇所に閉じ込め、FANG(Teamb2)と周(Teamb4)が同一基線から
-並行開発できるようにする。検出ロジックは新モジュール`app/rag/safety.py`に隔離し、
-`_blocking_route`からは入口で1回呼ぶだけにする。
+共有ファイルへの編集を最小化し、FANG(Teamb2)と周(Teamb4)が同一基線から並行開発できる
+ようにする。検出ロジックは新モジュール`app/rag/safety.py`に隔離し、入口ゲートは
+`server.py`の`_route_safely`から、6-3フォールバックは`router.py`の`_blocking_route`末尾から、
+それぞれ1回呼ぶだけにする。
 
-### 7.1 Phase 0 — 足場(どちらか1名、最初にマージする)
+### 7.1 Phase 0 — 足場(**完了**。ブランチ`feat/stage06-scaffold`、コミット`126ce97`)
 
-ブランチ`feat/stage06-scaffold`。契約だけを用意し、検出ロジックは入れない。
+契約だけを用意し、検出ロジックは入れない(`check_entry_gate`は常に`None`、
+`no_result_reply`は`""`を返すので挙動は不変)。
 
 1. `app/rag/safety.py`(新規):
 
@@ -226,14 +228,23 @@ STAGE04で確立した検証フローを踏襲する:
    ```
 
 2. `app/rag/types.py`: `RoutedAnswer`に`safety_gate: str | None = None`を追加。
-3. `app/rag/router.py` `_blocking_route`:
-   - 入口(`extract_turn`より前)に`ward, town = extract_region(prompt)` →
-     `check_entry_gate(prompt, ward, town)`の呼び出しと、非Noneなら`canned_response`を立てて
-     即`return`するブロック。位置に`# --- 6-1a/6-2 gate ---`の標識コメントを置く。
-   - 末尾(空振り判定の近く)に`# --- 6-3 fallback ---`の標識コメントだけを置く。
-4. `build_trace_record()` / `describe_sources()`に`"safety_gate": ans.safety_gate`を追加。
+3. `app/server.py` `_route_safely`: 先頭(**エージェント分岐より前**)に
+   `ward, town = router.extract_region(prompt)` → `safety.check_entry_gate(...)`の呼び出しと、
+   非Noneなら`RoutedAnswer`に`canned_response` / `safety_gate`を立てて即`return`するブロック。
+   `# --- 6-1a/6-2 gate ---`の標識コメントを置く。
 
-Phase 0をマージ後、担当A・Bは新しい`main`から各自ブランチを切り、以降は完全に並行。
+   > **当初案(§7.1 初版)からの変更**: 入口ゲートは`_blocking_route`の入口に置く予定だったが、
+   > `AGENTIC_RAG_ENABLED`が既定オンで、`agent.route_agentically`は`_blocking_route`を
+   > 経由せず自前の`RoutedAnswer`を返す。ゲートを`router`側に置くと既定オンのエージェント応答が
+   > 素通りするため、エージェント経路・決定論経路の両方より前段にある`_route_safely`の先頭へ
+   > 移した。§3(画像分類パス)の結論(「入口に置けば画像添付の有無に関わらず適用される」)は
+   > そのまま成立する。
+
+4. `app/rag/router.py`:
+   - `_blocking_route`末尾(空振り判定の近く)に`# --- 6-3 fallback hook ---`の標識コメントだけを置く。
+   - `build_trace_record()` / `describe_sources()`に`"safety_gate": ans.safety_gate`を追加。
+
+担当A・Bは`feat/stage06-scaffold`(またはマージ後の`main`)から各自ブランチを切り、以降は完全に並行。
 
 ### 7.2 担当A(FANG / Teamb2)— 入口安全ゲート(6-1a・6-2・6-1b/c回帰)
 
@@ -241,12 +252,12 @@ Phase 0をマージ後、担当A・Bは新しい`main`から各自ブランチ�
 
 | 対象 | 内容 |
 |---|---|
-| 占有ファイル | `app/rag/safety.py`(`check_entry_gate`と語彙リスト全体)、`tests/stage06_entry_gate_test.py`(新規) |
+| 占有ファイル | `app/rag/safety.py`(`check_entry_gate`と語彙リスト全体)、`tests/stage06_entry_gate_test.py`(新規)。`_route_safely`の呼び出しフックは Phase 0 済みなので、A は `check_entry_gate` の中身を埋めるだけ |
 | 6-1(a) | ごみ語彙ホワイトリスト → 無ければ範囲外。ごみ語彙有 + 他都市名ブラックリスト該当 → 範囲外。`ward`が北九州市内区名なら誤検出を上書き解除(§2.1) |
 | 6-2 | 危険処分の動詞・表現 × ごみ処分の文脈語の共起で発火。v1はcannedのみ(「既存データがあれば正規の出し方」は結合後の別タスク) |
 | 6-1(b)(c) | ほぼ回帰テスト(`市が収集しないもの`の備考連絡先、区のみ→町名要求)。上記の新規テストに含める |
 | §5未決 | 他都市名ブラックリスト初版、危険処分の動詞・表現リスト初版 を起草・commit |
-| 依存 | Phase 0のみ。`server.py` / `webui.html`は触らない |
+| 依存 | Phase 0のみ。`router.py` / `server.py` / `webui.html`のコードは触らない(`safety.py`とテストのみ) |
 
 ### 7.3 担当B(周 / Teamb4)— 空振りフォールバック(6-3)+ トレース閲覧UI(6-4)
 
@@ -254,21 +265,27 @@ Phase 0をマージ後、担当A・Bは新しい`main`から各自ブランチ�
 
 | 対象 | 内容 |
 |---|---|
-| 占有ファイル | `app/server.py`(新規ルート追加のみ)、`app/trace.html`(新規、または`LOGIN_PAGE`同様のインライン)、`tests/stage06_trace_test.py`(新規) |
-| 6-3 | `safety.py`の`no_result_reply()`を実装(担当Aと別関数)。`_blocking_route`末尾の`# --- 6-3 fallback ---`に、`ans.found is False`かつ他のcanned未発火かつ`ans.safety_gate is None`のとき`canned_response`を立てるブロックを追加(数行。担当Aの入口ブロックとは別ハンク) |
+| 占有ファイル | `app/server.py`(**`/trace`ルートの新規追加のみ**。`_route_safely`の入口フックは Phase 0 済みで触らない)、`app/trace.html`(新規、または`LOGIN_PAGE`同様のインライン)、`tests/stage06_trace_test.py`(新規) |
+| 6-3 | `safety.py`の`no_result_reply()`を実装(担当Aと別関数)。`_blocking_route`末尾の`# --- 6-3 fallback hook ---`に、`ans.found is False`かつ他のcanned未発火かつ`ans.safety_gate is None`のとき`canned_response`を立てるブロックを追加(数行) |
 | 6-4 | `GET /trace`(`require_login`)。`var/stage4_trace.jsonl`末尾N行を読み、セッション/リクエスト単位で 地区・品目・マッチ段階(exact/partial/vector/analogy)・`sources`・`safety_gate`(6-1a/6-2/6-3/なし)・4-2/4-3項 を表形式で表示。認証・設計は`/knowledge`ページ(`feat/webui-knowledge-manage`)を踏襲。`webui.html`ヘッダに「トレース」ボタンを追加 |
 | §5未決 | 6-3の固定文言(窓口番号)を確認・確定。6-4のUI詳細 |
 | 依存 | Phase 0の`safety_gate`フィールドのみ |
 
 ### 7.4 共有ファイルの編集境界(コンフリクトが起きないことの確認)
 
-| ファイル | Phase 0 | 担当A | 担当B |
+| ファイル | Phase 0(完了) | 担当A | 担当B |
 |---|---|---|---|
-| `app/rag/safety.py` | 骨組み | `check_entry_gate` + 語彙リスト | `no_result_reply()` |
-| `app/rag/router.py` `_blocking_route` | 2箇所に標識コメント | 入口ゲートのブロック | 末尾フォールバックのブロック |
-| `app/rag/types.py` / `build_trace_record` / `describe_sources` | `safety_gate`追加 | — | — |
-| `app/server.py` | — | — | `/trace`ルート追加 |
+| `app/rag/safety.py` | 骨組み(`SafetyVerdict` / スタブ2関数) | `check_entry_gate` + 語彙リスト | `no_result_reply()` |
+| `app/server.py` `_route_safely` | 入口ゲートのフック(`# --- 6-1a/6-2 gate ---`) | —(`check_entry_gate`を埋めるだけ) | — |
+| `app/rag/router.py` `_blocking_route` | 末尾に`# --- 6-3 fallback hook ---`標識のみ | — | 末尾フォールバックのブロック |
+| `app/rag/router.py` `build_trace_record` / `describe_sources` | `safety_gate`を出力 | — | — |
+| `app/rag/types.py` | `RoutedAnswer.safety_gate`追加 | — | — |
+| `app/server.py`(新規ルート) | — | — | `GET /trace`追加 |
 | `app/webui.html` | — | — | トレースボタン追加 |
+
+`safety.py`は担当A(`check_entry_gate`)と担当B(`no_result_reply`)が別関数を触るだけ、
+`_blocking_route`末尾は担当Bのみ、`server.py`は`_route_safely`(Phase 0)と`/trace`(担当B)で
+別関数。実コードのハンク重複はゼロ。
 
 ### 7.5 マージ順序と後続
 
