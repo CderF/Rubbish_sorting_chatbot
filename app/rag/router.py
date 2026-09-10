@@ -148,6 +148,33 @@ _PARTICLES = r"はがをにへとでもやのねよかっ、。？?!！\s"
 _LEADING = re.compile(rf"^[{_PARTICLES}]+")
 _TRAILING = re.compile(rf"[{_PARTICLES}]+$")
 
+# `_LEADING` は文字クラスなので「やかん」「ねじ回し」のように内容語自体が
+# _PARTICLES に含まれる仮名(や・ね・か 等)で始まる品名まで削ってしまう
+# (実測: 「やかんを処分したい」→ 候補が「んを処分したい」、「ねじ回しは
+# どう捨てますか」→「じ回し」)。`text` が発話中で「語の書き出し」の位置
+# (先頭、または断片分割に使う区切りの直後)に現れているなら、その1文字目は
+# 助詞の残骸ではなく利用者が実際に書いた内容語の頭なので `_LEADING` を
+# 当てない。区名・町名・ごみ種別語を除去した「跡」(「…丁目でソファを…」の
+# 「でソファを…」)は語の書き出しではないので、従来どおり `_LEADING` が効く。
+_FRAGMENT_BOUNDARY = r"[\s、。「」()（）]"
+
+
+def _written_from_the_start(frag: str, original: str) -> bool:
+    if not frag:
+        return False
+    return re.search(rf"(?:^|{_FRAGMENT_BOUNDARY}){re.escape(frag)}", original) is not None
+
+
+def _trim_particles(text: str, original: str) -> str:
+    """文頭・文末に残った助詞を落とす。ただし利用者が書いた語の頭は削らない。
+
+    `original` は正規化しただけの発話全文(区名・町名等の除去より前)。
+    """
+    if not _written_from_the_start(text, original):
+        text = _LEADING.sub("", text)
+    return _TRAILING.sub("", text).strip()
+
+
 _TOWN = re.compile(r"([一-龥ぁ-んァ-ヶa-zA-Z]{1,10}(?:\d{1,3}丁目|丁目|町|台|ケ丘|ヶ丘))")
 
 
@@ -334,6 +361,10 @@ def _item_name_candidates(
     if not text:
         return [], None
 
+    # 発話そのものの先頭かどうかを後で判定するために原文を控えておく
+    # (`_trim_particles` 参照)。
+    original = text
+
     if strip_waste_words is None:
         strip_waste_words = asks_schedule(text)
 
@@ -350,8 +381,7 @@ def _item_name_candidates(
             text = text.replace(word, " ")
 
     text = _QUESTION_TAIL.sub(r"\1", text)
-    text = _LEADING.sub("", text)
-    text = _TRAILING.sub("", text).strip()
+    text = _trim_particles(text, original)
 
     # 記号・空白で切り、断片ごとに「原文」と「修飾語を落とした形」の両方を
     # 候補化する。原文だけだと「壊れたテレビ」が完全一致しない一方、加工後
@@ -363,7 +393,7 @@ def _item_name_candidates(
     raw_fragments: list[str] = [text]
     candidates: list[str] = [text]
     for frag in re.split(r"[\s、。「」()（）]+", text):
-        frag = _TRAILING.sub("", _LEADING.sub("", frag))
+        frag = _trim_particles(frag, original)
         if not frag:
             continue
         raw_fragments.append(frag)
