@@ -144,9 +144,20 @@ def merge_with_state(
 
     1品目だけで今回もそれが見つかっている通常時(これまでずっと動いていた
     大半のケース)は `routed` をそのまま返す — 挙動を変えない。
-    固定回答(`canned_response`)・安全ゲート(`safety_gate`)発火時も対象外。
+    固定回答(`canned_response`)・安全ゲート(`safety_gate`)発火時も対象外
+    (ただし6-3の「品名を特定できない」兜底は例外 — 前ターンの品目が残って
+    いれば合流で解決できるため)。
     """
-    if routed.canned_response is not None or routed.safety_gate is not None:
+    # 合流しても意味が無い固定回答だけを対象外にする:
+    # - 6-1a(担当範囲外)・6-2(危険処分)・ごみ出しルール確定回答
+    #   (safety_gate が "6-1a"/"6-2")。
+    # - 4-3 類推不可(_ANALOGY_UNRELIABLE_REPLY。canned が立つが safety_gate
+    #   は None)。
+    # 6-3(品名を特定できない兜底)は対象外にしない — 「え、じゃあどうすれば」
+    # のような追問が「品名を教えてください」に落ちず、前の品目を引き継げる。
+    if routed.safety_gate in ("6-1a", "6-2"):
+        return routed
+    if routed.canned_response is not None and routed.safety_gate != "6-3":
         return routed
 
     carried_names = list(state.items)

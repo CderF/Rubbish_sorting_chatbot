@@ -378,7 +378,7 @@ def test_new_danger_words_do_not_misfire():
 def test_waste_rule_question_gets_a_targeted_denial(prompt):
     verdict = safety.check_entry_gate(prompt, ward=None, town=None)
     assert verdict is not None
-    assert verdict.gate == "6-3"
+    assert verdict.gate == "6-1a"  # 確定回答(担当範囲外と同じ)として返す
     assert verdict.blocks_search is True  # 品名検索の対象外なので即返す
     assert "いいえ" in verdict.reply  # 禁止事項を明確に否定する
     assert verdict.reply  # 正しい手順まで含む

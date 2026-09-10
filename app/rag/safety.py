@@ -280,7 +280,10 @@ def check_entry_gate(
     rule_reply = _match_waste_rule(norm)
     if rule_reply is not None:
         # ごみ出しルールの確認質問は、品名検索の対象ではないため検索せず即返す。
-        return SafetyVerdict(gate="6-3", reply=rule_reply)
+        # gate は "6-1a"(担当範囲外と同じ「確定回答」)を流用する。6-3 の
+        # 「品名を特定できない」兜底とは区別し、STAGE05 のセッション合流
+        # (multiturn.merge_with_state)の対象にしない。
+        return SafetyVerdict(gate="6-1a", reply=rule_reply)
 
     if _is_out_of_scope(norm, ward, has_history):
         return SafetyVerdict(gate="6-1a", reply=_OUT_OF_SCOPE_REPLY)

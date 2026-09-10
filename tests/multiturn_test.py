@@ -375,3 +375,61 @@ def test_merge_preserves_this_turns_own_general_info_alongside_the_carried_item(
 
     assert "指定袋は透明または半透明であること" in merged.context
     assert "ペットボトル" in merged.context
+
+
+def test_merge_does_not_skip_6_3_fallback_when_prior_item_exists(monkeypatch):
+    """6-3(品名を特定できない)兜底は、前ターンの品目が残っていれば合流で
+    解決する(STAGE05×STAGE06 統合の修正)。
+
+    「ソファを捨てたい」→「え、じゃあどうすれば」のような追問は、これまで
+    6-3 の「品名を教えてください」に落ちていた。前の品目を再検索して
+    引き継げることを確認する。
+    """
+
+    def fake_execute_tool(name, arguments):
+        if name == "search_waste_item":
+            hit = {
+                "item_name": "ソファーベッド",
+                "disposal_method": "粗大ごみ",
+                "notes": "事前申込制",
+                "source_url": "https://example.test/sofa",
+            }
+            return {"match_stage": "exact", "items": [hit]}
+        if name == "lookup_item_change_notice":
+            return {"has_pending_change": False}
+        if name == "lookup_collection_schedule":
+            return {"schedules": []}
+        raise AssertionError(f"unexpected tool call: {name} {arguments}")
+
+    monkeypatch.setattr(multiturn, "execute_tool", fake_execute_tool)
+
+    state = SessionState(items=["ソファーベッド"], ward="小倉北区", town="浅野1丁目")
+    routed = _routed()  # item_hits 空 = 品名を特定できない
+    routed.canned_response = "品物の名前を教えてください"
+    routed.safety_gate = "6-3"
+
+    merged = merge_with_state("え、じゃあどうすればいいですか？", state, routed)
+
+    names = [getattr(h, "item_name", "") for h in merged.item_hits]
+    assert names == ["ソファーベッド"]
+    # 6-3 の固定文は取り除かれ、LLM が前の品目を引き継げる状態になる。
+    assert merged.canned_response is None
+    assert merged.safety_gate is None
+    assert "ソファーベッド" in merged.context
+
+
+def test_merge_still_skips_6_3_fallback_when_no_prior_item(monkeypatch):
+    """前ターンの品目が無いセッションでは、6-3 兜底は従来どおり残る
+    (単ターンで「品名を特定できない」質問が固定文のまま返る)。"""
+
+    def boom(*a, **k):
+        raise AssertionError("execute_tool should not be called without a prior item")
+
+    monkeypatch.setattr(multiturn, "execute_tool", boom)
+
+    state = SessionState()  # 品目未確立
+    routed = _routed()
+    routed.canned_response = "品物の名前を教えてください"
+    routed.safety_gate = "6-3"
+
+    assert merge_with_state("これ燃えるゴミで合ってますよね？", state, routed) is routed
