@@ -57,7 +57,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from app.notices import admin as notice_admin  # noqa: E402
-from app.rag import knowledge, router  # noqa: E402  (sys.path 調整後に import)
+from app.rag import knowledge, router, slot_extract  # noqa: E402  (sys.path 調整後に import)
 from app.rag.session_state import DialogState  # noqa: E402
 
 # ナレッジ管理API(お知らせの取り込み/削除)は waste_items を直接書き換えるが、
@@ -191,6 +191,10 @@ async def _warmup():
         prompt_input = _build_prompt(_build_messages(text, img))
         async for _ in engine.generate(prompt_input, params, f"warmup-{i}"):
             pass
+
+    # スロット抽出(STAGE05)は制約付きデコードを使う。スキーマごとの文法
+    # コンパイルが初回に走るので、これも同じ理由でここで先払いする。
+    await slot_extract.warmup(router.WARDS, engine, processor)
 
 
 # --------------------------------------------------------------------------

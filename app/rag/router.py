@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date
 
+from app.rag import slot_extract
 from app.rag.session_state import (
     ADD_WORDS,
     CORRECTION_WORDS,
@@ -923,11 +924,51 @@ def _route_schedule(ans: RoutedAnswer, state: DialogState, prompt: str) -> None:
         ans.missing.append(f"{ward}{town}の収集日データ")
 
 
+def _apply_llm_slots(
+    turn: TurnInput, slots: dict
+) -> "tuple[TurnInput, list[str], str | None]":
+    """ルールが空振りしたターンに、LLM抽出の結果を重ねる(STAGE05)。
+
+    呼ばれるのは `slot_extract.needs_fallback()` が True だったターンだけなので、
+    品名・区・町名はいずれもルール側が空である。したがってここは「上書き」では
+    なく「空欄を埋める」操作にしかならない — 決定的に取れた値がLLMの推測で
+    置き換わることは無い。
+
+    候補列を `[item]` の1本に差し替えるのは画像パスと同じ理由による。LLMが返す
+    のは「傘」のような一般名で、発話(「これって何ゴミ？」)の部分文字列とは限ら
+    ないため、`_item_name_candidates` が作った断片列をそのまま使えない。
+
+    なお、ここで入れた品名がそのまま採用されるとは限らない。`_blocking_route`
+    は地区を伴うターンで、候補が完全一致・部分一致のどちらにも掛からなければ
+    品名を捨てる。LLMの推測も同じ検査を通るので、早見表に無い名前を勝手に
+    答え始めることはない。
+    """
+    item = slots.get("item")
+    ward = slots.get("ward")
+    town = slots.get("town")
+
+    if not (item or ward or town):
+        return turn, [], None
+
+    turn = replace(
+        turn,
+        item=item or turn.item,
+        ward=ward or turn.ward,
+        town=town or turn.town,
+    )
+    # 品名がLLM由来なら候補列も作り直す。ベクトルクエリは発話全体ではなく
+    # 抽出された一般名のほうが当たるので、そちらを渡す。
+    if item:
+        return turn, [item], item
+    return turn, [], None
+
+
 def _blocking_route(
     prompt: str,
     image_item_name: str | None = None,
     state: "DialogState | None" = None,
     today: "date | None" = None,
+    llm_slots: dict | None = None,
 ) -> RoutedAnswer:
     """同期の検索処理。`handle_query` からスレッドで呼ばれる。
 
@@ -942,8 +983,14 @@ def _blocking_route(
     検索は毎ターン**マージ後のスロット全体に対してやり直す**。会話履歴を事実の
     出どころにしないことで、「検索結果に書かれている内容だけを使う」という
     システムプロンプトの規則を緩めずに 5-1 を満たせる。
+
+    `llm_slots` は、ルール抽出が何も取れなかったターンに限って `handle_query` が
+    LLMから受け取ったスロット(`app/rag/slot_extract.py`)。`None` なら従来どおり
+    文字列ヒューリスティクスの結果だけで進む。
     """
     turn, candidates, vector_query = extract_turn(prompt, image_item_name)
+    if llm_slots is not None:
+        turn, candidates, vector_query = _apply_llm_slots(turn, llm_slots)
 
     # 今のターンの品目は、スロットへ畳み込む前に1回だけ引く。理由が2つある。
     #
@@ -1107,14 +1154,30 @@ async def handle_query(
     (STAGE03 3-2向け画像分類パス用)。呼び出し元がどちらも渡さない場合、または
     `img_b64` が無い場合は画像分類をスキップし、テキストのみのルーティングに
     フォールバックする(例外にはしない — 呼び出し側の都合を尊重する)。
+
+    同じ共有エンジンを、ルール抽出が空振りしたターンのスロット補完にも使う
+    (`app/rag/slot_extract.py`)。`engine`/`processor` を渡さない呼び出し
+    (既存のテスト・オフライン実行)では従来どおりルール抽出だけで動く。
     """
     image_item_name = None
     if img_b64 and engine is not None and processor is not None:
         image_item_name = await classify_image_to_item_name(img_b64, engine, processor)
 
+    # ルール抽出が1つもスロットを取れなかったターンだけ、LLMに読ませ直す。
+    # ここで `extract_turn` を先に1回回すのは、空振りかどうかを知るのに
+    # それが要るため。純粋な文字列処理でGPUもDBも踏まないので、`_blocking_route`
+    # 内でもう一度呼ばれることのコストは無視できる。
+    llm_slots = None
+    if engine is not None and processor is not None:
+        probe, _, _ = extract_turn(prompt, image_item_name)
+        if slot_extract.needs_fallback(probe):
+            llm_slots = await slot_extract.extract_slots(
+                probe.text, WARDS, engine, processor
+            )
+
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        _db_executor, _blocking_route, prompt, image_item_name, state
+        _db_executor, _blocking_route, prompt, image_item_name, state, None, llm_slots
     )
 
 
