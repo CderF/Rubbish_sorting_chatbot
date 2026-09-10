@@ -21,7 +21,7 @@ from app.notices.ingest import ingest_notice_file, relink
 from app.notices.notice_parser import parse_notice_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-KNOWLEDGE = REPO_ROOT / "knowledge" / "incoming"
+KNOWLEDGE = REPO_ROOT / "tests" / "fixtures" / "notices"
 ADDITIONS = KNOWLEDGE / "お知らせ-4-1.md"
 CHANGES = KNOWLEDGE / "お知らせ-4-2.md"
 SEED = Path(__file__).resolve().parent / "fixtures" / "hayamihyo_seed.json"

@@ -42,8 +42,9 @@ documents/北九州ゴミ分類Chatbot課題.pdf
 
 # --- data artefacts (STAGE 02-04) ----------------------------------------
 # var/ + *.db (above) hold the crawler's SQLite DB and STAGE 04 ingest output —
-# generated from knowledge/incoming/ + the crawl, not source. knowledge/incoming/
-# itself IS tracked: the distributed お知らせ files are ingest inputs.
+# generated from the crawl + ingested お知らせ, not source. The STAGE04 sample
+# お知らせ files now live under tests/fixtures/notices/ (test data only);
+# knowledge/incoming/ is created on demand by the WebUI upload path.
 *.sqlite
 *.sqlite3
 chroma/

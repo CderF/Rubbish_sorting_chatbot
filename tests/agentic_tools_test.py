@@ -28,7 +28,7 @@ import pytest
 from app.data.schema import WasteItem
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CHANGES = REPO_ROOT / "knowledge" / "incoming" / "お知らせ-4-2.md"
+CHANGES = REPO_ROOT / "tests" / "fixtures" / "notices" / "お知らせ-4-2.md"
 INGEST_AT = dt.datetime(2026, 9, 8, 3, 0, 0, tzinfo=timezone.utc)
 
 
