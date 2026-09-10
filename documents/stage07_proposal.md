@@ -35,7 +35,8 @@ STAGE05(マルチターン、PR #24)・STAGE06(安全対応、PR #43/#45)は本�
 
 ### 2.1 7-1 — MCPサーバとして公開する【実装済み】
 
-`app/mcp_server.py`(`FastMCP`、公式 `mcp` SDK v1)。5ツールを公開:
+`app/mcp_server.py`(`FastMCP`、公式 `mcp` SDK v1)。**8ツール + 1静的リソース + 2リソーステンプレート**
+を公開:
 
 | ツール | 中身 |
 |---|---|
@@ -43,13 +44,20 @@ STAGE05(マルチターン、PR #24)・STAGE06(安全対応、PR #43/#45)は本�
 | `lookup_collection_schedule(ward, town, waste_type)` | 同上(収集日パス。丁目省略の地区名解決込み) |
 | `lookup_item_change_notice(item_name)` | 同上(お知らせパス、STAGE04 4-2) |
 | `search_general_info(query)` | 同上(ベクトルRAGパス) |
-| `get_disposal_guidance(prompt)` | **新規**。1発の相談文を `router._blocking_route(prompt)` に通し、ルータが組んだ `context`・`sources`・マッチ段階・`missing` をそのまま返す。**LLM生成は通さない**(このプロセスに vLLM は無い)。接続元のクライアント(Claude Desktop 等)がこの材料を使って文章を書く |
+| `get_disposal_guidance(prompt, user_id=None)` | 1発の相談文を `router._blocking_route(prompt)` に通し、`context`・`sources`・マッチ段階・`missing`・表(markdown)を返す。**LLM生成は通さない**。`user_id` を渡すと7-4の記憶で地区を補う(§2.4) |
+| `remember_fact` / `recall_facts` / `forget_facts(user_id, …)` | 7-4 の記憶ストアへの明示的な読み書き |
+
+| リソース | 中身 |
+|---|---|
+| `knowledge://sources` | 取り込み済みの参照元ページ一覧(`/knowledge` と同じデータ、`knowledge.list_sources()`) |
+| `knowledge://{source_id}` | 1ページ分の内容(`knowledge.get_source()`) |
+| `schedule-calendar://{ward}/{town}` | 収集日を1週間カレンダーのSVG画像にしたもの(7-3、§2.3) |
 
 会話状態(STAGE05のスロット)は公開しない — マルチターンは接続元のクライアントが管理するものなので、
-「その1発で何が引けるか」だけを返す設計にした。
+「その1発で何が引けるか」だけを返す設計にした。7-4の記憶はそれとは別の永続層。
 
 **「自分たちで実装した」の解釈**: プロトコル実装(JSON-RPCフレーミング・stdioトランスポート)は
-公式SDK(`mcp` パッケージ)に委ね、ツールのハンドラ・スキーマ・検索ロジックへの接続を自分たちで書いた。
+公式SDK(`mcp` パッケージ)に委ね、ツール・リソースのハンドラ・検索ロジックへの接続を自分たちで書いた。
 FastAPIを使って `/chat` を自分たちで実装したのと同じ扱いとした。
 
 ### 2.2 7-2 — 外部クライアントから接続して呼び出せる状態にする【実装済み・stdio】
@@ -58,9 +66,16 @@ FastAPIを使って `/chat` を自分たちで実装したのと同じ扱いと�
 §4 未決事項参照)。
 
 **検証方法**: 公式 `mcp` クライアントSDK(`mcp.client.stdio.stdio_client` + `ClientSession`)で
-サブプロセスとして起動し、`initialize` ハンドシェイク→ `list_tools` → `call_tool` を実行。
-5ツールすべてが正しい名前で列挙され、`search_waste_item` の呼び出しが正しいJSONを返すことを確認済み
-(Claude Desktop が使うのと同じプロトコル経路)。
+サブプロセスとして起動し、`initialize` ハンドシェイク→ `list_tools`/`list_resources`/
+`list_resource_templates` → `call_tool`/`read_resource` を実行(Claude Desktop が使うのと
+同じプロトコル経路)。以下を確認済み:
+
+- 8ツールすべてが正しい名前で列挙される
+- `remember_fact` → `recall_facts` が実プロセス間で往復する(7-4)
+- `knowledge://sources` が読める(1静的リソース)
+- `knowledge://{source_id}` / `schedule-calendar://{ward}/{town}` の2リソーステンプレートが
+  列挙され、**日本語パスセグメント**(`小倉北区`・`浅野1丁目` をURLエンコードしたもの)を渡した
+  `schedule-calendar://` の読み取りが `mimeType: image/svg+xml` で正しいSVGを返す
 
 **Claude Desktop からの接続手順**(`claude_desktop_config.json` に追記):
 
@@ -85,30 +100,38 @@ pip install -r requirements.txt -r requirements-mcp.txt
 `var/kitakyushu_waste.db`(構造化DB)と `var/chroma/`(ベクトル索引)が要る。GPU・vLLMは不要
 (`get_disposal_guidance` はLLM生成をしない設計にしたのはこのため — メンターの手元で軽量に動く)。
 
-### 2.3 7-3 — リッチUI【部分的に実装済み】
+### 2.3 7-3 — リッチUI【実装済み】
 
+- **画像**: `schedule-calendar://{ward}/{town}`(MCPリソース、`mimeType: image/svg+xml`)。収集日を
+  1週間カレンダーのSVGにし、該当する曜日を塗る。PIL・matplotlib等の追加依存は使わず文字列組み立てのみ
+  (`app/mcp_server.py` の `_render_week_svg`)。実クライアントSDKでの読み取り・mimeType確認済み(§2.2)。
 - **表**: `get_disposal_guidance` が早見表・収集日の結果を GFM markdown の表にして `markdown` フィールドで
-  返す(MCPクライアント側でそのままレンダリングされる)。加えて WebUI 側は `/knowledge`・`/trace`
-  (STAGE06、PR #45)が既に表形式。
+  返す。加えて WebUI 側は `/knowledge`・`/trace`(STAGE06、PR #45)が既に表形式。
 - **ファイル編集**: PR #38(マージ済み)でお知らせファイルのアップロード・取り込み・削除を実装済み。
-- **画像出力**: 対象外(スコープカット)。品目の分類元画像をMCPレスポンスに `ImageContent` として
-  エコーする、程度なら小さいが、1日の残り時間を7-1/7-2の実接続確認に使うことを優先した。
 
-### 2.4 7-4 — パーソナライズ【ストアのみ実装、配線は未着手】
+### 2.4 7-4 — パーソナライズ【実装済み・MCP接続単位】
 
 `app/user_memory.py`: 利用者ID単位の永続 key-value ストア(`remember` / `recall` / `recall_all` /
 `forget` / `forget_all`、独立した `var/user_memory.db`)。STAGE05の `session_state.py` は**1会話限り**の
 スロットなので、7-4が求める「セッションを跨いだ記憶」とは別の層として独立させた。
 
-**未着手(配線)**:
+**配線した内容**:
 
-1. **「利用者」の身元をどこから取るか** — MCP接続なら接続(クライアントインスタンス)単位、WebUIなら
-   `require_login` は全員共通パスワードで個人を識別しない。どちらを軸にするか要決定(§4)。
-2. **どこで自動的に読み書きするか** — 例えば `get_disposal_guidance` の冒頭で `recall_all` した地区を
-   `_blocking_route` に渡す候補地区として使う、MCPに `remember`/`recall` ツールを足して接続元のClaudeに
-   明示的に管理させる、等。
+1. **利用者の識別軸は MCP 接続単位に決定**。WebUI(`require_login` が全員共通パスワードで個人を
+   識別しない)ではなく、`get_disposal_guidance` / `remember_fact` 等の `user_id` 引数として接続元の
+   クライアントに渡してもらう形にした。WebUIのログイン単位化は対象外(§4)。
+2. **`get_disposal_guidance` に自動読み書きを実装**:
+   - `user_id` を渡すと、まず素の発話で引く。地区が足りなければ(`missing` に「町名」等)、記憶に
+     ある区・町名を文末に補ってもう一度引く(`used_memory` で分かる)。
+   - 今回の発話から区・町名が読めていれば、次回のために記憶へ書き戻す(訂正すれば上書きされる)。
+   - `extract_region()` は文中のどこからでも区名・町名を拾う既存ロジックなので、記憶を「文末に
+     こっそり足す」だけで専用の合成ロジックを持たずに済んだ。
+3. `remember_fact` / `recall_facts` / `forget_facts` で、接続元のクライアントが任意のキーを
+   明示的に管理することもできる(区・町名以外を覚えさせたい場合)。
 
-ストアの契約(何を保存でき、何を返すか)は固まっているので、配線は接続方式が決まり次第すぐ着手できる。
+デモの流れ: 「ソファの収集日は?」(`user_id="mentor-1"`)→ 地区不明 → 「小倉北区浅野1丁目です、ソファの
+収集日は?」→ 引けて、区・町名を記憶 → **別セッション**で「冷蔵庫は?」(同じ `user_id`)→ 記憶から
+地区を補って引き直し、聞き返さない。
 
 ---
 
@@ -118,8 +141,10 @@ pip install -r requirements.txt -r requirements-mcp.txt
 python -m pytest tests/mcp_server_test.py tests/user_memory_test.py -q
 ```
 
-`app/rag/tools.py` への委譲・`get_disposal_guidance` の材料整形・`user_memory` の読み書き契約を
-オフラインで検証(`tests/agentic_tools_test.py` と同じ孤立SQLiteフィクスチャ)。
+`app/rag/tools.py` への委譲・`get_disposal_guidance` の材料整形と7-4連携・`user_memory` /
+`remember_fact`・`recall_facts`・`forget_facts` の読み書き契約・`knowledge://` リソース・
+収集日SVGの曜日抽出とレンダリングを、オフラインで検証(`tests/agentic_tools_test.py` と同じ
+孤立SQLiteフィクスチャ)。29 + 11 件。
 
 実プロトコル経由の疎通確認は上記(§2.2)のとおり、公式クライアントSDKでの手動実行で確認済み
 (自動テストには含めていない — サブプロセス起動を挟むため遅く、CIが無い現状のリポジトリでは
@@ -132,6 +157,6 @@ python -m pytest tests/mcp_server_test.py tests/user_memory_test.py -q
 | 項目 | 内容 | いつまでに |
 |---|---|---|
 | SSE/HTTPでの遠隔公開(7-2) | B1にホストしてメンターが直接接続できるようにするか。認証・TLS・デプロイが必要 | 時間があれば |
-| 7-4 の利用者識別の軸 | MCP接続単位 or WebUIログイン単位 | 配線着手時 |
-| 7-4 の自動読み書きの接続先 | `_blocking_route` への地区プリフィルか、MCPの明示的な `remember`/`recall` ツールか、両方か | 配線着手時 |
-| 7-3 画像出力 | `ImageContent` でのエコー等、対象外としたもの | 余裕があれば |
+| WebUIログイン単位の記憶(7-4) | 現状は MCP 接続(`user_id` 引数)単位のみ。WebUI から使うなら `require_login` を個人単位に拡張する必要がある | 余裕があれば |
+| `get_disposal_guidance` の記憶利用範囲 | 現状は区・町名だけを自動で読み書き。品目の好み等まで広げるかは未定 | 余裕があれば |
+| `var/user_memory.db` の運用 | 個人情報(区・町名)を平文でSQLiteに残す。`forget_facts` で消せるが、保持期間・アクセス制御の方針は未整理 | メンター確認時に相談 |
