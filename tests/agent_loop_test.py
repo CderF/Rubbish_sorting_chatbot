@@ -15,9 +15,12 @@ pytest-asyncio はこのプロジェクトの依存(requirements.txt)に無い�
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.rag import agent
+
+_REAL_DB_PATH = Path(__file__).resolve().parent.parent / "var" / "kitakyushu_waste.db"
 
 
 class _FakeOutput:
@@ -345,5 +348,92 @@ def test_district_fallback_note_reaches_context_and_states_the_weekday(monkeypat
         assert result.schedule_hits[0].weekday == "第2水曜日"
         assert "第2水曜日" in result.context
         assert "地区内の全ての町" in result.context
+
+    asyncio.run(body())
+
+
+def test_schedule_is_filled_in_even_when_the_model_never_calls_the_tool(monkeypatch):
+    """実機で実際に起きたケース: モデルが search_waste_item で品目(粗大ごみ)
+    を見つけたあと、lookup_collection_schedule を一度も呼ばずに終了しても、
+    収集曜日が省略されないことを確認する。
+
+    2026-09-10、B1実機で「八幡西区黒崎でソファを処分する方法を教えてくだ
+    さい」に対し、`tools.py` 側の地区名解決(直前のコミット)を入れたあとも
+    モデルが lookup_collection_schedule を一度も呼ばず、事前申込制の案内
+    だけで収集曜日が出ない状態が再現した。指示(システムプロンプト)だけに
+    頼らず、品目が見つかっていて収集日がまだ無ければコード側で
+    lookup_collection_schedule を直接実行する安全策(`_fill_missing_schedule`)
+    を追加した。
+
+    `_fill_missing_schedule` は(執行順が違うと壊れるモック経由ではなく)
+    `extract_region`/`_match_district` を通じて実際の本番DBを読む。それらは
+    `functools.lru_cache` されているので、`pytest tests/` 全体を実行した
+    ときに限り、無関係な `collection_schedule_town_test.py`(pytestのテスト
+    ではなく単体で実行するスクリプトだが `_test.py` という名前のため収集は
+    される)がトップレベルで `os.environ["DB_PATH"]` を空の一時DBへ恒久的に
+    書き換えてしまい、このテストが最初に `_town_candidates`/`_district_groups`
+    を呼ぶ側になった場合にその汚染を拾って落ちることがある
+    (2026-09-10 に発覚。テストスイート側の孤立性の問題で本コミットの範囲
+    外のため、ここでは実DBのパスを明示することで自衛するに留める)。"""
+    monkeypatch.setenv("DB_PATH", str(_REAL_DB_PATH))
+
+    def fake_execute_tool(name, arguments):
+        if name == "search_waste_item":
+            assert arguments == {"query": "ソファ"}
+            return {
+                "match_stage": "analogy",
+                "items": [
+                    {
+                        "item_name": "ソファーベッド",
+                        "disposal_method": "粗大ごみ",
+                        "notes": "事前申込制",
+                        "source_url": "https://example.test/sofa",
+                    }
+                ],
+            }
+        if name == "lookup_collection_schedule":
+            # モデルではなく _fill_missing_schedule がコード側から直接呼ぶ。
+            # 区名・町名は extract_region/_match_district がプロンプトの原文
+            # から実データを使って解決した結果("黒崎"は丁目省略の地区名)。
+            assert arguments == {
+                "ward": "八幡西区",
+                "town": "黒崎",
+                "waste_type": "粗大ごみ",
+            }
+            return {
+                "schedules": [
+                    {
+                        "ward": "八幡西区",
+                        "town": "黒崎1丁目",
+                        "waste_type": "粗大ごみ",
+                        "weekday": "第1月曜日",
+                        "source_url": "https://example.test/schedule",
+                    }
+                ],
+                "district_note": "「黒崎」は丁目の指定がなかったが…確認済み。",
+            }
+        raise AssertionError(f"unexpected tool call: {name}")
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    _TOOL_CALL_SOFA = (
+        "<tool_call>\n"
+        '{"name": "search_waste_item", "arguments": {"query": "ソファ"}}\n'
+        "</tool_call>"
+    )
+
+    async def body():
+        # モデルは search_waste_item だけ呼んで終了する(lookup_collection_schedule
+        # を一度も呼ばない、実機で観測された挙動そのまま)。
+        engine = _ScriptedEngine([_TOOL_CALL_SOFA, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "八幡西区黒崎でソファを処分する方法を教えてください",
+            engine=engine, build_prompt=_build_prompt, sampling_params=object(),
+        )
+
+        assert result is not None
+        assert len(result.schedule_hits) == 1
+        assert result.schedule_hits[0].weekday == "第1月曜日"
+        assert "第1月曜日" in result.context
 
     asyncio.run(body())

@@ -65,7 +65,13 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
-from app.rag.router import _analogy_pick, _override_analogy_hits
+from app.rag.router import (
+    _CURBSIDE_WASTE_TYPES,
+    _analogy_pick,
+    _match_district,
+    _override_analogy_hits,
+    extract_region,
+)
 from app.rag.tool_call_parser import ToolCall, parse_tool_calls
 from app.rag.tools import TOOL_SCHEMAS, execute_tool
 from app.rag.types import RoutedAnswer
@@ -194,6 +200,30 @@ async def _run_loop(
         if item.source_url:
             sources.append(item.source_url)
 
+    if collected_items and not collected_schedules:
+        # モデルが lookup_collection_schedule を自発的に呼ばなかった場合の
+        # 安全策。「事前予約が必要な品目でも収集曜日そのものは必ず案内する」
+        # という要件(STAGE03採点フィードバック由来、router.py側は既に対応
+        # 済み)を、モデルの自発的なツール呼び出しに頼らずコード側で保証する
+        # (4-3確度ゲートと同じ「小型モデルへの指示だけでは守れない」という
+        # 設計思想)。2026-09-10、実機で「八幡西区黒崎でソファを処分する
+        # 方法」に対し、tools.py 側の地区名解決(`_narrow_item_hits` 直後の
+        # 修正)を入れてもなお、モデルが lookup_collection_schedule を
+        # 一度も呼ばずに終わる(＝ツール自体が実行されない)ケースを確認した。
+        filled = _fill_missing_schedule(
+            prompt, collected_items[0], detected_ward, detected_town
+        )
+        if filled is not None:
+            schedules, note, ward, town = filled
+            for sched in schedules:
+                collected_schedules.append(SimpleNamespace(**sched))
+                if sched.get("source_url"):
+                    sources.append(sched["source_url"])
+            detected_ward = detected_ward or ward
+            detected_town = detected_town or town
+            if note:
+                district_notes.append(note)
+
     if not (collected_items or collected_schedules or collected_explanations):
         # 何も拾えなければ、呼び出し側で決定論的経路にフォールバックさせる。
         return None
@@ -211,6 +241,46 @@ async def _run_loop(
         detected_ward=detected_ward,
         detected_town=detected_town,
     )
+
+
+def _fill_missing_schedule(
+    prompt: str,
+    item: SimpleNamespace,
+    existing_ward: str | None,
+    existing_town: str | None,
+) -> tuple[list[dict], str | None, str | None, str | None] | None:
+    """品目は見つかったが収集日が一件も無いとき、区名・町名をプロンプトから
+    直接抜き出してコード側で収集日を引く(router.py の `extract_region`/
+    `_match_district` を再利用。「黒崎」のような丁目省略の地区名も解決できる)。
+
+    出し方が収集曜日を持たない区分(回収ボックス等、`_CURBSIDE_WASTE_TYPES`
+    以外)なら曜日という概念自体が無いので何もしない。
+    """
+    disposal_method = getattr(item, "disposal_method", None)
+    if disposal_method not in _CURBSIDE_WASTE_TYPES:
+        return None
+
+    ward = existing_ward
+    town = existing_town
+    if not ward or not town:
+        r_ward, r_town = extract_region(prompt)
+        ward = ward or r_ward
+        town = town or r_town
+        if ward and not town:
+            district = _match_district(ward, prompt)
+            if district:
+                town = district[0]
+    if not ward or not town:
+        return None
+
+    result = execute_tool(
+        "lookup_collection_schedule",
+        {"ward": ward, "town": town, "waste_type": disposal_method},
+    )
+    schedules = result.get("schedules") or []
+    if not schedules:
+        return None
+    return schedules, result.get("district_note"), ward, town
 
 
 _MATCH_STAGE_RANK = {"exact": 3, "partial": 2, "vector": 1}
