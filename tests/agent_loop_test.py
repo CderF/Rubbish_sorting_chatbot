@@ -437,3 +437,91 @@ def test_schedule_is_filled_in_even_when_the_model_never_calls_the_tool(monkeypa
         assert "第1月曜日" in result.context
 
     asyncio.run(body())
+
+
+# --------------------------------------------------------------------------
+# STAGE06: 品目検索が失敗したのに search_general_info の弱い結果で found=True
+# になってしまう回帰(コードレビュー PR #45 で発見)
+# --------------------------------------------------------------------------
+_TOOL_CALL_UFO = (
+    "<tool_call>\n"
+    '{"name": "search_waste_item", "arguments": {"query": "謎の物体"}}\n'
+    "</tool_call>"
+)
+_TOOL_CALL_GENERAL_INFO = (
+    "<tool_call>\n"
+    '{"name": "search_general_info", "arguments": {"query": "謎の物体"}}\n'
+    "</tool_call>"
+)
+
+
+def test_failed_item_search_plus_weak_explanation_falls_back_to_none(monkeypatch):
+    """品目検索(search_waste_item)が空振りしたあと、search_general_info が
+    (弱いかもしれない)説明チャンクを拾っただけでは found=True にしない。
+
+    修正前は `collected_explanations` が非空というだけで found=True が確定し、
+    STAGE06 6-3(完全空振りの固定拒絶)が `_blocking_route` 側にしか配線されて
+    いないため、この経路だけ6-3を素通りしていた。
+    """
+
+    def fake_execute_tool(name, arguments):
+        if name == "search_waste_item":
+            return {"match_stage": "none", "items": []}
+        if name == "search_general_info":
+            return {
+                "results": [
+                    {
+                        "text": "ごみステーションの利用ルールについて…",
+                        "source_url": "https://example.test/station",
+                        "source_page_title": "ごみステーションの散乱対策について",
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected tool call: {name}")
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_UFO, _TOOL_CALL_GENERAL_INFO, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "謎の物体はどう捨てればいいですか", engine=engine,
+            build_prompt=_build_prompt, sampling_params=object(),
+        )
+        # 呼び出し側(_route_safely)を決定論的経路にフォールバックさせ、
+        # そちら側で6-3の固定拒絶が正しく発火する。
+        assert result is None
+
+    asyncio.run(body())
+
+
+def test_pure_general_info_question_without_item_search_still_succeeds(monkeypatch):
+    """search_waste_item を一度も呼ばず(＝最初から一般説明質問として扱われ)
+    search_general_info だけで答えたケースは、修正後も found=True のまま
+    (ベクトルRAGパスの正規の使い方を壊さないことの確認)。
+    """
+
+    def fake_execute_tool(name, arguments):
+        assert name == "search_general_info"
+        return {
+            "results": [
+                {
+                    "text": "ごみステーションの防鳥ネットは補助金の対象です。",
+                    "source_url": "https://example.test/station",
+                    "source_page_title": "ごみステーションの散乱対策について",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_GENERAL_INFO, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "ごみステーションの防鳥ネットは借りられますか", engine=engine,
+            build_prompt=_build_prompt, sampling_params=object(),
+        )
+        assert result is not None
+        assert result.found is True
+        assert "防鳥ネット" in result.context
+
+    asyncio.run(body())
