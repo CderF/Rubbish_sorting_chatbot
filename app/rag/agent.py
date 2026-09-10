@@ -72,6 +72,7 @@ from app.rag.router import (
     _match_district,
     _override_analogy_hits,
     _shared_run_len,
+    category_procedure_intent,
     extract_region,
 )
 from app.rag.tool_call_parser import ToolCall, parse_tool_calls
@@ -85,7 +86,11 @@ _SYSTEM_PROMPT = (
     "- 品目の分別方法を調べるには search_waste_item を使う。"
     "本文に品目名として解釈できる語が一切含まれていない発言"
     "(地域名や訂正だけの発言など)では、品目名を作り出して呼んではならない。"
-    "その場合は品目名が分からないものとして扱う。\n"
+    "その場合は品目名が分からないものとして扱う。"
+    "「粗大ごみってどうやって出すんですか」「粗大ごみの申込み方法は」"
+    "「古紙を出したいです」のように、特定の品目ではなくごみ種別そのものの"
+    "出し方・手続きを尋ねる質問でも呼んではならない"
+    "(「ごみ箱」等、無関係な品目名を検索キーにしないこと)。\n"
     "- 収集曜日を調べるには lookup_collection_schedule を使う"
     "(区名と町名が分かっているときに呼ぶ。町名は丁目まで分からなくてもよく、"
     "「黒崎」のように丁目を省略した地区名でも解決できることがあるので、"
@@ -179,6 +184,15 @@ async def _run_loop(
     if image_item_name:
         user_content = f"(画像から推定した品目名: {image_item_name})\n\n{prompt}"
 
+    # 特定品目ではなく、ごみ種別そのものの手続き・収集日を尋ねる質問
+    # (要件5-1、`router.category_procedure_intent` 参照)。この経路でも
+    # 品目検索の結果を一切信用しない(下の search_waste_item 分岐で判定)。
+    _pre_ward, _pre_town = extract_region(prompt)
+    category_intent = (
+        None if image_item_name
+        else category_procedure_intent(prompt, _pre_ward, _pre_town)
+    )
+
     messages: list[dict] = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
@@ -211,10 +225,11 @@ async def _run_loop(
 
             if call.name == "search_waste_item":
                 query = call.arguments.get("query") or ""
-                if not _query_grounded_in_text(query, user_content):
-                    # 本文に無い品目名をモデルが作り出した(5-1 ガード)。
-                    # ツール応答はループの文脈には残すが、検索結果としては
-                    # 採用しない。
+                if category_intent is not None or not _query_grounded_in_text(query, user_content):
+                    # このターンが特定品目ではなくごみ種別そのものの質問
+                    # (category_intent)か、本文に無い品目名をモデルが
+                    # 作り出した(5-1 ガード)。ツール応答はループの文脈には
+                    # 残すが、検索結果としては採用しない。
                     continue
                 if not detected_item:
                     detected_item = query
@@ -233,6 +248,15 @@ async def _run_loop(
 
             elif call.name == "search_general_info":
                 for chunk in result.get("results", []):
+                    if category_intent is not None:
+                        # 種別そのものの質問では、埋め込み類似度だけで
+                        # 無関係なページ(「ふれあい収集」等)が高スコアで
+                        # 混入しうる(router.py.general_info_for_category と
+                        # 同じ理由)。本文に種別名が実際に含まれているものだけ
+                        # 信頼する。
+                        text = chunk.get("text") or ""
+                        if category_intent[0] not in text:
+                            continue
                     collected_explanations.append(chunk)
                     if chunk.get("source_url"):
                         sources.append(chunk["source_url"])
@@ -273,6 +297,26 @@ async def _run_loop(
             if note:
                 district_notes.append(note)
 
+    if category_intent is not None and not collected_schedules:
+        # 種別そのものの収集日質問(「家庭ごみの日を教えてください」)。
+        # search_waste_item は上のガードで一切採用しないので、品目を介さず
+        # 種別名を直接 waste_type として収集日を引く。
+        category_waste_type, category_schedule_like = category_intent
+        if category_schedule_like:
+            filled = _fill_schedule_for_waste_type(
+                prompt, category_waste_type, detected_ward, detected_town
+            )
+            if filled is not None:
+                schedules, note, ward, town = filled
+                for sched in schedules:
+                    collected_schedules.append(SimpleNamespace(**sched))
+                    if sched.get("source_url"):
+                        sources.append(sched["source_url"])
+                detected_ward = detected_ward or ward
+                detected_town = detected_town or town
+                if note:
+                    district_notes.append(note)
+
     if not (collected_items or collected_schedules or collected_explanations):
         # 何も拾えなければ、呼び出し側で決定論的経路にフォールバックさせる。
         return None
@@ -306,6 +350,18 @@ def _fill_missing_schedule(
     以外)なら曜日という概念自体が無いので何もしない。
     """
     disposal_method = getattr(item, "disposal_method", None)
+    return _fill_schedule_for_waste_type(prompt, disposal_method, existing_ward, existing_town)
+
+
+def _fill_schedule_for_waste_type(
+    prompt: str,
+    disposal_method: str | None,
+    existing_ward: str | None,
+    existing_town: str | None,
+) -> tuple[list[dict], str | None, str | None, str | None] | None:
+    """`_fill_missing_schedule` の中身(品目に依存しない部分)。ごみ種別
+    そのものの質問(`category_procedure_intent`)にも同じ解決ロジックを
+    再利用するため、品目から切り離してある。"""
     if disposal_method not in _CURBSIDE_WASTE_TYPES:
         return None
 
@@ -416,6 +472,32 @@ def _dedupe(urls: list[str]) -> list[str]:
     return out
 
 
+def _filter_schedules_to_known_items(
+    items: list[SimpleNamespace], schedules: list[SimpleNamespace]
+) -> list[SimpleNamespace]:
+    """`schedules` を、実際に見つかっている品目の `disposal_method` に
+    対応するものだけへ絞り込み、かつ重複を除く。
+
+    2026-09-14 レビュー指摘: モデルが `lookup_collection_schedule` を
+    見つかった品目とは無関係な `waste_type` で(自発的に、または混乱して)
+    呼んだ場合、そのまま context に混ざると「市が収集しないもの」の品目
+    (洗濯機・冷蔵庫等)に無関係な粗大ごみ収集日が付いてしまう。`items` が
+    空(品目とは無関係の収集日質問)のときはこの絞り込みをしない。
+    """
+    deduped: list[SimpleNamespace] = []
+    seen: set[tuple] = set()
+    known_types = {it.disposal_method for it in items} if items else None
+    for s in schedules:
+        if known_types is not None and s.waste_type not in known_types:
+            continue
+        key = (s.ward, s.town, s.waste_type, s.weekday)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(s)
+    return deduped
+
+
 def _build_context_text(
     items: list[SimpleNamespace],
     schedules: list[SimpleNamespace],
@@ -434,23 +516,28 @@ def _build_context_text(
                 lines.append(f"  備考: {it.notes}")
         blocks.append("\n".join(lines))
 
+    schedules = _filter_schedules_to_known_items(items, schedules)
     if schedules:
         lines = ["## 収集日の検索結果(エージェントが検索)"]
         for s in schedules:
             lines.append(f"- {s.ward}{s.town} / {s.waste_type}: {s.weekday}")
-        if any(s.waste_type == "粗大ごみ" for s in schedules):
-            # router.py の同じ注記と揃える(2026-09-10 追加)。粗大ごみは
-            # 事前申込制だが、申込の説明だけで済ませて収集曜日そのものを
-            # 省略されると「具体的な収集曜日を漏らす」という別の問題になる。
-            # 曜日の明記を先に、申込の要否は追加条件として明示する順で書く
-            # (どちらも必須、二択にしない)。
-            lines.append(
-                "  ※ 事前申込制。上記の収集曜日(申込後にこの曜日に収集される)を"
-                "必ず回答に明記すること。申込の説明だけで済ませて曜日を省略しない。"
-                "その上で、申込なしにはこの曜日へ出せないこと、"
-                "事前に粗大ごみ受付センター(電話: 093-513-3005)へ電話、"
-                "またはインターネットで申込む必要があることも併せて伝える。"
-            )
+            if s.waste_type == "粗大ごみ":
+                # 注記はこの行(粗大ごみ)にだけ付ける — 他のごみ種別
+                # (家庭ごみ等)の収集日に誤って適用されないようにするため
+                # (2026-09-14 レビュー指摘: 毛布(家庭ごみ)が布団(粗大ごみ)
+                # の事前申込条件を引き継いでしまう不具合の再発防止。以前は
+                # ブロック全体に1回だけ付けていた)。粗大ごみは事前申込制だが、
+                # 申込の説明だけで済ませて収集曜日そのものを省略されると
+                # 「具体的な収集曜日を漏らす」という別の問題になる。曜日の
+                # 明記を先に、申込の要否は追加条件として明示する順で書く
+                # (どちらも必須、二択にしない)。
+                lines.append(
+                    "  ※ 事前申込制。上記の収集曜日(申込後にこの曜日に収集される)を"
+                    "必ず回答に明記すること。申込の説明だけで済ませて曜日を省略しない。"
+                    "その上で、申込なしにはこの曜日へ出せないこと、"
+                    "事前に粗大ごみ受付センター(電話: 093-513-3005)へ電話、"
+                    "またはインターネットで申込む必要があることも併せて伝える。"
+                )
         for note in district_notes or ():
             lines.append(f"  ※ {note}")
         blocks.append("\n".join(lines))

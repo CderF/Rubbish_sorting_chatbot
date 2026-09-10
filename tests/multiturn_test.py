@@ -116,6 +116,31 @@ def test_update_state_records_every_item_hit_not_just_the_first(monkeypatch):
     assert state.items == ["ソファーベッド", "冷蔵庫(冷凍冷蔵庫)"]
 
 
+def test_update_state_does_not_record_unreliable_analogy_hits():
+    """2026-09-14 レビュー指摘の回帰: 4-3確度ゲートで弾かれた類推候補
+    (`analogy_unreliable`)は、WebUI表示用に `item_hits` へ残っているだけで
+    根拠として信頼できないので、セッション状態には書き込まない。地域は
+    (品目とは独立に確定した情報なので)通常どおり更新してよい。"""
+    state = SessionState()
+    routed = _routed(item_hits=[_item_hit("セグウェイに近い何か")], ward="小倉北区")
+    routed.analogy_unreliable = True
+    update_state(state, "セグウェイはどう捨てますか", routed)
+    assert state.items == []
+    assert state.ward == "小倉北区"
+
+
+def test_correction_to_a_canonical_alias_item_records_the_resolved_name():
+    """5-2 #47 の回帰: 「冷蔵庫じゃなくてテレビでした」の訂正後、state には
+    (曖昧な部分一致ではなく)`resolve_canonical_alias` が解決する正式名
+    「テレビ(ブラウン管式・液晶式・プラズマ式)」が入る ― 品目検索の結果
+    (`item_hits[0].item_name`)をそのまま使う設計により、別名解決さえ
+    正しく効けば自動的に満たされる。"""
+    state = SessionState(items=["冷蔵庫(冷凍冷蔵庫)"])
+    routed = _routed(item_hits=[_item_hit("テレビ(ブラウン管式・液晶式・プラズマ式)", "市が収集しないもの")])
+    update_state(state, "冷蔵庫じゃなくてテレビでした", routed)
+    assert state.items == ["テレビ(ブラウン管式・液晶式・プラズマ式)"]
+
+
 # --- merge_with_state ------------------------------------------------------
 def test_merge_is_a_no_op_for_the_common_single_item_case(monkeypatch):
     def boom(*a, **k):

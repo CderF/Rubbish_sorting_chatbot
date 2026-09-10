@@ -92,11 +92,20 @@ def update_state(state: SessionState, prompt: str, routed: RoutedAnswer) -> None
     複数ヒットしても最終的に1件へ絞る)だが、`item_hits[0]` だけを見ると
     将来その絞り込みが緩んだ場合に静かに品目を取りこぼすため、全件を見る
     (2026-09-10 レビュー指摘)。
+
+    確度が低い類推(`analogy_unreliable`、4-3確度ゲート対象)は書き込まない
+    ― `item_hits` はWebUI表示のために残っているだけで、根拠として信頼できる
+    候補ではないため。これをそのまま書き込むと、次のターン以降でも
+    信頼できない品目が「確立した品目」として再検索され続けてしまう
+    (2026-09-14 レビュー指摘)。
     """
     if routed.detected_ward:
         state.ward = routed.detected_ward
     if routed.detected_town:
         state.town = routed.detected_town
+
+    if routed.analogy_unreliable:
+        return
 
     resolved_names = []
     for hit in routed.item_hits:

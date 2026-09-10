@@ -117,8 +117,11 @@ def test_timeline_method_uses_only_the_structured_exact_date():
 def test_search_item_returns_hits_and_stage(monkeypatch):
     # the stage is kept for the WebUI 根拠 panel (#12); the answer logic uses
     # _classify_item_match instead.
+    # 「テレビ」は resolve_canonical_alias の対象になった(2026-09-14、
+    # 正式名「テレビ(ブラウン管式・液晶式・プラズマ式)」に固定される)ので、
+    # この汎用の exact-match 確認には別名工を使う。
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: _rec(n))
-    assert _search_item("テレビ") == ([_rec("テレビ")], "exact")
+    assert _search_item("傘") == ([_rec("傘")], "exact")
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
     monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [])

@@ -32,7 +32,17 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 DB_PATH = os.path.join(tempfile.mkdtemp(), "town_range_test.db")
-os.environ["DB_PATH"] = DB_PATH
+# `os.environ["DB_PATH"]` は意図的にここでは設定しない(下の
+# `if __name__ == "__main__":` 内でのみ設定する)。このファイルには
+# pytest 用の `test_*` 関数が無く単体スクリプトとして実行する前提だが、
+# ファイル名が `*_test.py` に一致するため `pytest tests/` はこのモジュール
+# を import してしまう。モジュール直下で環境変数を書き換えると、
+# `app.rag.router._district_groups`/`_town_candidates` 等の
+# `functools.lru_cache` がこの空の一時DBを掴んだまま、同じプロセスで動く
+# 他のテストファイル全部に波及して汚染する(2026-09-14 レビュー指摘で
+# 実害を確認・特定)。実行方法(モジュール先頭のdocstring参照)は
+# `python3 tests/collection_schedule_town_test.py` なので、
+# `if __name__ == "__main__":` の中でだけ設定すれば実害なく両立できる。
 
 from app.data import db  # noqa: E402
 from app.data.schema import CollectionSchedule  # noqa: E402
@@ -114,4 +124,5 @@ def main():
 
 
 if __name__ == "__main__":
+    os.environ["DB_PATH"] = DB_PATH
     sys.exit(main())

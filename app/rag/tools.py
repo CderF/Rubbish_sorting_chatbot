@@ -27,7 +27,7 @@ from typing import Any, Callable
 
 from app.data.lookup import lookup_collection_schedule, lookup_item_exact, lookup_item_partial
 from app.notices.lookup import pending_change
-from app.rag.router import _district_groups, _uniform_district_schedule
+from app.rag.router import _district_groups, _uniform_district_schedule, resolve_canonical_alias
 from app.rag.vector_store import vector_search_explanations, vector_search_items
 
 # --- OpenAI-style function-calling スキーマ ---------------------------------
@@ -155,6 +155,16 @@ def _tool_search_waste_item(query: str) -> dict:
     query = (query or "").strip()
     if not query:
         return {"error": "query is required"}
+
+    # 既知の品名の言い換え(「テレビ」→「テレビ(ブラウン管式・液晶式・
+    # プラズマ式)」等)は、部分一致の並び順やベクトル距離の揺れに任せず
+    # 正式名へ先に固定する(router.py._search_item と同じ、共通の
+    # resolve_canonical_alias)。
+    canonical = resolve_canonical_alias(query)
+    if canonical:
+        exact = lookup_item_exact(canonical)
+        if exact:
+            return {"match_stage": "exact", "items": [_serialize_item(exact)]}
 
     exact = lookup_item_exact(query)
     if exact:
