@@ -185,6 +185,8 @@ LLMに渡して「見つかりませんでした」と言わせるのではな�
 | 6-4 WebUIページのUI詳細 | `/knowledge`ページのデザインパターンを踏襲するかどうかの最終確認 | FANG/周 | 実装着手時 |
 | STAGE05マージ後の多ターン回帰確認 | PR #24マージ後、STAGE06ゲートが多ターン文脈でも破綻しないか確認 | FANG/周 | PR #24マージ後(別タスク) |
 
+※ 各項目の担当A/Bへの割り当ては §7.6 を参照。
+
 ---
 
 ## 6. 検証方針(実装時に適用)
@@ -195,3 +197,92 @@ STAGE04で確立した検証フローを踏襲する:
 - 既存162件のテスト(STAGE01〜05・webui-knowledge-manage)が全てグリーンのまま維持されることを実装完了条件とする
 - 6-1他都市名ブラックリストは、北九州市の実在地名(区名・町名)を対象とした誤検知ゼロテストを追加
   (4-3のときの`tests/stage4_grader_replay_test.py`と同じ考え方: 実際に採点で使われた質問文での回帰)
+
+---
+
+## 7. 分担(2名並行開発)
+
+`_blocking_route`への共有編集を1箇所に閉じ込め、FANG(Teamb2)と周(Teamb4)が同一基線から
+並行開発できるようにする。検出ロジックは新モジュール`app/rag/safety.py`に隔離し、
+`_blocking_route`からは入口で1回呼ぶだけにする。
+
+### 7.1 Phase 0 — 足場(どちらか1名、最初にマージする)
+
+ブランチ`feat/stage06-scaffold`。契約だけを用意し、検出ロジックは入れない。
+
+1. `app/rag/safety.py`(新規):
+
+   ```python
+   @dataclass(frozen=True)
+   class SafetyVerdict:
+       gate: str          # "6-1a" / "6-2" / "6-3"
+       reply: str
+
+   def check_entry_gate(prompt, ward, town) -> "SafetyVerdict | None":
+       return None        # 担当A が 6-1a / 6-2 を実装
+
+   def no_result_reply() -> str:
+       return ""          # 担当B が 6-3 の文言を実装
+   ```
+
+2. `app/rag/types.py`: `RoutedAnswer`に`safety_gate: str | None = None`を追加。
+3. `app/rag/router.py` `_blocking_route`:
+   - 入口(`extract_turn`より前)に`ward, town = extract_region(prompt)` →
+     `check_entry_gate(prompt, ward, town)`の呼び出しと、非Noneなら`canned_response`を立てて
+     即`return`するブロック。位置に`# --- 6-1a/6-2 gate ---`の標識コメントを置く。
+   - 末尾(空振り判定の近く)に`# --- 6-3 fallback ---`の標識コメントだけを置く。
+4. `build_trace_record()` / `describe_sources()`に`"safety_gate": ans.safety_gate`を追加。
+
+Phase 0をマージ後、担当A・Bは新しい`main`から各自ブランチを切り、以降は完全に並行。
+
+### 7.2 担当A(FANG / Teamb2)— 入口安全ゲート(6-1a・6-2・6-1b/c回帰)
+
+ブランチ`feat/stage06-entry-gate`。
+
+| 対象 | 内容 |
+|---|---|
+| 占有ファイル | `app/rag/safety.py`(`check_entry_gate`と語彙リスト全体)、`tests/stage06_entry_gate_test.py`(新規) |
+| 6-1(a) | ごみ語彙ホワイトリスト → 無ければ範囲外。ごみ語彙有 + 他都市名ブラックリスト該当 → 範囲外。`ward`が北九州市内区名なら誤検出を上書き解除(§2.1) |
+| 6-2 | 危険処分の動詞・表現 × ごみ処分の文脈語の共起で発火。v1はcannedのみ(「既存データがあれば正規の出し方」は結合後の別タスク) |
+| 6-1(b)(c) | ほぼ回帰テスト(`市が収集しないもの`の備考連絡先、区のみ→町名要求)。上記の新規テストに含める |
+| §5未決 | 他都市名ブラックリスト初版、危険処分の動詞・表現リスト初版 を起草・commit |
+| 依存 | Phase 0のみ。`server.py` / `webui.html`は触らない |
+
+### 7.3 担当B(周 / Teamb4)— 空振りフォールバック(6-3)+ トレース閲覧UI(6-4)
+
+ブランチ`feat/stage06-trace-ui`。
+
+| 対象 | 内容 |
+|---|---|
+| 占有ファイル | `app/server.py`(新規ルート追加のみ)、`app/trace.html`(新規、または`LOGIN_PAGE`同様のインライン)、`tests/stage06_trace_test.py`(新規) |
+| 6-3 | `safety.py`の`no_result_reply()`を実装(担当Aと別関数)。`_blocking_route`末尾の`# --- 6-3 fallback ---`に、`ans.found is False`かつ他のcanned未発火かつ`ans.safety_gate is None`のとき`canned_response`を立てるブロックを追加(数行。担当Aの入口ブロックとは別ハンク) |
+| 6-4 | `GET /trace`(`require_login`)。`var/stage4_trace.jsonl`末尾N行を読み、セッション/リクエスト単位で 地区・品目・マッチ段階(exact/partial/vector/analogy)・`sources`・`safety_gate`(6-1a/6-2/6-3/なし)・4-2/4-3項 を表形式で表示。認証・設計は`/knowledge`ページ(`feat/webui-knowledge-manage`)を踏襲。`webui.html`ヘッダに「トレース」ボタンを追加 |
+| §5未決 | 6-3の固定文言(窓口番号)を確認・確定。6-4のUI詳細 |
+| 依存 | Phase 0の`safety_gate`フィールドのみ |
+
+### 7.4 共有ファイルの編集境界(コンフリクトが起きないことの確認)
+
+| ファイル | Phase 0 | 担当A | 担当B |
+|---|---|---|---|
+| `app/rag/safety.py` | 骨組み | `check_entry_gate` + 語彙リスト | `no_result_reply()` |
+| `app/rag/router.py` `_blocking_route` | 2箇所に標識コメント | 入口ゲートのブロック | 末尾フォールバックのブロック |
+| `app/rag/types.py` / `build_trace_record` / `describe_sources` | `safety_gate`追加 | — | — |
+| `app/server.py` | — | — | `/trace`ルート追加 |
+| `app/webui.html` | — | — | トレースボタン追加 |
+
+### 7.5 マージ順序と後続
+
+- Phase 0を先にマージ。担当A・Bのブランチに前後関係は無く、完成順にマージしてよい
+  (`safety.py`を両者が触るため、後にマージする側が小さくrebase)。
+- 両ブランチとPR #24(STAGE05)がマージされた後、§5最終行の多ターン回帰を別タスクで実施。
+
+### 7.6 §5未決事項の担当割り当て
+
+| §5の項目 | 担当 |
+|---|---|
+| STAGE06公式採点基準・サンプル問題 | 運営方 → A/B(配布後に§2を更新) |
+| 6-1 他都市名ブラックリストの具体的リスト | A |
+| 6-2 危険処分の動詞・表現リストの具体的内容 | A |
+| 6-3の固定文言(窓口番号等) | B |
+| 6-4 WebUIページのUI詳細 | B |
+| STAGE05マージ後の多ターン回帰確認 | A/B(共同・別タスク) |
