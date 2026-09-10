@@ -30,6 +30,7 @@ import os
 import secrets
 import sys
 import time
+import urllib.parse
 import uuid
 from collections import OrderedDict
 from io import BytesIO
@@ -39,6 +40,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
+    PlainTextResponse,
     RedirectResponse,
     StreamingResponse,
 )
@@ -54,7 +56,19 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from app.notices import admin as notice_admin  # noqa: E402
 from app.rag import agent, knowledge, router  # noqa: E402  (sys.path 調整後に import)
+
+# ナレッジ管理API(お知らせの取り込み/削除)は waste_items を直接書き換えるが、
+# それだけではベクトル索引(var/chroma/)に反映されない。反映し忘れると、
+# 削除・変更したはずの内容が vector 検索フォールバックから拾われ続ける。
+# router.py と同じフォールバック方針: 重い依存が無い環境でも import は通す。
+try:
+    from app.rag.vector_store import build_item_index
+except ImportError:
+
+    def build_item_index() -> int:
+        return 0
 
 MODEL_NAME = "Qwen3-VL-8B-Instruct"
 # Where the downloaded weights live. Override per machine via MODEL_PATH so the
@@ -495,10 +509,72 @@ async def info(_=Depends(require_login)):
 # --------------------------------------------------------------------------
 @app.get("/knowledge")
 async def knowledge_list(_=Depends(require_login)):
-    """取り込み済みの参照元ページ一覧。DB未作成なら available=false を返す。"""
+    """取り込み済みの参照元ページ一覧。DB未作成なら available=false を返す。
+
+    `notice_files` は配布お知らせファイルの管理用リスト(アップロード済み ∪
+    取り込み済み)。クロールしたページは従来どおり `sources` に入る。
+    """
     data = await asyncio.to_thread(knowledge.list_sources)
     data["using_stubs"] = router.using_stubs()
+    data["notice_files"] = await asyncio.to_thread(notice_admin.status_payload)
     return data
+
+
+# --- 配布お知らせファイルの管理 (WebUI ナレッジ一覧) ----------------------
+#   /knowledge/files...  という2階層以上のパスなので、単一セグメントの
+#   /knowledge/{source_id} とは衝突しない。すべて require_login の後ろ。
+@app.post("/knowledge/files")
+async def notice_file_upload(request: Request, name: str, _=Depends(require_login)):
+    """お知らせ .md をアップロードして incoming に保存する(取り込みはしない)。
+    本文がそのままファイル内容、`?name=` がファイル名。"""
+    body = await request.body()
+    try:
+        return await asyncio.to_thread(notice_admin.save_notice_file, name, body)
+    except notice_admin.NoticeFileError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+
+@app.post("/knowledge/files/{name}/ingest")
+async def notice_file_ingest(name: str, _=Depends(require_login)):
+    """保存済みファイルを取り込む。取り込み済みなら旧レコードを消してから再取り込み。"""
+    try:
+        result = await asyncio.to_thread(
+            notice_admin.with_rw_conn, lambda c: notice_admin.ingest_saved_file(c, name)
+        )
+    except notice_admin.NoticeFileError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    await asyncio.to_thread(build_item_index)
+    return result
+
+
+@app.delete("/knowledge/files/{name}")
+async def notice_file_delete(name: str, _=Depends(require_login)):
+    """取り込みで作った waste_items 行を消し(前身行は is_current を復元)、ファイルも削除。"""
+    try:
+        result = await asyncio.to_thread(
+            notice_admin.with_rw_conn, lambda c: notice_admin.delete_notice_file(c, name)
+        )
+    except notice_admin.NoticeFileError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    await asyncio.to_thread(build_item_index)
+    return result
+
+
+@app.get("/knowledge/files/{name}/raw")
+async def notice_file_raw(name: str, download: int = 0, _=Depends(require_login)):
+    """ファイル原文をそのまま返す。`?download=1` で添付ダウンロードにする。"""
+    try:
+        text = await asyncio.to_thread(notice_admin.raw_notice_text, name)
+        base = notice_admin.safe_name(name)
+    except notice_admin.NoticeFileError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    headers = None
+    if download:
+        quoted = urllib.parse.quote(base)
+        headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quoted}"}
+    return PlainTextResponse(
+        text, headers=headers, media_type="text/markdown; charset=utf-8"
+    )
 
 
 @app.get("/knowledge/{source_id}")
