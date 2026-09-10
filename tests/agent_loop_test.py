@@ -226,6 +226,182 @@ def test_unrelated_extra_search_call_does_not_pollute_context(monkeypatch):
     asyncio.run(body())
 
 
+def test_item_search_with_a_query_absent_from_the_prompt_is_not_trusted(monkeypatch):
+    """5-1 の回帰テスト: 品目名を一切含まない発言(地域名だけ)に対して
+    モデルが search_waste_item を存在しない品目名で呼んでも、それを根拠に
+    しない。
+
+    2026-09-10、B1実機の複数ターン会話で「小倉北区浅野1丁目です」
+    (品目名を一切含まない発言)に対し、モデルが `車いす(電動式を除く)` を
+    検索して見つけたことにし、それを根拠に無関係な回答を生成する事例が
+    見つかった(要件5-1「推測せず確認する」への違反)。他に何も拾えなければ
+    `route_agentically` は None を返し、呼び出し側が決定論的経路
+    (「該当する情報が見つかりませんでした」)にフォールバックすること。"""
+
+    def fake_execute_tool(name, arguments):
+        assert name == "search_waste_item"
+        assert arguments == {"query": "車いす"}
+        return {
+            "match_stage": "vector",
+            "items": [
+                {
+                    "item_name": "車いす(電動式を除く)",
+                    "disposal_method": "粗大ごみ",
+                    "notes": "",
+                    "source_url": "https://example.test/wheelchair",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    _TOOL_CALL_MADE_UP = (
+        "<tool_call>\n"
+        '{"name": "search_waste_item", "arguments": {"query": "車いす"}}\n'
+        "</tool_call>"
+    )
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_MADE_UP, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "小倉北区浅野1丁目です", engine=engine, build_prompt=_build_prompt,
+            sampling_params=object(),
+        )
+        # 品目・収集日・一般説明のいずれも実質的に拾えていないので、呼び出し
+        # 側で決定論的経路にフォールバックさせる None を返す。
+        assert result is None
+
+    asyncio.run(body())
+
+
+def test_item_search_with_a_query_present_in_the_prompt_is_still_trusted(monkeypatch):
+    """上のガードが、本文に実在する品目名まで誤って弾かないことを確認する
+    (既存の正常系の維持)。"""
+
+    def fake_execute_tool(name, arguments):
+        if name == "search_waste_item":
+            assert arguments == {"query": "テレビ"}
+            return {
+                "match_stage": "exact",
+                "items": [
+                    {
+                        "item_name": "テレビ",
+                        "disposal_method": "粗大ごみ",
+                        "notes": "事前申込制",
+                        "source_url": "https://example.test/tv",
+                    }
+                ],
+            }
+        if name == "lookup_collection_schedule":
+            # _fill_missing_schedule がコード側から直接呼ぶ(品目は見つかった
+            # が、モデルがこのツールを自発的に呼ばなかった場合の安全策)。
+            return {"schedules": []}
+        raise AssertionError(f"unexpected tool call: {name}")
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_TV, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "小倉北区城内でテレビはどう捨てますか", engine=engine,
+            build_prompt=_build_prompt, sampling_params=object(),
+        )
+        assert result is not None
+        assert result.item_hits[0].item_name == "テレビ"
+
+    asyncio.run(body())
+
+
+def test_single_character_item_name_is_not_falsely_blocked_by_the_grounding_gate(
+    monkeypatch,
+):
+    """2026-09-10 レビュー指摘の回帰: `_query_grounded_in_text` が「2文字以上
+    の共通する連続部分列」だけを見ていると、「傘」のような1文字の品目名は
+    それ自体の長さが1しかないため常に弾かれてしまっていた。本文にそのまま
+    含まれる(部分文字列として一致する)場合は文字数に関わらず信頼する。"""
+
+    def fake_execute_tool(name, arguments):
+        if name == "search_waste_item":
+            assert arguments == {"query": "傘"}
+            return {
+                "match_stage": "exact",
+                "items": [
+                    {
+                        "item_name": "傘",
+                        "disposal_method": "燃えないごみ",
+                        "notes": "",
+                        "source_url": "https://example.test/kasa",
+                    }
+                ],
+            }
+        if name == "lookup_collection_schedule":
+            return {"schedules": []}
+        raise AssertionError(f"unexpected tool call: {name}")
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    _TOOL_CALL_KASA = (
+        "<tool_call>\n"
+        '{"name": "search_waste_item", "arguments": {"query": "傘"}}\n'
+        "</tool_call>"
+    )
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_KASA, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "傘はどう捨てますか", engine=engine, build_prompt=_build_prompt,
+            sampling_params=object(),
+        )
+        assert result is not None
+        assert result.item_hits[0].item_name == "傘"
+
+    asyncio.run(body())
+
+
+def test_single_hiragana_character_query_is_not_trusted_even_if_substring_matches(
+    monkeypatch,
+):
+    """2026-09-10 レビュー指摘の回帰: 「傘」のような1文字品目名を通すために
+    部分文字列一致を先に見るようにした結果、query が「す」のようなひらがな
+    1文字だと「です」「ます」等の語尾にほぼ必ず含まれてしまい、部分文字列
+    一致だけでは弾けなくなっていた。「小倉北区浅野1丁目です」
+    (品目名を一切含まない発言)に対しモデルが query="す" で
+    search_waste_item を呼んでも、それを根拠にしない。"""
+
+    def fake_execute_tool(name, arguments):
+        assert name == "search_waste_item"
+        assert arguments == {"query": "す"}
+        return {
+            "match_stage": "vector",
+            "items": [
+                {
+                    "item_name": "車いす(電動式を除く)",
+                    "disposal_method": "粗大ごみ",
+                    "notes": "",
+                    "source_url": "https://example.test/wheelchair",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    _TOOL_CALL_SU = (
+        "<tool_call>\n"
+        '{"name": "search_waste_item", "arguments": {"query": "す"}}\n'
+        "</tool_call>"
+    )
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_SU, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "小倉北区浅野1丁目です", engine=engine, build_prompt=_build_prompt,
+            sampling_params=object(),
+        )
+        assert result is None
+
+    asyncio.run(body())
+
+
 def test_tool_execution_exception_is_caught_and_returns_none(monkeypatch):
     def raising_execute_tool(name, arguments):
         raise RuntimeError("boom")

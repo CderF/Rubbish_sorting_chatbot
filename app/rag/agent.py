@@ -67,9 +67,11 @@ from typing import Any, Awaitable, Callable
 
 from app.rag.router import (
     _CURBSIDE_WASTE_TYPES,
+    _KANA_ONLY_RE,
     _analogy_pick,
     _match_district,
     _override_analogy_hits,
+    _shared_run_len,
     extract_region,
 )
 from app.rag.tool_call_parser import ToolCall, parse_tool_calls
@@ -80,7 +82,10 @@ _SYSTEM_PROMPT = (
     "あなたは北九州市のごみ分別・収集日を案内するアシスタントの検索エージェントです。\n"
     "ユーザーの質問に直接答えず、まずは提供されたツールを使って必要な情報を"
     "集めることに専念してください。\n"
-    "- 品目の分別方法を調べるには search_waste_item を使う。\n"
+    "- 品目の分別方法を調べるには search_waste_item を使う。"
+    "本文に品目名として解釈できる語が一切含まれていない発言"
+    "(地域名や訂正だけの発言など)では、品目名を作り出して呼んではならない。"
+    "その場合は品目名が分からないものとして扱う。\n"
     "- 収集曜日を調べるには lookup_collection_schedule を使う"
     "(区名と町名が分かっているときに呼ぶ。町名は丁目まで分からなくてもよく、"
     "「黒崎」のように丁目を省略した地区名でも解決できることがあるので、"
@@ -99,6 +104,44 @@ _TOOL_CALL_MAX_TOKENS = 300
 
 def _norm(s: str) -> str:
     return unicodedata.normalize("NFKC", s or "").strip()
+
+
+def _query_grounded_in_text(query: str, text: str) -> bool:
+    """モデルが呼んだ search_waste_item の `query` が、実際にこのターンの
+    発言に基づくものかを検査する。
+
+    2026-09-10、B1実機の複数ターン会話で「小倉北区浅野1丁目です」
+    (品目名を一切含まない、地域名だけの発言)に対し、モデルが
+    search_waste_item を実在しない品目名(会話に一度も出ていない語)で
+    呼び、それを根拠に無関係な回答を生成する事例を確認した
+    (要件5-1「推測せず確認する」への違反)。プロンプトへの指示だけでは
+    小型モデルが必ず守るとは限らない(4-3確度ゲート等、既存の設計判断と
+    同じ理由)ため、コード側でも検証する。
+
+    発言中に `query` がそのまま(正規化後)部分文字列として現れるか、2文字
+    以上の共通する連続部分列があれば「本文から拾った」とみなす。前者を先に
+    見るのは、「傘」のような1文字の品目名だと連続部分列の長さが1にしか
+    ならず、後者の条件だけでは常に弾かれてしまうため(2026-09-10 レビュー
+    指摘で発覚)。
+
+    ただし、ひらがなだけの1文字(「す」等)は、部分文字列として容易に
+    見つかってしまう(「です」「ます」等の語尾・助詞にほぼ必ず含まれる)ため
+    部分文字列一致だけでは弾けない。2026-09-10、「小倉北区浅野1丁目です」
+    (品目名を一切含まない発言)から、モデルが query="す" で
+    search_waste_item を呼び、「す」が発言に含まれることを理由に
+    採用されてしまう再発を確認した(レビュー指摘)。ひらがな1文字はこの
+    判定より先に弾く(「傘」のような漢字1文字の品目名はこの対象外)。
+    どちらの条件も満たさなければ、本文には無い語をモデルが作り出したとみなし、
+    結果を採用しない。
+    """
+    q, t = _norm(query), _norm(text)
+    if not q:
+        return False
+    if _KANA_ONLY_RE.match(q) and len(q) < 2:
+        return False
+    if q in t:
+        return True
+    return _shared_run_len(q, t) >= 2
 
 
 async def route_agentically(
@@ -167,8 +210,14 @@ async def _run_loop(
             messages.append({"role": "tool", "content": json.dumps(result, ensure_ascii=False)})
 
             if call.name == "search_waste_item":
+                query = call.arguments.get("query") or ""
+                if not _query_grounded_in_text(query, user_content):
+                    # 本文に無い品目名をモデルが作り出した(5-1 ガード)。
+                    # ツール応答はループの文脈には残すが、検索結果としては
+                    # 採用しない。
+                    continue
                 if not detected_item:
-                    detected_item = call.arguments.get("query")
+                    detected_item = query
                 items = [SimpleNamespace(**item) for item in result.get("items", [])]
                 item_call_results.append((result.get("match_stage"), items))
 

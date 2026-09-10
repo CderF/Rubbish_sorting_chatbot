@@ -217,6 +217,16 @@ def _district_groups(ward: str) -> dict[str, tuple[str, ...]]:
     return {base: tuple(towns) for base, towns in groups.items() if len(towns) > 1}
 
 
+# `_has_plausible_item_text` が候補から先に取り除く、品目名には現れない
+# 会話の相槌・丁寧表現。地区の確認・訂正だけの発言(「すみません、やっぱり
+# 〜でした」)がまるごと品名候補になってしまうのを防ぐ。
+_FILLER_WORDS = (
+    "すみません", "やっぱり", "でした", "ですが", "ですけど",
+    "お願いします", "ください", "教えてください",
+)
+_FILLER_RE = re.compile("(" + "|".join(_FILLER_WORDS) + ")")
+
+
 def _match_district(ward: str, prompt: str) -> tuple[str, tuple[str, ...]] | None:
     """プロンプトに、丁目を省略した地区名が含まれるかを調べる。
 
@@ -230,6 +240,74 @@ def _match_district(ward: str, prompt: str) -> tuple[str, tuple[str, ...]] | Non
         if base and base in tail:
             return base, towns
     return None
+
+
+def _has_plausible_item_text(candidate: str, ward: str | None) -> bool:
+    """品名候補が、本当に品目名らしい実体を持つかを判定する。
+
+    2026-09-10、B1実機の複数ターン会話の再現テストで、地域だけの発言
+    (「小倉北区浅野1丁目です」)や地域訂正だけの発言(「やっぱり八幡西区
+    黒崎でした」)から、`_item_name_candidates` が正規表現の残骸(「す」)や
+    会話の相槌・丁寧表現・丁目省略の地区名(「黒崎」、地区名そのものは品目
+    ではない)を候補として拾ってしまい、それをそのままベクトル検索にかけて
+    無関係な品目(「車いす」「つっぱり棒」)を見つけてしまう不具合を確認した
+    (要件5-1「推測せず確認する」への違反、`app/rag/agent.py` の
+    `_query_grounded_in_text` と同じ動機のガードをこちら
+    ―決定論的経路― にも入れる)。`_blocking_route` が `_search_item`/
+    ベクトル検索に候補を渡す前にここで弾く。
+
+    - まず会話の相槌・丁寧表現(`_FILLER_RE`)を候補から取り除く。
+    - 丁目省略の地区名(`_match_district`)が残っていれば、それも取り除く。
+      `_district_groups` は「同じ地区名を共有する丁目が複数ある」場合しか
+      地区として登録しない(既存の設計、`_district_groups` 参照)ため、
+      町名が既に「黒崎1〜5丁目」のような結合表記で1行にまとまっている
+      データでは検出できないことがある — その場合はこの分岐が素通りする
+      既知の限界(別問題、ここでは追わない)。
+    - 上のどちらかで何かを取り除いた場合、取り除いた残りに実質的な内容
+      (かな以外を1文字も含まない)が無ければ、相槌・地区名の言い換えに
+      過ぎないとみなす。句読点・空白は文中のどこにあっても除いてから判定する。
+    - 何も取り除かれなかった候補は、ひらがなだけで2文字未満のときだけ弾く
+      (助詞・語尾の残骸である可能性が高い一方、「かご」等の実在する短い
+      ひらがな品目まで誤って弾かないため)。
+    """
+    text = _norm(candidate)
+    if not text:
+        return False
+
+    stripped = text
+    trimmed_something = False
+
+    filler_stripped = _FILLER_RE.sub("", stripped)
+    if filler_stripped != stripped:
+        trimmed_something = True
+        stripped = filler_stripped
+
+    if ward:
+        district = _match_district(ward, stripped)
+        if district:
+            base, _towns = district
+            stripped = stripped.replace(base, "")
+            trimmed_something = True
+
+    if trimmed_something:
+        remainder = _PUNCT_OR_SPACE_RE.sub("", stripped)
+        return bool(remainder) and not _KANA_ONLY_RE.match(remainder)
+
+    if _KANA_ONLY_RE.match(text):
+        if len(text) < 2:
+            return False
+        # `_item_name_candidates` の断片化・修飾語除去(`_clean_fragment`)が
+        # 相槌の一部を単独の断片として切り出すことがある(「やっぱり」→
+        # 「ぱり」)。`_FILLER_RE` はフィラー語自体を含む候補しか捉えられない
+        # ので、逆方向(候補がフィラー語の部分文字列)もここで見る
+        # (2026-09-10 レビュー指摘: 「黒崎」を正しく除去できるようになった後も
+        # 「ぱり」というひらがな2文字の残骸が生き残り、ベクトル検索で
+        # 「つっぱり棒」を誤って見つけてしまう再発を、実際の再クロール後の
+        # DB で確認した)。
+        if any(text in w or w in text for w in _FILLER_WORDS):
+            return False
+
+    return True
 
 
 def _uniform_district_schedule(
@@ -608,6 +686,11 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         item_candidates, vector_query = _item_name_candidates(
             prompt, strip_waste_words=wants_schedule
         )
+        # 品目名として実体の無い候補(地域名の言い換え・正規表現の残骸)を
+        # 検索に渡す前に弾く(要件5-1、`_has_plausible_item_text` 参照)。
+        item_candidates = [c for c in item_candidates if _has_plausible_item_text(c, ward)]
+        if vector_query is not None and not _has_plausible_item_text(vector_query, ward):
+            vector_query = None
     item_name = item_candidates[0] if item_candidates else None
     ans.detected_item = item_name
     ans.item_candidates = list(item_candidates)
@@ -899,6 +982,9 @@ def _shared_run_len(a: str, b: str) -> int:
 _KANA_ONLY_RE = re.compile(r"^[ぁ-ん]+$")
 _PAREN_TAIL_RE = re.compile(r"[(（].*$")
 _KANJI_RE = re.compile(r"[一-龥々]")
+# `_has_plausible_item_text` が地区名除去後の残りを判定する際、文中のどこに
+# あっても句読点・空白を取り除いてから見るための正規表現。
+_PUNCT_OR_SPACE_RE = re.compile(r"[\s、。「」()（）]+")
 # 末尾一致(上位語)判定で、品名の本体ではない「サイズ・動力・用途」の接頭語。
 # これらを剥がした残りに内容語(漢字2つ以上)が残るなら、末尾一致でも別品目。
 _STRENGTH_PREFIX_MODS = (
