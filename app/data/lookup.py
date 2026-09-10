@@ -102,6 +102,46 @@ def lookup_item_partial(item_name: str, limit: int = 10) -> list[WasteItem]:
     return [_row_to_waste_item(r) for r in rows]
 
 
+def lookup_item_contained_in(text: str, min_length: int = 2) -> list[WasteItem]:
+    """`text`(質問文の断片、文全体のこともある)の中に、現行の品名が連続
+    文字列として現れているものを全件返す(単純な部分文字列一致、語境界は
+    見ない)。
+
+    `lookup_item_partial` とは逆方向: あちらは「item_nameがtextを含む」
+    (`LIKE '%text%'`)なので、textが品名より長い(「廃車にした自動車を
+    処分したいのです」のような文全体)場合は原理的に何もヒットしない。
+    こちらは「textがitem_nameを含む」方向で、`app/rag/router.py` の
+    `_QUESTION_TAIL` が質問定型に一致せず文全体が候補として残るケースの
+    救済に使う(2026-09-10 実採点trace回帰)。
+
+    語境界のチェック(「捨てたらいいか」に「たらい」が偶然含まれる、のような
+    事故の排除)は呼び出し側の責務 — `app/rag/router.py` の
+    `_resolve_named_hit` が既に「直前が助詞・記号/直後が文末・助詞・質問
+    定型」という同種の判定を実装しているため、ここでは候補を絞り込みすぎず
+    全件返し、その既存ロジックに絞り込みを委ねる。1文字の品名は文中に
+    偶然含まれやすいため既定で対象外にする(`min_length`)。
+
+    括弧書きの条件(「蛍光管(環型、直型)」)を含む品名は、括弧の手前部分
+    (「蛍光管」)だけでも一致とみなす — 利用者は条件まで言わずに品名の
+    本体だけを口にすることが多いため(「蛍光管を割って…」に「蛍光管」は
+    含まれるが「蛍光管(環型、直型)」は含まれない)。
+    """
+    normalized = _normalize(text)
+    if not normalized:
+        return []
+    rows = _get_connection().execute(
+        "SELECT * FROM waste_items WHERE is_current = 1 AND length(item_name) >= ?",
+        (min_length,),
+    ).fetchall()
+    hits = []
+    for row in rows:
+        name = row["item_name"]
+        base = name.split("(")[0].split("（")[0]
+        if name in normalized or (len(base) >= min_length and base in normalized):
+            hits.append(row)
+    return [_row_to_waste_item(row) for row in hits]
+
+
 def lookup_towns(ward: str) -> list[str]:
     """区内の全町名(丁目単位に展開済み)を返す。
 

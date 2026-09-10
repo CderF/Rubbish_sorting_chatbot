@@ -25,9 +25,20 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Callable
 
-from app.data.lookup import lookup_collection_schedule, lookup_item_exact, lookup_item_partial
+from app.data.lookup import (
+    lookup_collection_schedule,
+    lookup_item_contained_in,
+    lookup_item_exact,
+    lookup_item_partial,
+)
 from app.notices.lookup import pending_change
-from app.rag.router import _district_groups, _uniform_district_schedule
+from app.rag.router import (
+    _district_groups,
+    _partial_lookup_ok,
+    _pick_embedded_item,
+    _uniform_district_schedule,
+    _vector_query_ok,
+)
 from app.rag.vector_store import vector_search_explanations, vector_search_items
 
 # --- OpenAI-style function-calling スキーマ ---------------------------------
@@ -160,9 +171,22 @@ def _tool_search_waste_item(query: str) -> dict:
     if exact:
         return {"match_stage": "exact", "items": [_serialize_item(exact)]}
 
-    partial = lookup_item_partial(query)[:5]
-    if partial:
-        return {"match_stage": "partial", "items": [_serialize_item(i) for i in partial]}
+    # 以下3つのガードは `router._search_item` と同一の規則。Agentic経路は
+    # `_blocking_route` を経由しないため、ここに入れないと既定オンの
+    # エージェント応答だけが「品名を特定できないまま断定する」状態で残る
+    # (2026-09-10 実採点trace回帰。モデルが query に何を渡すかは制御でき
+    # ないので、ツール側で同じ歯止めを掛ける)。
+    if _partial_lookup_ok(query):
+        partial = lookup_item_partial(query)[:5]
+        if partial:
+            return {"match_stage": "partial", "items": [_serialize_item(i) for i in partial]}
+
+    embedded = _pick_embedded_item(query, lookup_item_contained_in(query))
+    if embedded is not None:
+        return {"match_stage": "exact", "items": [_serialize_item(embedded)]}
+
+    if not _vector_query_ok(query):
+        return {"match_stage": "none", "items": []}
 
     vector = vector_search_items(query, top_k=3)
     return {
