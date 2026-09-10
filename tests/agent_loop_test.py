@@ -807,3 +807,51 @@ def test_message_text_extracts_text_from_image_turns():
     msg = {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "ソファ"}]}
     assert agent._message_text(msg) == "ソファ"
     assert agent._message_text({"role": "user", "content": "傘"}) == "傘"
+
+
+# --- 言い換えで解決した品目を exact として扱う(2026-09-10 第6回採点) ----------
+# モデルが query="硫酸" で検索し、ツールが包括行「薬品(家庭医薬品でないもの)」を
+# 返すと、`_build_routed_answer` は名前の一致で exact/analogy を決めるため
+# analogy に落ち、「類似する『薬品…』に準じると」というためらいのある言い回しと、
+# 類推用のプロンプト規則になっていた(B1実機のスモークテストで確認)。
+# 決定論的経路には同じ引き上げ(`_resolve_alias_hit`)が入っている。
+
+_TOOL_CALL_SULFURIC = (
+    "<tool_call>\n"
+    '{"name": "search_waste_item", "arguments": {"query": "硫酸"}}\n'
+    "</tool_call>"
+)
+_TOOL_CALL_SKATEBOARD = (
+    "<tool_call>\n"
+    '{"name": "search_waste_item", "arguments": {"query": "電動スケートボード"}}\n'
+    "</tool_call>"
+)
+
+
+def _route_with_tool(prompt: str, tool_call: str):
+    """実DBのツールを通して agentic 経路を回す(実行結果は本物の早見表から引く)。"""
+    async def body():
+        return await agent.route_agentically(
+            prompt, engine=_ScriptedEngine([tool_call]),
+            build_prompt=_build_prompt, sampling_params=object(),
+        )
+
+    return asyncio.run(body())
+
+
+def test_alias_resolved_item_is_exact_not_analogy():
+    ans = _route_with_tool(
+        "理科の実験で使った硫酸が残っているのですが、どう処分すればいいですか？",
+        _TOOL_CALL_SULFURIC,
+    )
+    assert ans is not None
+    assert ans.item_match == "exact"
+    assert ans.detected_item == "薬品(家庭医薬品でないもの)"
+    assert [h.item_name for h in ans.item_hits] == ["薬品(家庭医薬品でないもの)"]
+
+
+def test_embedded_item_hit_is_still_an_analogy():
+    """「電動スケートボード」の中の「スケートボード」は別品目なので exact にしない。"""
+    ans = _route_with_tool("電動スケートボードはどう捨てますか", _TOOL_CALL_SKATEBOARD)
+    assert ans is not None
+    assert ans.item_match == "analogy"

@@ -74,6 +74,7 @@ from app.rag.router import (
     _listed_item_extras,
     _match_district,
     _override_analogy_hits,
+    _resolve_alias_hit,
     _shared_run_len,
     category_procedure_intent,
     extract_region,
@@ -366,6 +367,24 @@ async def _run_loop(
             detected_item = (
                 getattr(collected_items[0], "item_name", None) or detected_item
             )
+        else:
+            # 言い換え表(`_CANONICAL_ALIASES`)の解決で名前が変わった場合も同じ問題が
+            # 起きる。モデルが query="硫酸" で検索し、ツールが包括行
+            # 「薬品(家庭医薬品でないもの)」を返すと、名前が一致しないため
+            # analogy 扱いになり、「類似する『薬品…』に準じると」という
+            # ためらいのある言い回しと、類推用のプロンプト規則になってしまう
+            # (B1実機のスモークテストで確認。決定論的経路には同じ解決の
+            # 引き上げ `_resolve_alias_hit` が入っている)。
+            # 完全一致の段で確定しているときだけ、解決先の正式名に合わせる。
+            alias_hit = _resolve_alias_hit(
+                user_content,
+                [detected_item or ""],
+                list(collected_items),
+            )
+            if alias_hit is not None:
+                detected_item = (
+                    getattr(alias_hit, "item_name", None) or detected_item
+                )
 
     if collected_items:
         # 品目が確定している質問では、無関係なページのチャンクを根拠から外す。
