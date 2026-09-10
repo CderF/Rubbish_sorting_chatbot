@@ -361,3 +361,35 @@ def test_new_danger_words_do_not_misfire():
         assert safety.check_entry_gate(prompt, ward=None, town=None) is None
     # 「焼いた魚」等は危険語として誤検知しない(「焼い」は追加していない)。
     assert safety.check_entry_gate("焼いた魚はどう捨てればいいですか", ward=None, town=None) is None
+
+
+# --- 6-3 補完: ごみ出しルールの否定(2026-09-10 第4回採点対応) ---------------
+# 6-3 の失敗の一部は「品名を特定できない」のではなく、明確なごみ出しルールへの
+# 確認質問だった。ルールは早見表・収集日・説明ページのどこにも無いため、
+# コード側で確定した事実として「いいえ + 正しい手順」を返す。
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "家庭ごみは深夜に出しておいても大丈夫ですよね？",
+        "事業所から出たごみを家庭ごみと一緒に出していいですか？",
+        "家にあるごみを全部まとめて1件で申し込んでもらえますか？",
+    ],
+)
+def test_waste_rule_question_gets_a_targeted_denial(prompt):
+    verdict = safety.check_entry_gate(prompt, ward=None, town=None)
+    assert verdict is not None
+    assert verdict.gate == "6-3"
+    assert verdict.blocks_search is True  # 品名検索の対象外なので即返す
+    assert "いいえ" in verdict.reply  # 禁止事項を明確に否定する
+    assert verdict.reply  # 正しい手順まで含む
+
+
+def test_waste_rule_does_not_misfire_on_normal_item_questions():
+    # 「粗大ごみを1件申し込みたい」は「まとめて」を含まない正常な質問。
+    # 「ソファ」「スプレー缶」等の通常の品目質問も素通りする。
+    for prompt in (
+        "粗大ごみを1件申し込みたいのですが",
+        "ソファを捨てたいのですが",
+        "スプレー缶はどう捨てればいいですか",
+    ):
+        assert safety.check_entry_gate(prompt, ward=None, town=None) is None
