@@ -740,7 +740,19 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     # 検索結果ゼロを LLM に渡して「見つかりませんでした」と言わせると、モデルが
     # 自前の知識で埋める失敗モード(4-3 で繰り返し確認)が未知の入力でも起きる。
     # コード側で固定文を立て、engine.generate を通さず返す。
-    if not ans.found and ans.canned_response is None and ans.safety_gate is None:
+    #
+    # `ans.missing` が非空(区名はあるが町名が無い等)のときは対象外にする
+    # (コードレビューで発見: 修正前は6-3がここを素通りせず全部拾ってしまい、
+    # build_system_prompt() の「不足している{missing}を推測せず利用者に
+    # 追加入力を促す」という既存の指示(3-1由来)を握りつぶしていた。
+    # 「本当に何も手がかりが無い」場合と「あと一歩の情報が要る」場合は
+    # 区別し、後者は従来どおりLLMに追加入力を促させる)。
+    if (
+        not ans.found
+        and not ans.missing
+        and ans.canned_response is None
+        and ans.safety_gate is None
+    ):
         reply = safety.no_result_reply()
         if reply:
             ans.canned_response = reply

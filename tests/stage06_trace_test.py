@@ -111,6 +111,21 @@ def test_a_hit_does_not_trigger_the_6_3_fallback(seeded_router):
     assert ans.canned_response is None
 
 
+def test_missing_town_asks_for_it_instead_of_the_6_3_canned_reply(empty_db):
+    # コードレビューで発見した回帰: 区名はあるが町名が無く、品目も収集日も
+    # ヒットしない(＝ ans.found is False)場合、修正前は6-3が先に拾ってしまい
+    # build_system_prompt() の「町名が必要、推測せず利用者に追加入力を促す」
+    # という既存の指示(router.py の `ans.missing`)を握りつぶしていた。
+    # 「あと一歩の情報が要る」ケースは6-3の対象外とし、従来どおり
+    # missing 経由でLLMに追加入力を促させる。
+    ans = empty_db._blocking_route("小倉北区の収集日を教えてください")
+
+    assert ans.found is False
+    assert "町名" in ans.missing
+    assert ans.safety_gate is None
+    assert ans.canned_response is None
+
+
 def test_6_3_fallback_calls_safety_no_result_reply(empty_db, monkeypatch):
     """固定文をハードコードで比較していないこと(safety 側を差し替えると追従する)。"""
     monkeypatch.setattr(empty_db.safety, "no_result_reply", lambda: "＜差し替え文＞")
