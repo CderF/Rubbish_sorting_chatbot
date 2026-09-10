@@ -56,6 +56,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from app import trace_view  # noqa: E402
 from app.notices import admin as notice_admin  # noqa: E402
 from app.rag import agent, knowledge, router, safety  # noqa: E402  (sys.path 調整後に import)
 from app.rag.types import RoutedAnswer  # noqa: E402
@@ -79,6 +80,8 @@ MODEL_PATH = os.environ.get(
 )
 # webui.html sits next to this file in the repo.
 WEBUI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui.html")
+# STAGE06 6-4: 判断過程の事後確認ページ(webui.html と同じ場所)。
+TRACE_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trace.html")
 
 # --- access control -------------------------------------------------------
 # /chat must stay unauthenticated (the grading server sends no auth headers),
@@ -291,7 +294,9 @@ def _write_trace(session_id: str, prompt: str, routed, final_text: str) -> None:
         print(f"[trace] write failed: {exc!r}", flush=True)
 
 
-async def _route_safely(prompt: str, img: str | None):
+async def _route_safely(
+    prompt: str, img: str | None, history: list[dict] | None = None
+):
     """検索パスを呼ぶ。失敗しても生成は止めない。
 
     RAG側の例外で 5xx を返すとステージ全体が中断してしまう(冒頭の契約メモ参照)
@@ -308,15 +313,37 @@ async def _route_safely(prompt: str, img: str | None):
     を経由しないため、ゲートを `router` 側に置くと既定オンのエージェント応答が
     素通りしてしまう(STAGE06 proposal §7.1 の足場でこの位置に確定)。
     足場では `check_entry_gate` が常に None を返すため挙動は変わらない。
+
+    `history`: 同じ `session_id` の過去の user/assistant ターン(`sessions`)。
+    STAGE05 ではエージェント経路に渡して、品目・地区の省略・追加・訂正を
+    会話履歴から解釈させる。STAGE06 の入口ゲートはその有無だけを使い、
+    「最初の発話か、追い返しか」を区別する(2026-09-10 実採点trace回帰:
+    `app/rag/safety.py` 冒頭のコメント参照)。
     """
     # --- 6-1a/6-2 gate (STAGE06 proposal §7.2 / 担当A) ---
+    has_history = bool(history)
     ward, town = router.extract_region(prompt)
-    verdict = safety.check_entry_gate(prompt, ward, town)
-    if verdict is not None:
+    verdict = safety.check_entry_gate(prompt, ward, town, has_history=has_history)
+    if verdict is not None and verdict.blocks_search:
         ans = RoutedAnswer()
         ans.detected_ward, ans.detected_town = ward, town
         ans.canned_response = verdict.reply
         ans.safety_gate = verdict.gate
+        return ans
+
+    # 6-2(危険・違法な処分の誘導)は検索を止めない。検索結果に実在する正しい
+    # 排出ルート(販売店・専門業者・受付センター等)を使って「禁止の明示 + 正しい
+    # 手順」をセットで答えさせるため、印だけ付けて通常の経路へ流す
+    # (2026-09-10 採点フィードバック対応。`app/rag/safety.py` の
+    # `SafetyVerdict.blocks_search` 参照)。
+    dangerous = verdict is not None and not verdict.blocks_search
+
+    def _mark(ans):
+        if ans is not None and dangerous:
+            if ans.safety_gate == "6-3":
+                # 危険要求に「情報がないので答えられません」を返さない。
+                ans.canned_response = None
+            ans.safety_gate = "6-2"
         return ans
 
     if AGENTIC_RAG_ENABLED:
@@ -337,14 +364,36 @@ async def _route_safely(prompt: str, img: str | None):
                 temperature=0.0, max_tokens=AGENTIC_TOOL_CALL_MAX_TOKENS
             ),
             image_item_name=image_item_name,
+            history=history,
         )
         if agentic_result is not None:
-            return agentic_result
+            # 6-2 の印を先に付けてからテンプレートを判定する(テンプレートは
+            # 6-2 を対象外にする。`router.apply_response_template` 参照)。
+            return router.apply_response_template(_mark(agentic_result), prompt)
         print("[agent] route_agentically returned None, falling back to deterministic router",
               flush=True)
 
     try:
-        return await router.handle_query(prompt, img, engine=engine, processor=processor)
+        result = _mark(
+            await router.handle_query(prompt, img, engine=engine, processor=processor)
+        )
+        if router.needs_history_retry(result) and history:
+            # 決定論的経路は会話履歴を受け取らないため、品名を省いた追問
+            # (「え、知らなかったです。じゃあどうすればいいんですか？」)では
+            # 品目を特定できず6-3の固定文に落ちる。過去の利用者発言を前置して
+            # 一度だけ引き直し、品目か収集日が拾えたときだけ差し替える
+            # (2026-09-10 第6回採点回帰)。画像は現在の発話に添付されたもので、
+            # 引き直しの材料は履歴のテキスト側なので再分類させない。
+            combined = agent.build_history_query(history, prompt)
+            if combined:
+                retried = _mark(
+                    await router.handle_query(
+                        combined, None, engine=engine, processor=processor
+                    )
+                )
+                if retried.item_hits or retried.schedule_hits:
+                    result = retried
+        return router.apply_response_template(result, prompt)
     except Exception as exc:  # noqa: BLE001 — 生成の継続を最優先する
         print(f"[rag] handle_query failed, falling back to plain generation: {exc!r}",
               flush=True)
@@ -367,12 +416,14 @@ async def _stream_chat(
 
     # 検索結果はシステムメッセージとして毎ターン先頭に差し込む。会話履歴には
     # 残さない(ターンごとに検索結果が変わるうえ、積み重なると文脈を圧迫するため)。
-    routed = await _route_safely(prompt, img)
+    routed = await _route_safely(prompt, img, history=history)
 
     # 確定回答(4-3 確度ゲート等): LLM に言い換え・脚色・補足をさせず、
     # そのまま1フレームで返す。engine.generate は通さない。
     if routed is not None and routed.canned_response:
         text = routed.canned_response
+        citations = router.format_citations(routed) if routed.template_response else ""
+        text += citations
         yield f"data: {json.dumps({'delta': text}, ensure_ascii=False)}\n\n"
         async with _sessions_lock:
             sessions[session_id] = messages + [
@@ -394,7 +445,7 @@ async def _stream_chat(
 
     if routed is not None:
         prompt_input = _build_prompt(
-            [{"role": "system", "content": router.build_system_prompt(routed)}] + messages
+            [{"role": "system", "content": router.build_system_prompt(routed, prompt)}] + messages
         )
     else:
         prompt_input = _build_prompt(messages)
@@ -687,3 +738,28 @@ async def webui(request: Request, creds: HTTPBasicCredentials | None = Depends(_
     if not _authed(request, creds):
         return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
     return FileResponse(WEBUI_PATH)
+
+
+# --------------------------------------------------------------------------
+# STAGE06 6-4: 判断過程の事後確認(トレース閲覧)
+#   「どう調べて・どう判断してその回答に至ったか」をメンターが後から確認できる。
+#   /knowledge ページと同じ require_login。生のプロンプト・回答を含むため
+#   未認証公開はしない。
+# --------------------------------------------------------------------------
+@app.get("/trace", response_class=HTMLResponse)
+async def trace_page(request: Request, creds: HTTPBasicCredentials | None = Depends(_basic)):
+    if not _authed(request, creds):
+        return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
+    return FileResponse(TRACE_HTML_PATH)
+
+
+@app.get("/trace/data")
+async def trace_data(limit: int = 100, _=Depends(require_login)):
+    """直近 `limit` 件のトレース(新しい順)。"""
+    limit = max(1, min(limit, 500))
+    rows = await asyncio.to_thread(trace_view.read_trace_tail, _TRACE_PATH, limit)
+    return {
+        "rows": trace_view.summarize_trace_rows(rows),
+        "path": _TRACE_PATH,
+        "enabled": _TRACE_ENABLED,
+    }

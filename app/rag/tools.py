@@ -25,9 +25,22 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Callable
 
-from app.data.lookup import lookup_collection_schedule, lookup_item_exact, lookup_item_partial
+from app.data.lookup import (
+    lookup_collection_schedule,
+    lookup_item_contained_in,
+    lookup_item_exact,
+    lookup_item_partial,
+)
 from app.notices.lookup import pending_change
-from app.rag.router import _district_groups, _uniform_district_schedule
+from app.rag.router import (
+    _district_groups,
+    _partial_lookup_ok,
+    _pick_embedded_item,
+    _resolve_embedded_alias,
+    _uniform_district_schedule,
+    _vector_query_ok,
+    resolve_canonical_alias,
+)
 from app.rag.vector_store import vector_search_explanations, vector_search_items
 
 # --- OpenAI-style function-calling スキーマ ---------------------------------
@@ -156,13 +169,45 @@ def _tool_search_waste_item(query: str) -> dict:
     if not query:
         return {"error": "query is required"}
 
+    # 既知の品名の言い換え(「テレビ」→「テレビ(ブラウン管式・液晶式・
+    # プラズマ式)」等)は、部分一致の並び順やベクトル距離の揺れに任せず
+    # 正式名へ先に固定する(router.py._search_item と同じ、共通の
+    # resolve_canonical_alias)。
+    canonical = resolve_canonical_alias(query)
+    if canonical:
+        exact = lookup_item_exact(canonical)
+        if exact:
+            return {"match_stage": "exact", "items": [_serialize_item(exact)]}
+
     exact = lookup_item_exact(query)
     if exact:
         return {"match_stage": "exact", "items": [_serialize_item(exact)]}
 
-    partial = lookup_item_partial(query)[:5]
-    if partial:
-        return {"match_stage": "partial", "items": [_serialize_item(i) for i in partial]}
+    # 以下3つのガードは `router._search_item` と同一の規則。Agentic経路は
+    # `_blocking_route` を経由しないため、ここに入れないと既定オンの
+    # エージェント応答だけが「品名を特定できないまま断定する」状態で残る
+    # (2026-09-10 実採点trace回帰。モデルが query に何を渡すかは制御でき
+    # ないので、ツール側で同じ歯止めを掛ける)。
+    if _partial_lookup_ok(query):
+        partial = lookup_item_partial(query)[:5]
+        if partial:
+            return {"match_stage": "partial", "items": [_serialize_item(i) for i in partial]}
+
+    embedded = _pick_embedded_item(query, lookup_item_contained_in(query))
+    if embedded is not None:
+        return {"match_stage": "exact", "items": [_serialize_item(embedded)]}
+
+    # 言い換え表の語が質問文にそのまま埋もれているケースの救済(router._search_item
+    # と同じ規則。「硫酸」→「薬品(家庭医薬品でないもの)」等)。完全一致・部分一致・
+    # 埋め込み品名がすべて空振りしたあとにだけ試し、既存の品名一致を横取りしない。
+    alias_target = _resolve_embedded_alias(query)
+    if alias_target:
+        alias_hit = lookup_item_exact(alias_target)
+        if alias_hit is not None:
+            return {"match_stage": "exact", "items": [_serialize_item(alias_hit)]}
+
+    if not _vector_query_ok(query):
+        return {"match_stage": "none", "items": []}
 
     vector = vector_search_items(query, top_k=3)
     return {

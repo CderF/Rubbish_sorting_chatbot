@@ -16,6 +16,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
+from app.rag import safety
 from app.rag.types import ItemRecord, RoutedAnswer, ScheduleRecord
 
 # --- データ層の解決 --------------------------------------------------------
@@ -24,6 +25,7 @@ from app.rag.types import ItemRecord, RoutedAnswer, ScheduleRecord
 try:
     from app.data.lookup import (  # type: ignore[import-not-found]
         lookup_collection_schedule,
+        lookup_item_contained_in,
         lookup_item_exact,
         lookup_item_partial,
         lookup_towns,
@@ -38,6 +40,9 @@ except ImportError:
         lookup_towns,
     )
 
+    def lookup_item_contained_in(text: str, min_length: int = 2):  # noqa: ARG001
+        return None
+
     _USING_STUBS = True
 
 # --- ベクトルRAGパス・画像分類パスの解決 -----------------------------------
@@ -46,10 +51,13 @@ except ImportError:
 # 環境でも router.py 自体はimportできるようにするための最小限のフォール
 # バックに留める)。
 try:
-    from app.rag.vector_store import vector_search_items
+    from app.rag.vector_store import vector_search_explanations, vector_search_items
 except ImportError:
 
     def vector_search_items(query: str, top_k: int = 3) -> list[ItemRecord]:
+        return []
+
+    def vector_search_explanations(query: str, top_k: int = 3) -> list[dict]:
         return []
 
 
@@ -122,6 +130,106 @@ _WASTE_WORDS = WASTE_TYPES + (
     "びん",
 )
 
+# `category_procedure_intent` が認識する、特定品目ではなく「ごみ種別」
+# そのものを指す語。`WASTE_TYPES` より広い(早見表 disposal_method の
+# 「回収ボックス」系区分も含む)。「ペットボトル」は品名としても頻繁に
+# 単体で検索されるため(既存のテスト・実装がこの前提)、ここには含めない。
+_CATEGORY_WORDS = (
+    "粗大ごみ", "家庭ごみ", "古紙", "小物金属", "小型電子機器",
+    "電池類", "紙パック", "古着", "資源化ごみ", "特定ごみ",
+)
+# 「〜の収集日」「〜は何曜日」のように収集日そのものを尋ねる語。
+_CATEGORY_SCHEDULE_MARKERS = re.compile(r"(日|曜日|いつ)")
+# 「〜はどうやって出す/申し込む」のように、品目ではなく出し方・手続き
+# そのものを尋ねる語。
+_CATEGORY_PROCEDURE_MARKERS = re.compile(
+    r"(出し方|出すん|出したい|捨てるん|捨てたい|申し?込(?:む|みたい|んで|んだ)?|"
+    r"やり方|どうやって|どう出す|教えて)"
+)
+# 種別名・手続き語を取り除いた残りが「実質的な内容の無い言い回し」かを
+# 判定するための、助詞・丁寧語・語尾の除去用パターン(アンカー無し。
+# 「ってどうやって出すんですか」→種別語・手続き語除去後の「ってですか」の
+# ような、文中に散らばった助詞・丁寧語もまとめて消す)。
+_CATEGORY_FILLER_CHARS_RE = re.compile(
+    r"(って|です|ます|でしょう|でしょ|ください|は|の|を|も|で|に|へ|から|ん|か|、|。|\s)+"
+)
+
+
+def category_procedure_intent(
+    prompt: str, ward: str | None = None, town: str | None = None
+) -> tuple[str, bool] | None:
+    """`prompt` が特定の品目ではなく、ごみ種別そのものの出し方・手続き・
+    収集日を尋ねる質問なら `(種別名, 収集日の質問かどうか)` を返す。
+    該当しなければ None。
+
+    2026-09-14、B1のトレース精査で「粗大ごみってどうやって出すんですか」
+    「粗大ごみってどうやって申し込むんですか」「古紙を出したいです」の
+    ような、特定品目を指さない質問が品目検索に落ち、無関係な品目
+    (「ごみ箱」等)や無関係な制度(「ふれあい収集」等)に化ける不具合を
+    複数確認した(要件5-1「推測せず確認する」への違反)。品目検索
+    (`_search_item`/ベクトル検索)に渡す前に、`_blocking_route` と
+    `app/rag/agent.py` の両方からここを通す。
+
+    種別名を(区名・町名を除いた上で)含み、かつ収集日・手続きのどちらかを
+    尋ねる語も含み、それらを取り除いた残りに実質的な内容が無い(短い助詞・
+    語尾程度)場合に該当と判定する。「粗大ごみの布団はどう捨てますか」の
+    ように具体的な品目(布団)が残るケースは対象外(通常の品目検索に任せる)。
+    """
+    text = _norm(prompt)
+    for part in (ward, town):
+        if part:
+            text = text.replace(part, " ")
+
+    category = next(
+        (c for c in sorted(_CATEGORY_WORDS, key=len, reverse=True) if c in text), None
+    )
+    if category is None:
+        return None
+
+    schedule_like = bool(_CATEGORY_SCHEDULE_MARKERS.search(text))
+    procedure_like = bool(_CATEGORY_PROCEDURE_MARKERS.search(text))
+    if not (schedule_like or procedure_like):
+        return None
+
+    remainder = text.replace(category, "")
+    remainder = _CATEGORY_SCHEDULE_MARKERS.sub("", remainder)
+    remainder = _CATEGORY_PROCEDURE_MARKERS.sub("", remainder)
+    remainder = _PUNCT_OR_SPACE_RE.sub("", remainder)
+    remainder = _CATEGORY_FILLER_CHARS_RE.sub("", remainder)
+    if remainder:
+        return None
+    return category, schedule_like
+
+
+# 種別の手続き質問(procedure_like)で、知識ベースに根拠となる一般説明が
+# 見つからなかったときの固定回答。LLM生成には一切渡さない(4-3確度ゲートの
+# `_ANALOGY_UNRELIABLE_REPLY` と同じ設計: 何も見つからない状況で自由生成
+# させると、小型モデルは「ふれあい収集」「ごみ箱」のような無関係な内容を
+# 作り出してしまう ― 2026-09-14、B1のトレース精査で確認)。
+_CATEGORY_NO_CONTEXT_REPLY = "具体的な品目名と、お住まいの区・町名を教えてください。"
+
+
+def general_info_for_category(category: str) -> tuple[str, str] | None:
+    """種別そのものの手続き質問(procedure_like)に、知識ベースの一般説明
+    (`search_general_info`)で答えられる根拠があれば `(説明文, 出典URL)` を
+    返す。無ければ None。
+
+    2026-09-14、`vector_search_explanations` はコサイン距離だけでは
+    「粗大ごみ」「古紙」の出し方・申込みについて、本文に種別名が一度も
+    出てこない無関係なページ(「ふれあい収集」「ごみステーションの散乱
+    対策」等)をむしろ高いスコアで返してしまうことを確認した
+    (要件5-1「推測せず確認する」)。距離の閾値だけでは信頼できないため、
+    返ってきたチャンクの本文に実際に種別名が含まれているものだけを信頼する
+    (`app/rag/agent.py` の `_query_grounded_in_text` と同じ、埋め込み類似度
+    だけに頼らない字面の裏取り)。
+    """
+    for chunk in vector_search_explanations(f"{category} 出し方 申込み方法", top_k=3):
+        text = chunk.get("text") or ""
+        if category in text:
+            return text, chunk.get("source_url", "")
+    return None
+
+
 # 「〜はどう捨てますか」「〜はどこで回収してもらえますか」「〜の処分方法を
 # 教えてください」などの質問定型を落として品名だけを残す。捨て・処分・回収
 # 等の語が現れたら、その手前まで(\1)を品名として残し、以降を全部落とす。
@@ -191,11 +299,16 @@ def extract_region(prompt: str) -> tuple[str | None, str | None]:
     return ward, town
 
 
-_CHOME_SUFFIX_RE = re.compile(r"\d+丁目$")
+_CHOME_SUFFIX_RE = re.compile(r"\d+丁目(?:\(一部\)|（一部）)?$")
 
 
 def _town_base(town: str) -> str:
-    """町名から丁目番号を除いた「地区の呼び名」を返す(例: 「黒崎1丁目」→「黒崎」)。"""
+    """町名から丁目番号を除いた「地区の呼び名」を返す(例: 「黒崎1丁目」→「黒崎」)。
+
+    「企救丘4丁目(一部)」のように、丁目の一部だけが別表記になっている町名も
+    同じ地区として扱う(2026-09-14 レビュー指摘: 「(一部)」が付くと従来の
+    正規表現が末尾にマッチせず、`_district_groups` がこの町を地区の仲間
+    として拾えなかったため、丁目省略の地区名から漏れていた)。"""
     return _CHOME_SUFFIX_RE.sub("", town)
 
 
@@ -217,6 +330,16 @@ def _district_groups(ward: str) -> dict[str, tuple[str, ...]]:
     return {base: tuple(towns) for base, towns in groups.items() if len(towns) > 1}
 
 
+# `_has_plausible_item_text` が候補から先に取り除く、品目名には現れない
+# 会話の相槌・丁寧表現。地区の確認・訂正だけの発言(「すみません、やっぱり
+# 〜でした」)がまるごと品名候補になってしまうのを防ぐ。
+_FILLER_WORDS = (
+    "すみません", "やっぱり", "でした", "ですが", "ですけど",
+    "お願いします", "ください", "教えてください",
+)
+_FILLER_RE = re.compile("(" + "|".join(_FILLER_WORDS) + ")")
+
+
 def _match_district(ward: str, prompt: str) -> tuple[str, tuple[str, ...]] | None:
     """プロンプトに、丁目を省略した地区名が含まれるかを調べる。
 
@@ -230,6 +353,92 @@ def _match_district(ward: str, prompt: str) -> tuple[str, tuple[str, ...]] | Non
         if base and base in tail:
             return base, towns
     return None
+
+
+def _has_plausible_item_text(candidate: str, ward: str | None) -> bool:
+    """品名候補が、本当に品目名らしい実体を持つかを判定する。
+
+    2026-09-10、B1実機の複数ターン会話の再現テストで、地域だけの発言
+    (「小倉北区浅野1丁目です」)や地域訂正だけの発言(「やっぱり八幡西区
+    黒崎でした」)から、`_item_name_candidates` が正規表現の残骸(「す」)や
+    会話の相槌・丁寧表現・丁目省略の地区名(「黒崎」、地区名そのものは品目
+    ではない)を候補として拾ってしまい、それをそのままベクトル検索にかけて
+    無関係な品目(「車いす」「つっぱり棒」)を見つけてしまう不具合を確認した
+    (要件5-1「推測せず確認する」への違反、`app/rag/agent.py` の
+    `_query_grounded_in_text` と同じ動機のガードをこちら
+    ―決定論的経路― にも入れる)。`_blocking_route` が `_search_item`/
+    ベクトル検索に候補を渡す前にここで弾く。
+
+    - まず会話の相槌・丁寧表現(`_FILLER_RE`)を候補から取り除く。
+    - 丁目省略の地区名(`_match_district`)が残っていれば、それも取り除く。
+      `_district_groups` は「同じ地区名を共有する丁目が複数ある」場合しか
+      地区として登録しない(既存の設計、`_district_groups` 参照)ため、
+      町名が既に「黒崎1〜5丁目」のような結合表記で1行にまとまっている
+      データでは検出できないことがある — その場合はこの分岐が素通りする
+      既知の限界(別問題、ここでは追わない)。
+    - 上のどちらかで何かを取り除いた場合、取り除いた残りに実質的な内容
+      (かな以外を1文字も含まない)が無ければ、相槌・地区名の言い換えに
+      過ぎないとみなす。句読点・空白は文中のどこにあっても除いてから判定する。
+    - 何も取り除かれなかった候補は、ひらがなだけで2文字未満のときだけ弾く
+      (助詞・語尾の残骸である可能性が高い一方、「かご」等の実在する短い
+      ひらがな品目まで誤って弾かないため)。
+    """
+    text = _norm(candidate)
+    if not text:
+        return False
+
+    stripped = text
+    trimmed_something = False
+
+    filler_stripped = _FILLER_RE.sub("", stripped)
+    if filler_stripped != stripped:
+        trimmed_something = True
+        stripped = filler_stripped
+
+    if ward:
+        district = _match_district(ward, stripped)
+        if district:
+            base, _towns = district
+            stripped = stripped.replace(base, "")
+            trimmed_something = True
+
+    # ごみ種別語(「家庭ごみ」等)とその手続き・収集日を尋ねる語も取り除く。
+    # 2026-09-14、「小倉南区の企救丘で家庭ごみの日を教えてください」で、
+    # フィラー・地区名(企救丘)を取り除いた残りに「家庭ごみ」(品目ではなく
+    # ごみ種別)が残り、それが「実質的な内容」と誤判定されてベクトル検索に
+    # 渡ってしまう再発を確認した(要件5-1)。種別語が実際に見つかったときに
+    # 限って手続き・収集日の語も一緒に取り除く ― 種別語が無いのに手続き語
+    # (「捨てたい」等)だけ機械的に取り除くと、「黒崎でかごを捨てたい」の
+    # ような実在の品目(かご)の直前にある漢字(捨)が消え、残りが「でかごを」
+    # という平仮名だけになって誤って弾かれてしまう(2026-09-14 レビュー指摘)。
+    category_word = next(
+        (w for w in sorted(_CATEGORY_WORDS, key=len, reverse=True) if w in stripped), None
+    )
+    if category_word:
+        stripped = stripped.replace(category_word, "")
+        stripped = _CATEGORY_SCHEDULE_MARKERS.sub("", stripped)
+        stripped = _CATEGORY_PROCEDURE_MARKERS.sub("", stripped)
+        trimmed_something = True
+
+    if trimmed_something:
+        remainder = _PUNCT_OR_SPACE_RE.sub("", stripped)
+        return bool(remainder) and not _KANA_ONLY_RE.match(remainder)
+
+    if _KANA_ONLY_RE.match(text):
+        if len(text) < 2:
+            return False
+        # `_item_name_candidates` の断片化・修飾語除去(`_clean_fragment`)が
+        # 相槌の一部を単独の断片として切り出すことがある(「やっぱり」→
+        # 「ぱり」)。`_FILLER_RE` はフィラー語自体を含む候補しか捉えられない
+        # ので、逆方向(候補がフィラー語の部分文字列)もここで見る
+        # (2026-09-10 レビュー指摘: 「黒崎」を正しく除去できるようになった後も
+        # 「ぱり」というひらがな2文字の残骸が生き残り、ベクトル検索で
+        # 「つっぱり棒」を誤って見つけてしまう再発を、実際の再クロール後の
+        # DB で確認した)。
+        if any(text in w or w in text for w in _FILLER_WORDS):
+            return False
+
+    return True
 
 
 def _uniform_district_schedule(
@@ -253,6 +462,58 @@ def _uniform_district_schedule(
     if len({key(hits) for hits in per_town}) != 1:
         return None
     return per_town[0]
+
+
+def _describe_non_uniform_district(
+    ward: str, district_name: str, towns: tuple[str, ...], waste_type: str | None
+) -> str | None:
+    """地区内で収集日が丁目によって割れている(`_uniform_district_schedule`
+    が None を返した)とき、実際にどう割れているかを丁目ごとにまとめた
+    案内文を作る。
+
+    2026-09-14、B1のトレース精査で「企救丘」(小倉南区)の質問に対し、
+    地区内で収集日が割れているという理由だけで「町名が不明」と案内し、
+    そもそも丁目によって収集日が違うこと自体が伝わらない不具合を確認した
+    (要件5-2「地域の曖昧さを具体的に示す」)。同じ収集日を共有する丁目を
+    グループ化し、利用者がどちらに該当するか選べる形で示す。
+
+    どの丁目も収集日が引けない(データが無い)場合は None を返し、呼び出し側は
+    従来通りの「町名が必要」という一般的な案内にフォールバックする。
+
+    「企救丘4丁目(一部)」のように、1つの町(丁目)の中でも収集日データが
+    複数(同じごみ種別に対し曜日が2通り)存在することがある ― 該当丁目の
+    中でも実際の住所によって収集日が分かれることを公式ページ自身が
+    「(一部)」と明記しているケース。これを他の丁目とまとめて1つの通常
+    グループに入れてしまうと、存在しない「1〜4丁目共通の収集日」を
+    作り出すことになる(2026-09-14 レビュー指摘)。そのため、同じごみ種別で
+    複数の曜日を持つ町は他の丁目と混ぜず、単独で「要確認」として案内する。
+    """
+    groups: dict[frozenset, list[str]] = {}
+    ambiguous_towns: list[str] = []
+    for t in towns:
+        hits = lookup_collection_schedule(ward, t, waste_type)
+        if not hits:
+            continue
+        weekdays_by_type: dict[str, set[str]] = {}
+        for h in hits:
+            weekdays_by_type.setdefault(h.waste_type, set()).add(h.weekday)
+        if any(len(wd) > 1 for wd in weekdays_by_type.values()):
+            ambiguous_towns.append(t)
+            continue
+        key = frozenset((wt, next(iter(wd))) for wt, wd in weekdays_by_type.items())
+        groups.setdefault(key, []).append(t)
+
+    if len(groups) < 2 and not ambiguous_towns:
+        return None
+
+    parts = []
+    for key, group_towns in groups.items():
+        weekdays = "・".join(sorted({w for _wt, w in key}))
+        town_range = "・".join(group_towns)
+        parts.append(f"{town_range}は{weekdays}")
+    for t in ambiguous_towns:
+        parts.append(f"{t}は収集日が複数存在するため要確認")
+    return f"「{district_name}」は丁目によって収集日が異なる({'、'.join(parts)})。何丁目か"
 
 
 def extract_waste_type(prompt: str) -> str | None:
@@ -286,6 +547,74 @@ _JUNK_MODIFIERS = (
     "三輪の", "折り畳み式の", "折りたたみ式の", "折り畳みの", "折りたたみの",
 )
 _ETC_SUFFIX = re.compile(r"(?:など|等|とか)$")
+
+# 2026-09-10 実採点trace回帰: 「これ燃えるゴミで合ってますよね？」「さっき
+# 聞いたやつ、結局何ごみでしたっけ？」のように `_QUESTION_TAIL` の定型に
+# 一致しない言い回しでは、文全体がそのまま vector_query になり、
+# `vector_search_items` が(無関係でも)何かしら最近傍の品目を返してしまい、
+# 4-3類推が根拠薄弱なまま分別区分を断定していた。
+#
+# 一方で「廃車にした自動車を処分したいのですが」のように、文中に実在の
+# 品名がそのまま埋め込まれているケースは `lookup_item_contained_in`
+# (app/data/lookup.py)で正確に拾える。この判定(_looks_like_a_sentence)は
+# その救済が失敗した**後**、ベクトル検索に回すか諦めるかの最終ゲートとして
+# `_search_item` の中でだけ使う — `_item_name_candidates` の候補生成自体は
+# 変更しない(候補を削ると `lookup_item_contained_in` の入力も減ってしまう)。
+#
+# 実データ検証: waste_items の全864品名にこれらの語(述語マーカー・語尾の
+# 指示語・相槌)は1件も含まれない。
+_SENTENCE_MARKERS = (
+    "です", "ます", "でしょう", "ください", "んです",
+    "でした", "ました", "ません", "っけ",
+    "分からない", "わからない", "たらいいか", "ばいいか",
+)
+_VAGUE_REFERENCE_SUFFIXES = ("やつ", "もの", "これ", "それ", "あれ")
+_FILLER_WORDS = frozenset({
+    "あの", "あのー", "えっと", "えーと", "まあ", "そうそう", "うーん",
+    "なんか", "ええ", "はい", "うん", "そう", "そうですね", "ちょっと",
+})
+
+
+def _looks_like_a_sentence(candidate: str) -> bool:
+    """候補が品名ではなく、文(述語)・漠然とした代名詞参照・相槌らしいかを判定する。"""
+    if any(m in candidate for m in _SENTENCE_MARKERS):
+        return True
+    if candidate.endswith(_VAGUE_REFERENCE_SUFFIXES):
+        return True
+    return candidate in _FILLER_WORDS
+
+
+def _partial_lookup_ok(candidate: str) -> bool:
+    """その候補を部分一致(`LIKE '%候補%'`)に渡してよいか。
+
+    2026-09-10 実採点trace回帰: 「え、知らなかったです。じゃあどうすれば
+    いいんですか？」のような相槌だけの追い返しは、断片分割の結果として
+    1文字の候補(「え」)を生む。これを部分一致に渡すと
+    `LIKE '%え%'` が「砂(鉢植え…)」「つえ」「ふえ(ホイッスル)」等に
+    無差別にヒットし、根拠皆無のまま analogy として断定してしまう。
+
+    完全一致は1文字でも意味がある(「傘」「畳」「鍵」等、実データに1文字の
+    品名が15件ある)ため制限しない。制限するのは部分一致だけ。
+    """
+    return len(candidate) >= 2 and candidate not in _FILLER_WORDS
+
+
+def _vector_query_ok(candidate: str) -> bool:
+    """その候補をベクトル検索に渡してよいか(決定論的経路・Agentic経路 共通)。
+
+    ベクトル検索は「必ず最近傍を返す」ので、根拠にならない文字列を渡すと
+    無関係な品目を掴んだまま断定してしまう。渡してよいのは:
+
+    - 2文字以上(1文字のクエリは意味のある近傍を持たない。「傘」「畳」等の
+      1文字の実在品名は完全一致で先に拾えるため、ここで弾いても影響しない)
+    - 文・代名詞参照・相槌でないこと(`_looks_like_a_sentence`)
+
+    Agentic経路(`app/rag/tools.py`)はモデルが任意の文字列を query として
+    渡してくるため、決定論的経路と同じ判定をこの1関数に集約して共有する
+    (2026-09-10 実採点trace回帰。実際にモデルが「え」だけを query にした
+    ケースが観測され、`LIKE '%え%'` とベクトル検索の両方が誤爆していた)。
+    """
+    return len(candidate) >= 2 and not _looks_like_a_sentence(candidate)
 
 
 def _clean_fragment(frag: str) -> str:
@@ -377,6 +706,71 @@ def _item_name_candidates(
     return candidates, vector_query
 
 
+# 品目の列挙を切り分ける区切り(「AとB」「A、B」「AやB」「あとB」)。記号に加えて、
+# かな・漢字に挟まれた助詞「と」「や」も区切りとして扱う。直前・直後を文字種で
+# 縛るのは、「ボート」のように語の一部である「と」を割らないため。
+_LIST_SEP_RE = re.compile(
+    r"[、,，・]+|(?<=[ぁ-んァ-ヶ一-龥])[とや](?=[ぁ-んァ-ヶ一-龥])|あと|それと"
+)
+
+
+def _is_waste_type_only(fragment: str) -> bool:
+    """断片がごみ種別語だけで出来ているか(「かん・びん」「ペットボトル」等)。
+
+    種別そのものの質問であって品目の列挙ではないので、品目の追加検索から外す。
+    """
+    rest = _norm(fragment)
+    for word in sorted(_WASTE_WORDS, key=len, reverse=True):
+        rest = rest.replace(word, "")
+    return len(rest.strip(" ・、,，。")) < 2
+
+
+def _listed_item_extras(prompt: str, exclude: set[str]) -> list[ItemRecord]:
+    """質問文に列挙された品目のうち、早見表に完全一致するものを返す。
+
+    多品目の質問(「たんすと古い布団と、あと段ボールがたくさんあります」)では、
+    主候補の検索だけでは最初の1件しか拾えず、残りの品目が回答から抜け落ちる。
+    列挙の区切り(`_LIST_SEP_RE`)で分割し、断片ごとに完全一致(言い換えの解決込み)
+    を試して、明示的に列挙された品目を漏らさないようにする。
+
+    誤爆を防ぐため、次は採用しない:
+    - ごみ種別語だけの断片、および解決先がごみ種別そのものの行
+      (`_is_waste_type_only`)。種別の質問であって品目の列挙ではない。
+    - `exclude` にある品目(主候補として検索済み)。同じ品目を二重に載せない。
+      断片そのものの表記も見る — 早見表に「テレビ」と「テレビ(ブラウン管式…)」の
+      両方がある環境で、検索済みの「テレビ」を言い換え解決で別の行として
+      足してしまうのを防ぐ(2026-09-10 テスト回帰)。
+    ベクトル検索は使わない — 列挙の断片は短く、意味的近似を根拠にするには
+    材料が足りない(無関係な近傍を拾うだけになる)。
+    """
+    candidates, _ = _item_name_candidates(prompt)
+    fragments: list[str] = []
+    for cand in candidates:
+        for frag in _LIST_SEP_RE.split(cand):
+            frag = frag.strip()
+            if frag and frag not in fragments:
+                fragments.append(frag)
+
+    found: list[ItemRecord] = []
+    for frag in fragments:
+        if _is_waste_type_only(frag) or _norm(frag) in exclude:
+            continue
+        rec = lookup_item_exact(resolve_canonical_alias(frag) or frag)
+        if rec is None:
+            rec = _pick_embedded_item(frag, lookup_item_contained_in(frag))
+        if rec is None or _norm(rec.item_name) in exclude:
+            continue
+        if _is_waste_type_only(rec.item_name):
+            # 断片全体は種別語だけではないが、解決先が種別そのものの行
+            # (「ペットボトル」「かん・びん」)というケース。品目の列挙ではない
+            # ので足さない(「かん・びんとペットボトルは同じ袋に…」で
+            # ペットボトルを品目として拾ってしまう回帰を防ぐ)。
+            continue
+        exclude.add(_norm(rec.item_name))
+        found.append(rec)
+    return found
+
+
 def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str | None:
     """質問文から品名らしき部分(主候補のみ)を取り出す。"""
     candidates, _ = _item_name_candidates(prompt, strip_waste_words)
@@ -412,22 +806,71 @@ def _search_item(
     根拠表示用。回答ロジックが使う「質問の品名そのものか、似た別品目か」の
     判定は別で、呼び出し側の `_classify_item_match`(名前一致ベース)で行う。
     """
+    canonical = resolve_canonical_alias(item_name)
+    if canonical:
+        exact = lookup_item_exact(canonical)
+        if exact:
+            return [exact], "exact"
+
     exact = lookup_item_exact(item_name)
     if exact:
         return [exact], "exact"
-    partial = lookup_item_partial(item_name)[:5]
-    if partial:
-        return partial, "partial"
+    if _partial_lookup_ok(item_name):
+        partial = lookup_item_partial(item_name)[:5]
+        if partial:
+            return partial, "partial"
     for cand in extra_candidates or []:
         if cand == item_name:
             continue
         exact = lookup_item_exact(cand)
         if exact:
             return [exact], "exact"
+        if not _partial_lookup_ok(cand):
+            continue
         partial = lookup_item_partial(cand)[:5]
         if partial:
             return partial, "partial"
-    vector = vector_search_items(vector_query or item_name, top_k=3)
+
+    # 2026-09-10 実採点trace回帰の救済: `_QUESTION_TAIL` の定型に一致せず
+    # item_name が文全体のままでも、その中に実在の品名がそのまま埋め込まれて
+    # いれば(「廃車にした自動車を処分したいのです」の「自動車」)、ベクトル
+    # 検索より先に正確な一致として拾う(埋め込み一致の方が意味的近似より
+    # 遥かに確実な根拠のため)。`lookup_item_contained_in` は単純な部分文字列
+    # 一致(語境界を見ない)なので、ここで `_pick_embedded_item` により
+    # 「直後が文末・助詞・質問定型」の境界チェックをかける(「捨てたらいいか」
+    # に「たらい」が偶然含まれる、のような事故を防ぐ)。
+    embedded = _pick_embedded_item(item_name, lookup_item_contained_in(item_name))
+    if embedded is None:
+        for cand in extra_candidates or []:
+            embedded = _pick_embedded_item(cand, lookup_item_contained_in(cand))
+            if embedded is not None:
+                break
+    if embedded is not None:
+        return [embedded], "exact"
+
+    # 言い換え表(`_CANONICAL_ALIASES`)の語が質問文にそのまま埋もれている
+    # ケースの救済。「硫酸」のように早見表に品名として存在しない物質名を、
+    # 包括行(「薬品(家庭医薬品でないもの)」)へ固定する。完全一致・部分一致・
+    # 埋め込み品名がすべて空振りしたあとにだけ試すので、既存の品名一致を
+    # 横取りしない(2026-09-10 第6回採点回帰: 「硫酸」がベクトル類似で
+    # 「油(食用油)=家庭ごみ」に化けていた)。
+    for probe in (item_name, *(extra_candidates or [])):
+        target = _resolve_embedded_alias(probe)
+        if not target:
+            continue
+        rec = lookup_item_exact(target)
+        if rec is not None:
+            return [rec], "exact"
+
+    # 埋め込み品名も見つからず、ベクトル検索に渡すクエリ自体が文・代名詞
+    # 参照・相槌らしいなら(`_looks_like_a_sentence`)、ベクトル検索にも
+    # 回さない。根拠の無い文字列をそのまま embedding にかけても、無関係な
+    # 最近傍を拾って断定してしまうだけ(2026-09-10 実採点trace回帰)。
+    final_query = vector_query or item_name
+    if not _vector_query_ok(final_query):
+        return [], None
+
+    vector = vector_search_items(final_query, top_k=3)
     return vector, ("vector" if vector else None)
 
 
@@ -447,6 +890,51 @@ _AFTER_NAME_OK = re.compile(
     r"|(?:は|の|を|、)?\s*(?:捨て|出せ|出し|処分|廃棄|分別|区分|回収|収集|処理|片付け)"
     r")"
 )
+
+# 言い換え表(`_resolve_embedded_alias`)の探索だけに足す緩和。早見表の品名一致
+# (`_pick_embedded_item`)は「電動歯ブラシの充電スタンド」を別品目として正しく
+# 弾く必要があるため緩めないが、言い換えでは「注射器の本体」のように「の」+
+# 部位を表す語が続いても指している品物は同じなので成立させる。
+_PART_SUFFIX_RE = re.compile(r"^の(?:本体|部分|中身|フタ|ふた)")
+
+
+def _pick_embedded_item(text: str, candidates: list[ItemRecord]) -> "ItemRecord | None":
+    """`lookup_item_contained_in` が返した(語境界を見ていない)候補群から、
+    `text` 中で実際に品名の主辞として現れているものを選ぶ。
+
+    `_resolve_named_hit` と違い、直前の境界は見ない(「使わなくなった電子
+    レンジ」「〜にした自動車」のように、直前が助詞ではなく動詞の活用語尾
+    でも品名は品名のため)。直後の境界だけを `_AFTER_NAME_OK` でチェックする
+    ことで、「捨てたらいいか」に「たらい」が偶然含まれる、のような事故は
+    排除できる(直後が「いいか」で `_AFTER_NAME_OK` に一致しない)。
+
+    複数該当すれば最長一致(最も具体的な品名)を優先する。
+    """
+    if not candidates:
+        return None
+    norm_text = _norm(text)
+    best: "ItemRecord | None" = None
+    best_len = -1
+    for item in candidates:
+        full_name = _norm(getattr(item, "item_name", ""))
+        if not full_name:
+            continue
+        # `lookup_item_contained_in` は括弧書き手前(base name)だけの一致でも
+        # 候補に含める(「蛍光管(環型、直型)」候補が「蛍光管を割って…」で
+        # 選ばれる)。境界チェックもどちらで見つかったかに合わせて行う。
+        for name in (full_name, _base_name(full_name)):
+            if not name:
+                continue
+            idx = norm_text.find(name)
+            if idx == -1:
+                continue
+            end = idx + len(name)
+            if not _AFTER_NAME_OK.match(norm_text[end:]):
+                continue
+            if len(name) > best_len:
+                best, best_len = item, len(name)
+            break
+    return best
 
 
 def _resolve_named_hit(prompt: str, hits: list[ItemRecord]) -> "ItemRecord | None":
@@ -600,14 +1088,48 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     ward, town = extract_region(prompt)
     ans.detected_ward, ans.detected_town = ward, town
 
+    # 特定品目ではなく、ごみ種別そのものの手続き・収集日を尋ねる質問
+    # (要件5-1、`category_procedure_intent` 参照)。品目検索には一切渡さない。
+    category_intent = None if image_item_name else category_procedure_intent(prompt, ward, town)
+    category_waste_type: str | None = None
     wants_schedule = asks_schedule(prompt)
+    if category_intent is not None:
+        category_waste_type, category_schedule_like = category_intent
+        wants_schedule = wants_schedule or category_schedule_like
+
+        if not category_schedule_like:
+            # 手続きそのものの質問(収集日は絡まない)は、この先の品目・
+            # 収集日パスのどちらにも入らないので、ここで確定させて返す。
+            # 2026-09-14 レビュー指摘: 以前はここで found=False・context=""
+            # のまま関数を抜け、_RULES_NO_CONTEXT で LLM に自由生成させて
+            # いたが、小型モデルは「該当情報が見つかりませんでした」を確実に
+            # は守らず、「ごみ箱」「ふれあい収集」等を作り出すことがある
+            # (4-3確度ゲートと同じ理由)。知識ベースに根拠があれば使い、
+            # 無ければ固定の確認文へ倒す ― どちらの分岐も自由生成させない。
+            info = general_info_for_category(category_waste_type)
+            if info is not None:
+                text, source_url = info
+                ans.found = True
+                ans.context = f"## {category_waste_type}についての一般説明\n{text}"
+                if source_url:
+                    ans.sources = [source_url]
+            else:
+                ans.canned_response = _CATEGORY_NO_CONTEXT_REPLY
+            return ans
 
     if image_item_name:
         item_candidates, vector_query = [image_item_name], None
+    elif category_intent is not None:
+        item_candidates, vector_query = [], None
     else:
         item_candidates, vector_query = _item_name_candidates(
             prompt, strip_waste_words=wants_schedule
         )
+        # 品目名として実体の無い候補(地域名の言い換え・正規表現の残骸)を
+        # 検索に渡す前に弾く(要件5-1、`_has_plausible_item_text` 参照)。
+        item_candidates = [c for c in item_candidates if _has_plausible_item_text(c, ward)]
+        if vector_query is not None and not _has_plausible_item_text(vector_query, ward):
+            vector_query = None
     item_name = item_candidates[0] if item_candidates else None
     ans.detected_item = item_name
     ans.item_candidates = list(item_candidates)
@@ -623,7 +1145,16 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         # 自体が原文にそのまま出ていれば完全一致として扱い、正しい品名で
         # timeline も引けるようにする(trace: 46/50 が vector・timeline 0 の回帰)。
         if ans.item_match == "analogy":
-            named = _resolve_named_hit(prompt, ans.item_hits)
+            # 言い換え表(`_CANONICAL_ALIASES`)から名前が変わった行(「硫酸」→
+            # 「薬品(家庭医薬品でないもの)」)は、質問文に正式名が現れないため
+            # `_resolve_named_hit` では拾えない。ヒット名と解決先が一致することを
+            # 確認したうえで引き上げる。
+            # 埋め込み品名(`_pick_embedded_item`)はここでは使わない — あちらは
+            # 直前の境界を見ないので、「電動スケートボード」の中の「スケートボード」
+            # のような別品目まで exact に上げてしまう(2026-09-10 テスト回帰)。
+            named = _resolve_named_hit(prompt, ans.item_hits) or _resolve_alias_hit(
+                prompt, item_candidates, ans.item_hits
+            )
             if named is not None:
                 ans.item_match = "exact"
                 ans.detected_item = named.item_name
@@ -642,6 +1173,27 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         if ans.item_match == "analogy" and ans.item_match_stage == "vector":
             ans.analogy_unreliable = _analogy_pick(ans.item_hits, ans.detected_item) is None
 
+        # 品目の列挙(「たんすと布団と、あと段ボール」)では主候補の検索だけでは
+        # 1件しか拾えない。質問文に明示的に列挙された品目を追加で検索し、回答から
+        # 抜け落ちないようにする(2026-09-10 第6回採点回帰)。検索段が exact
+        # (原文の品名が早見表の行に確定した)ときだけ行う — 部分一致・ベクトルの段
+        # では質問の品目が一意でなく、断片の完全一致を混ぜると別品目の断定根拠に
+        # なってしまう。
+        if ans.item_match_stage == "exact" and len(ans.item_hits) == 1:
+            exclude = {_norm(h.item_name) for h in ans.item_hits}
+            exclude |= {_norm(c) for c in item_candidates}
+            extras = _listed_item_extras(prompt, exclude)
+            if extras:
+                # 列挙された品目がそれぞれ原文の品名と完全一致しているなら、類推では
+                # なく「複数品目の質問」として扱う。analogy のままだと context が
+                # `_analogy_pick` で1件に絞られ、他の品目が回答から消える。
+                ans.item_hits = ans.item_hits + extras
+                if ans.item_match != "exact":
+                    ans.item_match = "exact"
+                    ans.detected_item = (
+                        getattr(ans.item_hits[0], "item_name", None) or ans.detected_item
+                    )
+
     if ward:
         # 早見表がヒットしていれば、その出し方(disposal_method)を収集日検索の
         # ごみ種別として優先的に使う。プロンプトの語そのものではなく実際に
@@ -652,6 +1204,10 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
         single_item_disposal = (
             next(iter(item_disposal_methods)) if len(item_disposal_methods) == 1 else None
         )
+        # 品目が見つかっていなくても、種別そのものの質問(category_intent)
+        # なら、その種別名を品目の区分と同じ役割で使う。
+        single_item_disposal = single_item_disposal or category_waste_type
+        district_ambiguity: str | None = None
 
         if single_item_disposal is not None and single_item_disposal not in _CURBSIDE_WASTE_TYPES:
             # 小物金属・小型電子機器・電池類・古着・紙パック・蛍光管等は「回収
@@ -678,8 +1234,6 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
                 # 丁目を省略した地区名(「黒崎」等)の可能性を試す。地区内の
                 # 全丁目で収集日が完全に一致する場合に限り、それをそのまま
                 # 使う(実測: 全7区344地区中277地区(92%)が地区内で完全一致)。
-                # 割れている地区は None が返るので、下の missing("町名") に
-                # そのままフォールバックする(丁目を勝手に決めつけない)。
                 district = _match_district(ward, prompt)
                 if district:
                     district_name, district_towns = district
@@ -689,11 +1243,29 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
                         ans.detected_town = district_name
                         ans.district_schedule = True
                         ans.district_towns = list(district_towns)
+                    else:
+                        # 地区内で収集日が割れている(「企救丘」等)。丁目を
+                        # 勝手に決めつけて答えることはしないが、「町名が
+                        # 不明」とだけ案内すると、そもそも収集日が丁目に
+                        # よって違うこと自体が伝わらない(2026-09-14 レビュー
+                        # 指摘)。丁目ごとに実際の収集日を引いてグループ化し、
+                        # 「どちらのグループか」を選べる形で案内する。
+                        # `waste_type` は `wants_schedule` が立っているとき
+                        # しか `extract_waste_type` を試さないので、「〜の日を
+                        # 教えてください」のように asks_schedule の語彙に無い
+                        # 言い回しでは None のことがある。地区の内訳表示だけは
+                        # 独立して種別語を探し、無関係な種別まで混ぜない。
+                        district_ambiguity = _describe_non_uniform_district(
+                            ward, district_name, district_towns,
+                            waste_type or extract_waste_type(prompt),
+                        )
 
         if schedules:
             ans.schedule_hits = schedules
         elif ans.no_weekday_schedule:
             pass  # 上のフラグで案内するので missing には積まない
+        elif district_ambiguity:
+            ans.missing.append(district_ambiguity)
         elif not town:
             # 設計提案書 3-1: 区のみでは一意に定まらない。推測せず町名を要求する。
             ans.missing.append("町名")
@@ -734,11 +1306,177 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     if ans.item_match == "analogy" and ans.analogy_unreliable:
         ans.canned_response = _ANALOGY_UNRELIABLE_REPLY
 
+    # 必須項目テンプレート(`apply_response_template`)はここでは適用しない。
+    # `app/server.py._route_safely` が決定論的経路・Agentic経路の共通出口で、
+    # STAGE06 の 6-2 の印(`_mark`)を付けた**後**に適用する。ここで先に
+    # 適用すると 6-2 の印が付く前にテンプレートが確定し、危険な処分の誘導への
+    # 回答から「いいえ、〜してはいけません」が消える(テンプレートは 6-2 を
+    # 対象外にするが、その判定には印が必要)。
+
     # --- 6-3 fallback hook (STAGE06 proposal §7.3 / 担当B) ---
-    # ここに: ans.found が False かつ ans.canned_response が未設定かつ
-    # ans.safety_gate が None のとき、safety.no_result_reply() を canned_response
-    # に立てて「完全空振り」を LLM 生成に回さず固定文で返す。足場では未実装。
+    # 完全空振り(品目も収集日もヒットせず、6-1a/6-2 も 4-3 確度ゲートも未発火)。
+    # 検索結果ゼロを LLM に渡して「見つかりませんでした」と言わせると、モデルが
+    # 自前の知識で埋める失敗モード(4-3 で繰り返し確認)が未知の入力でも起きる。
+    # コード側で固定文を立て、engine.generate を通さず返す。
+    #
+    # `ans.missing` が非空(区名はあるが町名が無い等)のときは対象外にする
+    # (コードレビューで発見: 修正前は6-3がここを素通りせず全部拾ってしまい、
+    # build_system_prompt() の「不足している{missing}を推測せず利用者に
+    # 追加入力を促す」という既存の指示(3-1由来)を握りつぶしていた。
+    # 「本当に何も手がかりが無い」場合と「あと一歩の情報が要る」場合は
+    # 区別し、後者は従来どおりLLMに追加入力を促させる)。
+    if (
+        not ans.found
+        and not ans.missing
+        and ans.canned_response is None
+        and ans.safety_gate is None
+    ):
+        reply = safety.no_result_reply()
+        if reply:
+            ans.canned_response = reply
+            ans.safety_gate = "6-3"
     return ans
+
+
+# 利用者が自分の前提の是非を確かめている(はい/いいえで答えるべき)質問。
+# 「〜ですよね」「〜していいですか」「〜でいいですか」「大丈夫ですか」等。
+# 「どう捨てればいいですか」のような手順の質問(〜ばいいですか)は含めない —
+# そちらは必須項目テンプレートが本来想定している質問なので、ここで拾うと
+# テンプレートが実質的に無効になってしまう。
+_CONFIRMATION_RE = re.compile(
+    r"(よね"
+    r"|て(?:も)?いい(?:です|んです|の)?か"
+    r"|で(?:も)?いい(?:です|んです|の)?か"
+    r"|大丈夫|構いません|かまいません|問題(?:ない|ありません)"
+    r"|合って(?:い)?ます|正しいです)"
+)
+
+
+def _is_confirmation_question(prompt: str) -> bool:
+    return bool(_CONFIRMATION_RE.search(_norm(prompt or "")))
+
+
+# 利用者が品物の状態・内容物を前提として述べている発話(「水と魚が入ったまま」
+# 「洗わずにそのまま」等)。区分を答えるだけでは条件に触れられず、必須項目
+# テンプレート(項目表)では「先に中身を取り出す」等の手順を案内できないため、
+# テンプレートを当てずに LLM に条件ごと個別に答えさせる。
+# 実採点traceの実プロンプト165件で、この判定に当たるのは「水と魚が入ったままの
+# 大きな水槽」と「農薬の空き容器は、洗わずにそのまま」の2件だけで、通常の
+# 分別質問には発火しないことを確認済み(2026-09-10)。
+_STATED_CONDITION_RE = re.compile(
+    r"入ったまま|入れたまま|残ったまま|ついたまま|入った状態"
+    r"|そのまま|このまま|のままで|中身が入|中身入り|入っている|入ってる"
+)
+
+
+def _has_stated_condition(prompt: str) -> bool:
+    return bool(_STATED_CONDITION_RE.search(_norm(prompt or "")))
+
+
+def apply_response_template(ans: RoutedAnswer, prompt: str = "") -> RoutedAnswer:
+    """高リスク回答に必須項目テンプレートを適用して返す。
+
+    決定論的ルートだけでなく Function Calling ルートにも同じ制約を
+    適用するため、サーバーの共通出口から呼び出せる公開関数にしている。
+
+    STAGE06 の 6-2(危険・違法な処分の誘導、`safety_gate == "6-2"`)は対象外。
+    テンプレートは項目表を固定文で返すため、「タイヤを庭で燃やしていいですか」
+    への回答から「いいえ、燃やしてはいけません」という明確な否定が消えて
+    しまう。6-2 は `_RULES_DANGEROUS_REQUEST` を課した LLM 生成で、否定と
+    正しい手順(検索結果の相談先)をセットで答える。
+
+    `prompt` が確認型の質問(`_is_confirmation_question`)の場合も対象外。
+    2026-09-10 第5回採点で「エアコンは燃えないごみの日に出せばいいんですよね？」
+    等の誤った前提の確認は、LLM が「いいえ、燃えないごみの日には出せません」と
+    前提を明確に否定して通過していた。テンプレートは項目表しか返さず、この
+    否定が消える(統合ブランチで実DBに対して確認)。
+
+    `prompt` が品物の状態・内容物を述べている場合(`_has_stated_condition`)も
+    対象外。2026-09-10 第6回採点で「水と魚が入ったままの大きな水槽」に項目表が
+    当たり、述べられた条件に一切触れない回答になっていた(項目表は品目の区分を
+    並べるだけで、条件への対処を書く欄を持たない)。
+    """
+    if ans.safety_gate == "6-2":
+        return ans
+    if _is_confirmation_question(prompt) or _has_stated_condition(prompt):
+        return ans
+    if ans.canned_response is None:
+        templated = _build_required_fields_response(ans)
+        if templated is not None:
+            ans.canned_response = templated
+            ans.template_response = True
+    return ans
+
+
+def _build_required_fields_response(ans: RoutedAnswer) -> str | None:
+    """高リスクカテゴリを必須項目テンプレートで回答する。
+
+    早見表・収集日検索の結果だけを材料にするため、LLMが申込・手数料・
+    収集対象外などを省略したり、根拠のない条件を補ったりする余地を減らす。
+    """
+    if not ans.item_hits or ans.item_match == "analogy" or ans.timeline_change:
+        return None
+    if len(ans.item_hits) > 1:
+        # 多品目の質問(「たんすと布団と段ボール」)では、この項目表は1品目しか
+        # 表せず、残りの品目が回答から抜け落ちる(2026-09-10 第6回採点回帰)。
+        # 項目表をやめ、LLM に全品目を個別に整理させる。
+        return None
+
+    item = ans.item_hits[0]
+    item_name = getattr(item, "item_name", "") or ans.detected_item or "この品目"
+    method = getattr(item, "disposal_method", "") or "記載なし"
+    notes = (getattr(item, "notes", "") or "").strip()
+    lines = [f"品目: {item_name}", f"分別区分: {method}"]
+
+    schedules = ans.schedule_hits
+    has_bulky = method == "粗大ごみ" or any(
+        getattr(s, "waste_type", "") == "粗大ごみ" for s in schedules
+    )
+    not_collected = method == "市が収集しないもの"
+    no_weekday = ans.no_weekday_schedule or (
+        not schedules and method not in _CURBSIDE_WASTE_TYPES
+    )
+
+    if has_bulky:
+        lines.append("出し方・条件: " + (notes or "早見表の備考を確認してください。"))
+        if schedules:
+            lines.append("収集日: " + "、".join(
+                f"{getattr(s, 'ward', '')}{getattr(s, 'town', '')}は{getattr(s, 'weekday', '')}"
+                for s in schedules
+            ))
+        else:
+            lines.append(
+                "収集日: お住まいの区名と町名(丁目まで)をお知らせいただければ"
+                "お調べします。"
+            )
+        lines.append(
+            "申込・手数料: 品目ごとに300円・500円・700円・1,000円のいずれかです。"
+            "事前に粗大ごみ受付センター(電話: 093-513-3005)またはインターネットで"
+            "お申し込みください(インターネットからの申込ではキャッシュレス決済も"
+            "選べます)。"
+        )
+        lines.append("注意事項: 粗大ごみは事前申込が必要です。申込なしで収集日に出さないでください。")
+        return "\n".join(lines)
+
+    if not_collected:
+        lines.append(
+            "出し方・条件: 市が収集しない品目です。"
+            "家庭ごみ・粗大ごみとして出すことはできません。"
+        )
+        lines.append("収集日: 市による決まった収集曜日はありません。")
+        lines.append(
+            "相談先: " + (notes or "販売店・専門の処理業者等へご相談ください。")
+        )
+        return "\n".join(lines)
+
+    if no_weekday:
+        lines.append("出し方・条件: " + (notes or "早見表の備考に記載された方法に従ってください。"))
+        lines.append("収集日: 決まった収集曜日はありません。")
+        lines.append("申込・手数料: 検索結果に記載なし")
+        lines.append("注意事項: 備考に記載されていない方法や条件は追加できません。")
+        return "\n".join(lines)
+
+    return None
 
 
 # データ層のクエリは必ずこの1本のスレッドで実行する。
@@ -753,6 +1491,22 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
 # なお本来はデータ層側で解決すべき問題でもある(接続をスレッドごとに持つ、
 # または check_same_thread=False + ロック)。こちらは応用層で完結する防御。
 _db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rag-lookup")
+
+
+def needs_history_retry(ans: "RoutedAnswer | None") -> bool:
+    """決定論的経路が品目も収集日も特定できなかったか。
+
+    この状態の回答は 6-3 の「品名を教えてください」固定文で、セッションの過去の
+    発話にある品目を一切使えていない。6-1a/6-2 は `app/server.py._mark` で印が
+    付くか、そもそも `_route_safely` の入口で返っているので、`safety_gate` が
+    "6-3" かどうかだけを見れば「完全空振り」を正確に判定できる(6-3 以外で
+    canned が立つ経路 — 4-3 確度ゲート・種別の一般説明なし — は、品目や種別に
+    見当が付いている)。
+
+    呼び出し側(`app/server.py._route_safely`)は True のとき、会話履歴の利用者
+    発言を前置した文字列で一度だけ引き直す(`agent.build_history_query`)。
+    """
+    return ans is not None and ans.safety_gate == "6-3"
 
 
 async def handle_query(
@@ -808,6 +1562,109 @@ _ANALOGY_PREFERRED = {
     "コントローラー": "電子ゲーム機(携帯ゲーム機)",
     "ワイヤレス充電器": "アダプター(電源用)",
 }
+
+# 既知の品名の「言い換え」を正式な早見表の品名へ直接固定する。
+# `_ANALOGY_PREFERRED` とは意味が違う ― あちらは「似ているが別の品目」を
+# 代用として使う類推、こちらは「同じ品目を指す別の言い方」の別名解決で、
+# 類推の確度判定(`_analogy_is_reliable` 等)を経由させず常に信頼してよい。
+# 完全一致・部分一致・ベクトル検索より先に試す(部分一致の並び順やベクトル
+# 距離の揺れに任せない ― 2026-09-14、B1トレース精査で「テレビ」が
+# 「テレビアンテナ」に、「お酒の空き瓶」が「酒パック」に化ける事例を確認)。
+_CANONICAL_ALIASES = {
+    "テレビ": "テレビ(ブラウン管式・液晶式・プラズマ式)",
+    "お酒の空き瓶": "びん(飲料・食品のびん)",
+    "お酒のあきびん": "びん(飲料・食品のびん)",
+    "酒の空き瓶": "びん(飲料・食品のびん)",
+    "酒瓶": "びん(飲料・食品のびん)",
+    "お酒の瓶": "びん(飲料・食品のびん)",
+    "ワインの瓶": "ワインびん",
+    "ワインのびん": "ワインびん",
+    "ワインボトル": "ワインびん",
+    "カップ麺の容器": "カップめんなどの容器・フィルム",
+    "カップめんの容器": "カップめんなどの容器・フィルム",
+    "カップラーメンの容器": "カップめんなどの容器・フィルム",
+    # 長音符の有無だけが違う同じ品目の言い換え(早見表の表記は「ソファー」)。
+    "ソファ": "ソファー",
+    # 2026-09-10 第6回採点回帰。化学物質名は早見表に品名として存在せず、
+    # 包括行(「薬品(家庭医薬品でないもの)」等)にしか対応が無い。ベクトル
+    # 類似に任せると「硫酸 → 油(食用油) = 家庭ごみ」のような別区分への誤類推が
+    # 起きるため、物質名そのものの言い換えとして包括行へ固定する。
+    # いずれも実データ(waste_items)に存在する行を指す。
+    "硫酸": "薬品(家庭医薬品でないもの)",
+    "塩酸": "薬品(家庭医薬品でないもの)",
+    "硝酸": "薬品(家庭医薬品でないもの)",
+    "化学薬品": "薬品(家庭医薬品でないもの)",
+    "劇物": "薬品(家庭医薬品でないもの)",
+    "毒物": "薬品(家庭医薬品でないもの)",
+    "農薬の空き容器": "農薬びん(家庭用)(中身のないもの)",
+    "農薬の容器": "農薬びん(家庭用)(中身のないもの)",
+    "注射器": "注射筒",
+}
+
+
+def resolve_canonical_alias(query: str) -> str | None:
+    """`query` が既知の品名の言い換えなら、正式な早見表の品名を返す。
+    該当しなければ None(呼び出し側は元の `query` のまま exact/partial/
+    ベクトルへ進む)。`app/rag/router.py`(決定論的経路)と
+    `app/rag/tools.py`(agentic経路)の両方から呼ばれる共通の解決関数。
+    """
+    return _CANONICAL_ALIASES.get(_norm(query))
+
+
+def _resolve_embedded_alias(text: str) -> str | None:
+    """`text` の中に言い換え表のキーが「品名の主辞として」現れていれば、
+    対応する正式名を返す。
+
+    `resolve_canonical_alias` が候補文字列そのものの言い換えなのに対し、こちらは
+    「理科の実験で使った硫酸が残っているのですが」のように品名が質問文に埋もれ、
+    候補抽出(`_item_name_candidates`)で切り出せなかった場合の救済。呼び出し側は
+    完全一致・部分一致・埋め込み品名がすべて空振りしたあとにだけ試すので、
+    既存の品名一致を横取りしない。
+
+    直後の境界検査に `_AFTER_NAME_OK` を使うのは `_pick_embedded_item` と同じ理由。
+    これが無いと「テレビ台」(別品目)の中の「テレビ」を拾ってしまう。直前の境界は
+    見ない(「使った硫酸」のように直前が動詞の活用語尾でも品名は品名のため)。
+    長いキーから順に試し、最も具体的な言い換えを優先する。
+    """
+    norm = _norm(text)
+    if not norm:
+        return None
+    for key, target in sorted(
+        _CANONICAL_ALIASES.items(), key=lambda kv: len(kv[0]), reverse=True
+    ):
+        if len(key) < 2:
+            continue
+        start = 0
+        while True:
+            idx = norm.find(key, start)
+            if idx == -1:
+                break
+            rest = norm[idx + len(key):]
+            if _AFTER_NAME_OK.match(rest) or _PART_SUFFIX_RE.match(rest):
+                return target
+            start = idx + 1
+    return None
+
+
+def _resolve_alias_hit(
+    prompt: str, item_candidates: list[str], hits: list[ItemRecord]
+) -> "ItemRecord | None":
+    """ヒットが言い換え表の解決結果だった場合、その1件を返す。
+
+    `_resolve_named_hit` は「ヒット名が質問文にそのまま現れている」ことしか
+    見ないため、言い換え・物質名から包括行へ解決したケース(質問文に正式名が
+    現れない)では None になる。ヒット名と解決先が一致することを確認したうえで
+    返し、呼び出し側で exact へ上げられるようにする。
+    """
+    for probe in [*item_candidates, prompt]:
+        target = resolve_canonical_alias(probe) or _resolve_embedded_alias(probe)
+        if not target:
+            continue
+        q = _norm(target)
+        for h in hits:
+            if _norm(getattr(h, "item_name", "")) == q:
+                return h
+    return None
 
 
 def _override_analogy_hits(query: str, hits: list[ItemRecord]) -> list[ItemRecord]:
@@ -899,6 +1756,13 @@ def _shared_run_len(a: str, b: str) -> int:
 _KANA_ONLY_RE = re.compile(r"^[ぁ-ん]+$")
 _PAREN_TAIL_RE = re.compile(r"[(（].*$")
 _KANJI_RE = re.compile(r"[一-龥々]")
+# `_has_plausible_item_text`/`category_procedure_intent` が地区名・種別語
+# 除去後の残りを判定する際、文中のどこにあっても句読点・空白を取り除いてから
+# 見るための正規表現。全角/半角の「？」「！」も対象(2026-09-14 レビュー
+# 指摘: 「粗大ごみってどうやって出すんですか？」のように文末に全角疑問符が
+# 付くと、除去後の残りに「？」が残って「実質的な内容がある」と誤判定され、
+# category_procedure_intent が None を返してしまっていた)。
+_PUNCT_OR_SPACE_RE = re.compile(r"[\s、。「」()（）？?!！]+")
 # 末尾一致(上位語)判定で、品名の本体ではない「サイズ・動力・用途」の接頭語。
 # これらを剥がした残りに内容語(漢字2つ以上)が残るなら、末尾一致でも別品目。
 _STRENGTH_PREFIX_MODS = (
@@ -1129,12 +1993,40 @@ _RULES_WITH_CONTEXT = (
     "(持ち込み先・事前申込の要否・梱包方法・注意事項など)を"
     "一つも省略せず、全て回答に含める。ただし備考に書かれていない条件は"
     "書かない。\n"
+    "- 備考が空、または検索結果に備考の記載が無い場合、条件について何も"
+    "書かない。「制限はありません」「特別な梱包は不要です」"
+    "「事前申込は不要です」のように、備考が無いことを条件が無いことの"
+    "根拠として断定してはならない(備考が無いのは単に情報が無いだけで、"
+    "条件が無いことの確認ではない)。\n"
 )
 
 _RULES_NO_CONTEXT = (
     "- 該当する情報が見つからなかったため、分別区分や収集日を断定してはならない。\n"
     "- 「該当する情報が見つかりませんでした」と明示し、"
     "北九州市の公式ページや窓口での確認を案内する。\n"
+)
+
+# 6-2(危険・違法な処分の誘導)。2026-09-10 の採点フィードバック
+# 「不適切な処理方法や誤った分別区分を肯定するような案内を避け…禁止事項や
+# 例外事項を明確に伝える」「専門業者への相談や正しい排出ルートの提示など、
+# 具体的な代替案を漏れなく案内する」に対応する。以前は検索前に固定文で
+# 断っていたが、それでは『農薬』のように早見表に正しい相談先があるケースでも
+# 具体策の無い拒否になってしまうため、検索は通したうえでこの指示を足す。
+_RULES_DANGEROUS_REQUEST = (
+    "- 利用者は、危険または法律に違反する処分方法(野焼き・不法投棄・排水口や"
+    "土壌への投棄・中身の残った容器への穴あけ等)をしてよいか尋ねている。"
+    "まず「いいえ、〜してはいけません」と明確に否定すること。"
+    "危険な方法の手順は一切書かない。\n"
+    "- 否定だけで終わらせず、正しい処分方法を必ずセットで示す。検索結果に"
+    "販売店・専門の処理業者・粗大ごみ受付センター・回収ボックス等の具体的な"
+    "相談先や排出ルートがあれば、一つも省略せず挙げること。\n"
+    "- 検索結果に該当品目が無い場合でも、情報不足を理由に回答を避けない。"
+    "その方法が禁止であることを明示したうえで、品名を具体的に尋ね、"
+    "北九州市の窓口へ相談するよう案内する。\n"
+    "- 検索結果の『備考』に、条件によって区分が変わる記載(「割れたものは"
+    "家庭ごみ」「必ず中身を使い切ってから穴をあけずに」等)がある場合は、"
+    "書かれているとおりに伝えること。断定を強めたり、否定・反対の意味に"
+    "書き換えたりしてはならない。\n"
 )
 
 # 4-3 確度ゲート(_analogy_is_reliable)で弾いたとき用。意味の近い候補は
@@ -1185,12 +2077,34 @@ def _has_conditional_notes(ans: RoutedAnswer) -> bool:
     return any(_CONDITION_HINT_RE.search(getattr(h, "notes", "") or "") for h in ans.item_hits)
 
 
-def build_system_prompt(ans: RoutedAnswer) -> str:
+_RULES_USER_CONDITION = (
+    "- 利用者は品物の状態・内容物について条件を述べている(「水と魚が入った"
+    "まま」「洗わずにそのまま」等)。その条件を無視せず、一つずつ取り上げて"
+    "どうすればよいかを案内すること。\n"
+    "- 検索結果にその条件の扱いが書かれている場合は、書かれているとおりに伝える"
+    "(「必ず中身を使い切ってから」等)。書かれていない場合でも「問題ありません」"
+    "「そのままで大丈夫です」と断定してはならない。検索結果からは判断できない"
+    "ことを明示し、北九州市の窓口(お住まいの区の環境センター)での確認を案内する。\n"
+)
+
+
+def build_system_prompt(ans: RoutedAnswer, prompt: str = "") -> str:
     """`RoutedAnswer` からLLMへのシステムプロンプトを組み立てる。
 
     設計提案書 3-7(未識別時は憶測で断定しない)をここで強制する。
+
+    `prompt` は利用者の生の発話。品物の状態・内容物について条件を述べている
+    場合(`_has_stated_condition`)に、その条件へ一つずつ触れさせる規則を足す
+    (`apply_response_template` が同じ判定で項目表を外すのと対になっている)。
     """
     parts = [_BASE_RULES]
+
+    if prompt and _has_stated_condition(prompt):
+        parts.append(_RULES_USER_CONDITION)
+
+    if ans.safety_gate == "6-2":
+        # 検索結果の有無に関わらず、禁止の明示と正しい手順の提示を課す。
+        parts.append(_RULES_DANGEROUS_REQUEST)
 
     if ans.found and ans.item_match == "analogy" and ans.analogy_unreliable:
         # 4-3 確度ゲートで弾いた候補。類推で断定させず、確認を促す。
@@ -1334,6 +2248,8 @@ def build_trace_record(prompt: str, ans: RoutedAnswer) -> dict:
     return {
         "prompt": prompt,
         "detected_item": ans.detected_item,
+        "detected_ward": ans.detected_ward,  # STAGE06 6-4: /trace の「検出した地区」表示用
+        "detected_town": ans.detected_town,
         "item_candidates": list(ans.item_candidates),
         "item_match_stage": ans.item_match_stage,
         "item_match": ans.item_match,
@@ -1346,6 +2262,7 @@ def build_trace_record(prompt: str, ans: RoutedAnswer) -> dict:
         "schedule_hits": len(ans.schedule_hits),
         "missing": list(ans.missing),
         "canned_response": bool(ans.canned_response),
+        "template_response": ans.template_response,
         "safety_gate": ans.safety_gate,  # STAGE06 6-4: 発火した安全ゲート("6-1a"/"6-2"/"6-3")
         "sources": list(ans.sources),
     }

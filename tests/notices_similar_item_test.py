@@ -117,10 +117,16 @@ def test_timeline_method_uses_only_the_structured_exact_date():
 def test_search_item_returns_hits_and_stage(monkeypatch):
     # the stage is kept for the WebUI 根拠 panel (#12); the answer logic uses
     # _classify_item_match instead.
+    # 「テレビ」は resolve_canonical_alias の対象になった(2026-09-14、
+    # 正式名「テレビ(ブラウン管式・液晶式・プラズマ式)」に固定される)ので、
+    # この汎用の exact-match 確認には別名工を使う。
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: _rec(n))
-    assert _search_item("テレビ") == ([_rec("テレビ")], "exact")
+    assert _search_item("傘") == ([_rec("傘")], "exact")
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    # lookup_item_contained_in(STAGE06 根因2)は exact/partial の後に実DBを
+    # 引くため、vector 段を検証するテストでは必ず空を返すよう閉じておく。
+    monkeypatch.setattr(router, "lookup_item_contained_in", lambda *a, **k: [])
     monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [])
     assert _search_item("宇宙服") == ([], None)
 
@@ -301,6 +307,9 @@ def test_blocking_route_uses_best_vector_hit_instead_of_canned(monkeypatch):
     # 区分を導く。canned にはしない。
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    # lookup_item_contained_in(STAGE06 根因2)は exact/partial の後に実DBを
+    # 引くため、vector 段を検証するテストでは必ず空を返すよう閉じておく。
+    monkeypatch.setattr(router, "lookup_item_contained_in", lambda *a, **k: [])
     monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [_rec("かご")])
     monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
 
@@ -316,6 +325,9 @@ def test_blocking_route_keeps_related_vector_analogy(monkeypatch):
     # ので通す(断定拒否にしない)。
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    # lookup_item_contained_in(STAGE06 根因2)は exact/partial の後に実DBを
+    # 引くため、vector 段を検証するテストでは必ず空を返すよう閉じておく。
+    monkeypatch.setattr(router, "lookup_item_contained_in", lambda *a, **k: [])
     monkeypatch.setattr(
         router, "vector_search_items", lambda q, top_k=3: [_rec("スケートボード")]
     )
@@ -328,21 +340,37 @@ def test_blocking_route_keeps_related_vector_analogy(monkeypatch):
 
 
 # --- canned は「使える候補が1つも無い」ときだけ ------------------------
-def test_canned_only_when_no_usable_hit(monkeypatch):
+def test_total_miss_falls_through_to_the_6_3_canned_reply(monkeypatch):
+    """完全空振り(品目・収集日・類推すべて0件)。
+
+    STAGE04 まではここを `_RULES_NO_CONTEXT`(プロンプト指示のみ)で LLM に
+    「見つかりませんでした」と言わせていたが、STAGE06 6-3(stage06_proposal §2.3)
+    で硬性 canned_response に格上げした。`safety_gate` が "6-3" になる。
+    """
+    from app.rag import safety
+
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    # lookup_item_contained_in(STAGE06 根因2)は exact/partial の後に実DBを
+    # 引くため、vector 段を検証するテストでは必ず空を返すよう閉じておく。
+    monkeypatch.setattr(router, "lookup_item_contained_in", lambda *a, **k: [])
     monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [])
     monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
 
     ans = router._blocking_route("宇宙エレベーターはどう捨てますか")
-    # ヒット0件 → found=False。canned/断定拒否は _RULES_NO_CONTEXT 側で扱う
+
     assert ans.item_hits == []
-    assert ans.canned_response is None
+    assert ans.found is False
+    assert ans.canned_response == safety.no_result_reply()
+    assert ans.safety_gate == "6-3"
 
 
 def test_blocking_route_no_canned_for_reliable_analogy(monkeypatch):
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    # lookup_item_contained_in(STAGE06 根因2)は exact/partial の後に実DBを
+    # 引くため、vector 段を検証するテストでは必ず空を返すよう閉じておく。
+    monkeypatch.setattr(router, "lookup_item_contained_in", lambda *a, **k: [])
     monkeypatch.setattr(
         router, "vector_search_items", lambda q, top_k=3: [_rec("スケートボード")]
     )
@@ -377,6 +405,9 @@ def test_partial_hit_never_flagged_unreliable_even_if_lexically_unrelated(monkey
 def test_vector_stage_analogy_produces_a_pick_not_canned(monkeypatch):
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    # lookup_item_contained_in(STAGE06 根因2)は exact/partial の後に実DBを
+    # 引くため、vector 段を検証するテストでは必ず空を返すよう閉じておく。
+    monkeypatch.setattr(router, "lookup_item_contained_in", lambda *a, **k: [])
     monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [_rec("かご")])
     monkeypatch.setattr(router, "lookup_collection_schedule", lambda *a, **k: None)
 
@@ -456,6 +487,9 @@ def test_blocking_route_recovers_item_from_polluted_candidate(monkeypatch):
     # ヒット名「スプレー缶」が原文にあるので exact に復帰し timeline を引く。
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    # lookup_item_contained_in(STAGE06 根因2)は exact/partial の後に実DBを
+    # 引くため、vector 段を検証するテストでは必ず空を返すよう閉じておく。
+    monkeypatch.setattr(router, "lookup_item_contained_in", lambda *a, **k: [])
     monkeypatch.setattr(
         router, "vector_search_items",
         lambda q, top_k=3: [_rec("スプレー缶"), _rec("殺虫剤スプレー缶")],
@@ -534,6 +568,9 @@ def test_electric_nose_trimmer_gets_a_hedged_analogy(monkeypatch):
     # canned にはしない(類似品があるので確認だけ促すのは減点)。
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    # lookup_item_contained_in(STAGE06 根因2)は exact/partial の後に実DBを
+    # 引くため、vector 段を検証するテストでは必ず空を返すよう閉じておく。
+    monkeypatch.setattr(router, "lookup_item_contained_in", lambda *a, **k: [])
     monkeypatch.setattr(
         router, "vector_search_items",
         lambda q, top_k=3: [_rec("電動歯ブラシ"), _rec("カッター(刃を含む)"), _rec("マッサージ機")],
@@ -578,6 +615,9 @@ def test_override_analogy_hits_forces_reference_item(monkeypatch):
 def test_analogy_answer_cites_only_the_picked_reference(monkeypatch):
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
+    # lookup_item_contained_in(STAGE06 根因2)は exact/partial の後に実DBを
+    # 引くため、vector 段を検証するテストでは必ず空を返すよう閉じておく。
+    monkeypatch.setattr(router, "lookup_item_contained_in", lambda *a, **k: [])
     monkeypatch.setattr(
         router, "vector_search_items",
         lambda q, top_k=3: [

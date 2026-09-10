@@ -226,6 +226,182 @@ def test_unrelated_extra_search_call_does_not_pollute_context(monkeypatch):
     asyncio.run(body())
 
 
+def test_item_search_with_a_query_absent_from_the_prompt_is_not_trusted(monkeypatch):
+    """5-1 の回帰テスト: 品目名を一切含まない発言(地域名だけ)に対して
+    モデルが search_waste_item を存在しない品目名で呼んでも、それを根拠に
+    しない。
+
+    2026-09-10、B1実機の複数ターン会話で「小倉北区浅野1丁目です」
+    (品目名を一切含まない発言)に対し、モデルが `車いす(電動式を除く)` を
+    検索して見つけたことにし、それを根拠に無関係な回答を生成する事例が
+    見つかった(要件5-1「推測せず確認する」への違反)。他に何も拾えなければ
+    `route_agentically` は None を返し、呼び出し側が決定論的経路
+    (「該当する情報が見つかりませんでした」)にフォールバックすること。"""
+
+    def fake_execute_tool(name, arguments):
+        assert name == "search_waste_item"
+        assert arguments == {"query": "車いす"}
+        return {
+            "match_stage": "vector",
+            "items": [
+                {
+                    "item_name": "車いす(電動式を除く)",
+                    "disposal_method": "粗大ごみ",
+                    "notes": "",
+                    "source_url": "https://example.test/wheelchair",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    _TOOL_CALL_MADE_UP = (
+        "<tool_call>\n"
+        '{"name": "search_waste_item", "arguments": {"query": "車いす"}}\n'
+        "</tool_call>"
+    )
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_MADE_UP, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "小倉北区浅野1丁目です", engine=engine, build_prompt=_build_prompt,
+            sampling_params=object(),
+        )
+        # 品目・収集日・一般説明のいずれも実質的に拾えていないので、呼び出し
+        # 側で決定論的経路にフォールバックさせる None を返す。
+        assert result is None
+
+    asyncio.run(body())
+
+
+def test_item_search_with_a_query_present_in_the_prompt_is_still_trusted(monkeypatch):
+    """上のガードが、本文に実在する品目名まで誤って弾かないことを確認する
+    (既存の正常系の維持)。"""
+
+    def fake_execute_tool(name, arguments):
+        if name == "search_waste_item":
+            assert arguments == {"query": "テレビ"}
+            return {
+                "match_stage": "exact",
+                "items": [
+                    {
+                        "item_name": "テレビ",
+                        "disposal_method": "粗大ごみ",
+                        "notes": "事前申込制",
+                        "source_url": "https://example.test/tv",
+                    }
+                ],
+            }
+        if name == "lookup_collection_schedule":
+            # _fill_missing_schedule がコード側から直接呼ぶ(品目は見つかった
+            # が、モデルがこのツールを自発的に呼ばなかった場合の安全策)。
+            return {"schedules": []}
+        raise AssertionError(f"unexpected tool call: {name}")
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_TV, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "小倉北区城内でテレビはどう捨てますか", engine=engine,
+            build_prompt=_build_prompt, sampling_params=object(),
+        )
+        assert result is not None
+        assert result.item_hits[0].item_name == "テレビ"
+
+    asyncio.run(body())
+
+
+def test_single_character_item_name_is_not_falsely_blocked_by_the_grounding_gate(
+    monkeypatch,
+):
+    """2026-09-10 レビュー指摘の回帰: `_query_grounded_in_text` が「2文字以上
+    の共通する連続部分列」だけを見ていると、「傘」のような1文字の品目名は
+    それ自体の長さが1しかないため常に弾かれてしまっていた。本文にそのまま
+    含まれる(部分文字列として一致する)場合は文字数に関わらず信頼する。"""
+
+    def fake_execute_tool(name, arguments):
+        if name == "search_waste_item":
+            assert arguments == {"query": "傘"}
+            return {
+                "match_stage": "exact",
+                "items": [
+                    {
+                        "item_name": "傘",
+                        "disposal_method": "燃えないごみ",
+                        "notes": "",
+                        "source_url": "https://example.test/kasa",
+                    }
+                ],
+            }
+        if name == "lookup_collection_schedule":
+            return {"schedules": []}
+        raise AssertionError(f"unexpected tool call: {name}")
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    _TOOL_CALL_KASA = (
+        "<tool_call>\n"
+        '{"name": "search_waste_item", "arguments": {"query": "傘"}}\n'
+        "</tool_call>"
+    )
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_KASA, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "傘はどう捨てますか", engine=engine, build_prompt=_build_prompt,
+            sampling_params=object(),
+        )
+        assert result is not None
+        assert result.item_hits[0].item_name == "傘"
+
+    asyncio.run(body())
+
+
+def test_single_hiragana_character_query_is_not_trusted_even_if_substring_matches(
+    monkeypatch,
+):
+    """2026-09-10 レビュー指摘の回帰: 「傘」のような1文字品目名を通すために
+    部分文字列一致を先に見るようにした結果、query が「す」のようなひらがな
+    1文字だと「です」「ます」等の語尾にほぼ必ず含まれてしまい、部分文字列
+    一致だけでは弾けなくなっていた。「小倉北区浅野1丁目です」
+    (品目名を一切含まない発言)に対しモデルが query="す" で
+    search_waste_item を呼んでも、それを根拠にしない。"""
+
+    def fake_execute_tool(name, arguments):
+        assert name == "search_waste_item"
+        assert arguments == {"query": "す"}
+        return {
+            "match_stage": "vector",
+            "items": [
+                {
+                    "item_name": "車いす(電動式を除く)",
+                    "disposal_method": "粗大ごみ",
+                    "notes": "",
+                    "source_url": "https://example.test/wheelchair",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    _TOOL_CALL_SU = (
+        "<tool_call>\n"
+        '{"name": "search_waste_item", "arguments": {"query": "す"}}\n'
+        "</tool_call>"
+    )
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_SU, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "小倉北区浅野1丁目です", engine=engine, build_prompt=_build_prompt,
+            sampling_params=object(),
+        )
+        assert result is None
+
+    asyncio.run(body())
+
+
 def test_tool_execution_exception_is_caught_and_returns_none(monkeypatch):
     def raising_execute_tool(name, arguments):
         raise RuntimeError("boom")
@@ -276,6 +452,33 @@ def test_image_item_name_is_passed_through_as_context():
         assert "テレビ" in user_msg
 
     asyncio.run(body())
+
+
+def test_conversation_history_is_passed_to_function_calling_prompt():
+    captured_messages = []
+
+    def capturing_build_prompt(messages, tools=None):
+        captured_messages.append(messages)
+        return {"messages": messages, "tools": tools}
+
+    history = [
+        {"role": "user", "content": "ペットボトルの分別を教えて"},
+        {"role": "assistant", "content": "ペットボトルは資源ごみです。"},
+    ]
+
+    async def body():
+        await agent.route_agentically(
+            "小倉北区浅野1丁目です。収集日も教えてください。",
+            engine=_ScriptedEngine([_PLAIN_TEXT]),
+            build_prompt=capturing_build_prompt,
+            sampling_params=object(),
+            history=history,
+        )
+
+    asyncio.run(body())
+    messages = captured_messages[0]
+    assert messages[1:3] == history
+    assert messages[3]["content"].startswith("小倉北区浅野1丁目")
 
 
 def test_district_fallback_note_reaches_context_and_states_the_weekday(monkeypatch):
@@ -437,3 +640,218 @@ def test_schedule_is_filled_in_even_when_the_model_never_calls_the_tool(monkeypa
         assert "第1月曜日" in result.context
 
     asyncio.run(body())
+
+
+# --------------------------------------------------------------------------
+# STAGE06: 品目検索が失敗したのに search_general_info の弱い結果で found=True
+# になってしまう回帰(コードレビュー PR #45 で発見)
+# --------------------------------------------------------------------------
+_TOOL_CALL_UFO = (
+    "<tool_call>\n"
+    '{"name": "search_waste_item", "arguments": {"query": "謎の物体"}}\n'
+    "</tool_call>"
+)
+_TOOL_CALL_GENERAL_INFO = (
+    "<tool_call>\n"
+    '{"name": "search_general_info", "arguments": {"query": "謎の物体"}}\n'
+    "</tool_call>"
+)
+
+
+def test_failed_item_search_plus_weak_explanation_falls_back_to_none(monkeypatch):
+    """品目検索(search_waste_item)が空振りしたあと、search_general_info が
+    (弱いかもしれない)説明チャンクを拾っただけでは found=True にしない。
+
+    修正前は `collected_explanations` が非空というだけで found=True が確定し、
+    STAGE06 6-3(完全空振りの固定拒絶)が `_blocking_route` 側にしか配線されて
+    いないため、この経路だけ6-3を素通りしていた。
+    """
+
+    def fake_execute_tool(name, arguments):
+        if name == "search_waste_item":
+            return {"match_stage": "none", "items": []}
+        if name == "search_general_info":
+            return {
+                "results": [
+                    {
+                        "text": "ごみステーションの利用ルールについて…",
+                        "source_url": "https://example.test/station",
+                        "source_page_title": "ごみステーションの散乱対策について",
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected tool call: {name}")
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_UFO, _TOOL_CALL_GENERAL_INFO, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "謎の物体はどう捨てればいいですか", engine=engine,
+            build_prompt=_build_prompt, sampling_params=object(),
+        )
+        # 呼び出し側(_route_safely)を決定論的経路にフォールバックさせ、
+        # そちら側で6-3の固定拒絶が正しく発火する。
+        assert result is None
+
+    asyncio.run(body())
+
+
+def test_pure_general_info_question_without_item_search_still_succeeds(monkeypatch):
+    """search_waste_item を一度も呼ばず(＝最初から一般説明質問として扱われ)
+    search_general_info だけで答えたケースは、修正後も found=True のまま
+    (ベクトルRAGパスの正規の使い方を壊さないことの確認)。
+    """
+
+    def fake_execute_tool(name, arguments):
+        assert name == "search_general_info"
+        return {
+            "results": [
+                {
+                    "text": "ごみステーションの防鳥ネットは補助金の対象です。",
+                    "source_url": "https://example.test/station",
+                    "source_page_title": "ごみステーションの散乱対策について",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(agent, "execute_tool", fake_execute_tool)
+
+    async def body():
+        engine = _ScriptedEngine([_TOOL_CALL_GENERAL_INFO, _PLAIN_TEXT])
+        result = await agent.route_agentically(
+            "ごみステーションの防鳥ネットは借りられますか", engine=engine,
+            build_prompt=_build_prompt, sampling_params=object(),
+        )
+        assert result is not None
+        assert result.found is True
+        assert "防鳥ネット" in result.context
+
+    asyncio.run(body())
+
+
+# --------------------------------------------------------------------------
+# STAGE05(本田) × 5-1 グラウンディングガード(周)の統合
+# --------------------------------------------------------------------------
+# 本田の方式では過去ターンの品目を会話履歴から引き継いで検索させる。一方
+# `_query_grounded_in_text` は「モデルが利用者の言っていない品目名を作り
+# 出した」ことを弾くガードで、以前は今回の発話だけを見ていたため、履歴から
+# 引き継いだ品目名(下の「ソファ」)を必ず弾いてしまい、本田の多ターン対応を
+# 丸ごと無効化していた。比較対象を「このセッションで利用者が話した全ターン」
+# に広げたことの回帰。
+_TOOL_CALL_SOFA_FROM_HISTORY = (
+    "<tool_call>\n"
+    '{"name": "search_waste_item", "arguments": {"query": "ソファ"}}\n'
+    "</tool_call>"
+)
+
+
+def _sofa_tool(name, arguments):
+    if name == "search_waste_item":
+        return {
+            "match_stage": "exact",
+            "items": [
+                {
+                    "item_name": "ソファ",
+                    "disposal_method": "粗大ごみ",
+                    "notes": "事前申込制",
+                    "source_url": "https://example.test/sofa",
+                }
+            ],
+        }
+    return {}
+
+
+def test_item_carried_over_from_user_history_passes_the_grounding_guard(monkeypatch):
+    monkeypatch.setattr(agent, "execute_tool", _sofa_tool)
+    history = [
+        {"role": "user", "content": "ソファを捨てたいです"},
+        {"role": "assistant", "content": "ソファは粗大ごみです。"},
+    ]
+
+    async def body():
+        return await agent.route_agentically(
+            "え、じゃあどうすればいいですか？",
+            engine=_ScriptedEngine([_TOOL_CALL_SOFA_FROM_HISTORY, _PLAIN_TEXT]),
+            build_prompt=_build_prompt, sampling_params=object(),
+            history=history,
+        )
+
+    result = asyncio.run(body())
+    assert result is not None
+    assert [h.item_name for h in result.item_hits] == ["ソファ"]
+
+
+def test_item_mentioned_only_by_the_assistant_is_still_rejected(monkeypatch):
+    """assistant の発言(案内文中の例示等)は根拠にしない。利用者が一度も
+    言っていない品目名は、履歴があっても従来どおり弾く。"""
+    monkeypatch.setattr(agent, "execute_tool", _sofa_tool)
+    history = [
+        {"role": "user", "content": "これ燃えるゴミで合ってますよね？"},
+        {"role": "assistant", "content": "品物の名前を教えてください(例:「ソファ」など)。"},
+    ]
+
+    async def body():
+        return await agent.route_agentically(
+            "え、じゃあどうすればいいですか？",
+            engine=_ScriptedEngine([_TOOL_CALL_SOFA_FROM_HISTORY, _PLAIN_TEXT]),
+            build_prompt=_build_prompt, sampling_params=object(),
+            history=history,
+        )
+
+    # 採用された検索結果が1件も無いので、呼び出し側へフォールバック(None)。
+    assert asyncio.run(body()) is None
+
+
+def test_message_text_extracts_text_from_image_turns():
+    msg = {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "ソファ"}]}
+    assert agent._message_text(msg) == "ソファ"
+    assert agent._message_text({"role": "user", "content": "傘"}) == "傘"
+
+
+# --- 言い換えで解決した品目を exact として扱う(2026-09-10 第6回採点) ----------
+# モデルが query="硫酸" で検索し、ツールが包括行「薬品(家庭医薬品でないもの)」を
+# 返すと、`_build_routed_answer` は名前の一致で exact/analogy を決めるため
+# analogy に落ち、「類似する『薬品…』に準じると」というためらいのある言い回しと、
+# 類推用のプロンプト規則になっていた(B1実機のスモークテストで確認)。
+# 決定論的経路には同じ引き上げ(`_resolve_alias_hit`)が入っている。
+
+_TOOL_CALL_SULFURIC = (
+    "<tool_call>\n"
+    '{"name": "search_waste_item", "arguments": {"query": "硫酸"}}\n'
+    "</tool_call>"
+)
+_TOOL_CALL_SKATEBOARD = (
+    "<tool_call>\n"
+    '{"name": "search_waste_item", "arguments": {"query": "電動スケートボード"}}\n'
+    "</tool_call>"
+)
+
+
+def _route_with_tool(prompt: str, tool_call: str):
+    """実DBのツールを通して agentic 経路を回す(実行結果は本物の早見表から引く)。"""
+    async def body():
+        return await agent.route_agentically(
+            prompt, engine=_ScriptedEngine([tool_call]),
+            build_prompt=_build_prompt, sampling_params=object(),
+        )
+
+    return asyncio.run(body())
+
+
+def test_alias_resolved_item_is_exact_not_analogy():
+    ans = _route_with_tool(
+        "理科の実験で使った硫酸が残っているのですが、どう処分すればいいですか？",
+        _TOOL_CALL_SULFURIC,
+    )
+    assert ans is not None
+    assert ans.item_match == "exact"
+    assert ans.detected_item == "薬品(家庭医薬品でないもの)"
+    assert [h.item_name for h in ans.item_hits] == ["薬品(家庭医薬品でないもの)"]
+
+
+def test_embedded_item_hit_is_still_an_analogy():
+    """「電動スケートボード」の中の「スケートボード」は別品目なので exact にしない。"""
+    ans = _route_with_tool("電動スケートボードはどう捨てますか", _TOOL_CALL_SKATEBOARD)
+    assert ans is not None
+    assert ans.item_match == "analogy"
