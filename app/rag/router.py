@@ -1223,7 +1223,25 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     return ans
 
 
-def apply_response_template(ans: RoutedAnswer) -> RoutedAnswer:
+# 利用者が自分の前提の是非を確かめている(はい/いいえで答えるべき)質問。
+# 「〜ですよね」「〜していいですか」「〜でいいですか」「大丈夫ですか」等。
+# 「どう捨てればいいですか」のような手順の質問(〜ばいいですか)は含めない —
+# そちらは必須項目テンプレートが本来想定している質問なので、ここで拾うと
+# テンプレートが実質的に無効になってしまう。
+_CONFIRMATION_RE = re.compile(
+    r"(よね"
+    r"|て(?:も)?いい(?:です|んです|の)?か"
+    r"|で(?:も)?いい(?:です|んです|の)?か"
+    r"|大丈夫|構いません|かまいません|問題(?:ない|ありません)"
+    r"|合って(?:い)?ます|正しいです)"
+)
+
+
+def _is_confirmation_question(prompt: str) -> bool:
+    return bool(_CONFIRMATION_RE.search(_norm(prompt or "")))
+
+
+def apply_response_template(ans: RoutedAnswer, prompt: str = "") -> RoutedAnswer:
     """高リスク回答に必須項目テンプレートを適用して返す。
 
     決定論的ルートだけでなく Function Calling ルートにも同じ制約を
@@ -1234,8 +1252,16 @@ def apply_response_template(ans: RoutedAnswer) -> RoutedAnswer:
     への回答から「いいえ、燃やしてはいけません」という明確な否定が消えて
     しまう。6-2 は `_RULES_DANGEROUS_REQUEST` を課した LLM 生成で、否定と
     正しい手順(検索結果の相談先)をセットで答える。
+
+    `prompt` が確認型の質問(`_is_confirmation_question`)の場合も対象外。
+    2026-09-10 第5回採点で「エアコンは燃えないごみの日に出せばいいんですよね？」
+    等の誤った前提の確認は、LLM が「いいえ、燃えないごみの日には出せません」と
+    前提を明確に否定して通過していた。テンプレートは項目表しか返さず、この
+    否定が消える(統合ブランチで実DBに対して確認)。
     """
     if ans.safety_gate == "6-2":
+        return ans
+    if _is_confirmation_question(prompt):
         return ans
     if ans.canned_response is None:
         templated = _build_required_fields_response(ans)

@@ -369,13 +369,13 @@ async def _route_safely(
         if agentic_result is not None:
             # 6-2 の印を先に付けてからテンプレートを判定する(テンプレートは
             # 6-2 を対象外にする。`router.apply_response_template` 参照)。
-            return router.apply_response_template(_mark(agentic_result))
+            return router.apply_response_template(_mark(agentic_result), prompt)
         print("[agent] route_agentically returned None, falling back to deterministic router",
               flush=True)
 
     try:
         result = await router.handle_query(prompt, img, engine=engine, processor=processor)
-        return router.apply_response_template(_mark(result))
+        return router.apply_response_template(_mark(result), prompt)
     except Exception as exc:  # noqa: BLE001 — 生成の継続を最優先する
         print(f"[rag] handle_query failed, falling back to plain generation: {exc!r}",
               flush=True)

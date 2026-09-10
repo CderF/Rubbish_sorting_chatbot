@@ -437,3 +437,97 @@ def test_response_template_still_applies_to_ordinary_questions():
     assert ans.canned_response is not None
     assert ans.template_response is True
     assert "販売店" in ans.canned_response
+
+
+# --- 確認型の質問では必須項目テンプレートを使わない(2026-09-10 第5回採点) ---
+# 「エアコンは燃えないごみの日に出せばいいんですよね？」は LLM が
+# 「いいえ、燃えないごみの日には出せません」と前提を否定して通過していた。
+# テンプレートは項目表しか返さず、この否定が消える。
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "エアコンは燃えないごみの日に出せばいいんですよね？",
+        "自動車用のバッテリーを家庭ごみに混ぜて出してもいいですか？",
+        "スーパーの袋でいいですか？",
+        "このまま出しても大丈夫ですか？",
+    ],
+)
+def test_confirmation_questions_skip_the_template(prompt):
+    from app.rag.router import apply_response_template
+
+    ans = apply_response_template(_not_collected_answer(None), prompt)
+    assert ans.canned_response is None
+    assert ans.template_response is False
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "エアコンはどう捨てればいいですか？",       # 手順の質問(〜ばいいですか)
+        "タイヤはどこに出せばいいですか？",
+        "使い残した農薬を処分したいのですが、収集してもらえますか？",
+        "エアコンの捨て方を教えてください",
+    ],
+)
+def test_procedure_questions_still_get_the_template(prompt):
+    from app.rag.router import apply_response_template
+
+    ans = apply_response_template(_not_collected_answer(None), prompt)
+    assert ans.template_response is True
+
+
+# --- ごみ出しルール表の追加分(2026-09-10 第5回採点) -----------------------
+# いずれも利用者の誤った前提を LLM が肯定してしまっていた(Q45「スーパーの
+# 袋で大丈夫です」、Q46「粗大ごみは無料です」、Q47「かん・びんとペットボトルは
+# まとめてよい」)。根拠: 北九州市「家庭ごみ」ページ(指定袋以外は収集しない、
+# 収集日の朝8時30分まで)、DB の説明ページ「指定袋と粗大ごみ処理手数料納付券の
+# 料金について」(粗大ごみ手数料、資源化物用の袋が別々)。
+@pytest.mark.parametrize(
+    "prompt,must_contain",
+    [
+        ("指定袋が今切れているので、普通のスーパーの袋で家庭ごみを出しても大丈夫ですよね？",
+         "指定袋以外"),
+        ("粗大ごみは無料で回収してもらえますよね？", "有料"),
+        ("かん・びんとペットボトルは同じ袋にまとめて出していいですよね？", "別々"),
+        ("家庭ごみは深夜に出しておいても大丈夫ですよね？", "8時30分"),
+        ("資源ごみは収集日の前日の夜に出しておいても大丈夫ですよね？", "8時30分"),
+    ],
+)
+def test_new_waste_rules_deny_the_wrong_premise(prompt, must_contain):
+    verdict = safety.check_entry_gate(prompt, ward=None, town=None)
+    assert verdict is not None
+    assert verdict.blocks_search is True
+    assert verdict.reply.startswith("いいえ")
+    assert must_contain in verdict.reply
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        # 4-1 のお知らせには「無料で回収」するイベントがある。粗大ごみの話で
+        # なければ「粗大ごみは有料」の規則を当ててはいけない。
+        "ホバーボードは無料で回収してもらえますか？",
+        # 「レジ袋」は早見表の品目(プラスチック)。袋の規則を当てない。
+        "レジ袋はどう捨てればいいですか？",
+        # かん・びんだけ/ペットボトルだけの質問は通常の品目検索へ。
+        "ペットボトルはまとめて出していいですか？",
+        "かん・びんの収集日を教えてください",
+    ],
+)
+def test_new_waste_rules_do_not_misfire(prompt):
+    verdict = safety.check_entry_gate(prompt, ward=None, town=None)
+    assert verdict is None or verdict.gate != "6-1a" or not verdict.reply.startswith("いいえ")
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        # 実採点traceの発話(多ターンで品物を答えただけ)。「レジ袋で」が
+        # 「レジ袋です」に前方一致して指定袋ルールが誤爆していた。
+        "レジ袋です。",
+        # 袋そのものを捨てる質問は、指定袋ルールではなく品目検索へ。
+        "スーパーの袋はどう捨てればいいですか？",
+    ],
+)
+def test_bag_rule_does_not_fire_on_the_bag_itself(prompt):
+    assert safety._match_waste_rule(safety._normalize(prompt)) is None
