@@ -96,13 +96,13 @@ MAX_SESSIONS = 256
 # Never return an empty body — that fails the question outright.
 EMPTY_FALLBACK = "申し訳ありません。回答を生成できませんでした。もう一度お試しください。"
 
-# Agentic RAG(Function Calling)。既定オフ: 実機(B1/B2)でチャットテンプレート
-# の tools= 描画とツール呼び出しの実フォーマットを検証してから有効化する
-# (このセッションはGPUサーバーに接続できず検証できていないため)。
-# 失敗しても _route_safely が現行の決定論的経路へ自動フォールバックするので、
-# 有効化してもグレーディング中の既存挙動を壊さない設計だが、フラグはいつでも
-# 即座に戻せるよう env var のままにしてある。
-AGENTIC_RAG_ENABLED = os.environ.get("AGENTIC_RAG_ENABLED", "0") == "1"
+# Agentic RAG(Function Calling)。既定オン: B1実機で複数の質問パターン
+# (早見表パス・収集日パス・ベクトルRAGパス)を検証済み(2026-09-10、
+# app/rag/agent.py のモジュールdocstring参照)。失敗しても _route_safely が
+# 現行の決定論的経路へ自動フォールバックするので、既定オンでも安全側の設計
+# は維持している。フラグはいつでも即座に戻せるよう env var のままにしてある
+# (`AGENTIC_RAG_ENABLED=0` で無効化)。
+AGENTIC_RAG_ENABLED = os.environ.get("AGENTIC_RAG_ENABLED", "1") == "1"
 AGENTIC_TOOL_CALL_MAX_TOKENS = 300
 
 app = FastAPI()
