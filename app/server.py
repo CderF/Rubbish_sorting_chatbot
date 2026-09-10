@@ -342,12 +342,13 @@ async def _route_safely(
             history=history,
         )
         if agentic_result is not None:
-            return agentic_result
+            return router.apply_response_template(agentic_result)
         print("[agent] route_agentically returned None, falling back to deterministic router",
               flush=True)
 
     try:
-        return await router.handle_query(prompt, img, engine=engine, processor=processor)
+        result = await router.handle_query(prompt, img, engine=engine, processor=processor)
+        return router.apply_response_template(result)
     except Exception as exc:  # noqa: BLE001 — 生成の継続を最優先する
         print(f"[rag] handle_query failed, falling back to plain generation: {exc!r}",
               flush=True)
@@ -376,6 +377,8 @@ async def _stream_chat(
     # そのまま1フレームで返す。engine.generate は通さない。
     if routed is not None and routed.canned_response:
         text = routed.canned_response
+        citations = router.format_citations(routed) if routed.template_response else ""
+        text += citations
         yield f"data: {json.dumps({'delta': text}, ensure_ascii=False)}\n\n"
         async with _sessions_lock:
             sessions[session_id] = messages + [
