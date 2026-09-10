@@ -80,6 +80,12 @@ _SYSTEM_PROMPT = (
     "あなたは北九州市のごみ分別・収集日を案内するアシスタントの検索エージェントです。\n"
     "ユーザーの質問に直接答えず、まずは提供されたツールを使って必要な情報を"
     "集めることに専念してください。\n"
+    "この会話では、現在の発話だけでなく、それまでの会話履歴も前提にして"
+    "検索条件を判断してください。過去の品目・地区が現在の発話で省略されて"
+    "いる場合は引き継ぎ、「追加」「も」「一緒に」は既存の条件を保持して追加、"
+    "「変更」「訂正」「やっぱり」「ではなく」は該当する過去の条件を今回の内容"
+    "に置き換えてください。品目と地区が会話全体で揃ったら、両方を使って"
+    "分別・出し方・収集日を検索してください。\n"
     "- 品目の分別方法を調べるには search_waste_item を使う。\n"
     "- 収集曜日を調べるには lookup_collection_schedule を使う"
     "(区名と町名が分かっているときに呼ぶ。町名は丁目まで分からなくてもよく、"
@@ -108,8 +114,13 @@ async def route_agentically(
     sampling_params: Any,
     image_item_name: str | None = None,
     max_iterations: int = _MAX_ITERATIONS_DEFAULT,
+    history: list[dict] | None = None,
 ) -> RoutedAnswer | None:
     """Function Calling でツールを呼びながら検索する。
+
+    `history` は同じ `session_id` の過去の user/assistant ターン。検索条件の
+    省略・追加・変更・訂正をFunction Calling側でも解釈できるよう、現在の
+    発話と一緒に検索エージェントへ渡す。
 
     成功すれば `RoutedAnswer` を、失敗すれば None を返す(呼び出し側は None の
     とき決定論的経路にフォールバックすること)。この関数自体は例外を投げない
@@ -117,7 +128,8 @@ async def route_agentically(
     """
     try:
         return await _run_loop(
-            prompt, engine, build_prompt, sampling_params, image_item_name, max_iterations
+            prompt, engine, build_prompt, sampling_params, image_item_name,
+            history, max_iterations
         )
     except Exception as exc:  # noqa: BLE001 — 呼び出し側のフォールバックに委ねる
         print(f"[agent] route_agentically failed: {exc!r}", flush=True)
@@ -130,14 +142,19 @@ async def _run_loop(
     build_prompt: Callable[..., dict],
     sampling_params: Any,
     image_item_name: str | None,
+    history: list[dict] | None,
     max_iterations: int,
 ) -> RoutedAnswer | None:
     user_content = prompt
     if image_item_name:
         user_content = f"(画像から推定した品目名: {image_item_name})\n\n{prompt}"
 
+    # `server.sessions` stores only user/assistant turns. Copy the list so the
+    # tool-call loop can append its own assistant/tool messages without
+    # modifying the session history that is concurrently used by `/chat`.
     messages: list[dict] = [
         {"role": "system", "content": _SYSTEM_PROMPT},
+        *(list(history) if history else []),
         {"role": "user", "content": user_content},
     ]
 
