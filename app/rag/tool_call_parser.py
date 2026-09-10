@@ -16,6 +16,13 @@ Hermes方式(`<tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>`)
 このパーサーはその形式を主に扱うが、単一の固定フォーマットに決め打ちせず
 「候補パターンを順に試す」設計は維持してある(実際の生成結果でずれが見つ
 かった場合に `_CANDIDATE_PATTERNS` へ追加するだけで対応できるように)。
+
+B1(本番機)で `AGENTIC_RAG_ENABLED=1` に切り替えて実機検証済み(2026-09-10、
+検証後コードは変更せずデプロイのみ元へ完全に戻した)。実際の
+Qwen3-VL-8B-Instruct が複数の異なる質問でこのHermes形式の tool_call を
+安定して生成し、このパーサーが問題なく抽出できることを確認した
+(`app/rag/agent.py` のモジュールdocstring参照。第二候補パターンへの
+フォールバックが必要になった実例は無し)。
 """
 
 from __future__ import annotations
