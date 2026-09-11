@@ -232,7 +232,15 @@ class MCPBridge:
         if not result.contents:
             raise BridgeError("空のリソース応答です")
         content = result.contents[0]
-        mime = content.mimeType or "application/octet-stream"
+        # MCP 1.x uses ``mime_type`` while older SDK models exposed the
+        # camelCase ``mimeType`` spelling.  Keep the WebUI response stable
+        # across both SDK versions.
+        mime = _field(
+            content,
+            "mimeType",
+            "mime_type",
+            default="application/octet-stream",
+        ) or "application/octet-stream"
         text = getattr(content, "text", None)
         if text is not None:
             return {"uri": uri, "mimeType": mime, "text": text}
