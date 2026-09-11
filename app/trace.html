@@ -67,6 +67,8 @@
   .trail .call .cq{font-size:11.5px;color:var(--muted);margin-bottom:5px}
   .trail .call .cq b{color:var(--text);font-weight:600}
   .trail .rej{color:var(--err);font-size:11px;margin-left:6px}
+  .round-h{padding:4px 10px 0;font-size:10.5px;font-weight:650;color:var(--accent);
+           text-transform:uppercase;letter-spacing:.4px}
   .attempt{display:flex;gap:8px;align-items:flex-start;padding:3px 0;font-size:11.5px}
   .attempt .stage{flex:0 0 auto;min-width:112px;color:var(--muted)}
   .attempt .stage b{color:var(--text);font-weight:600;display:block;font-size:11.5px}
@@ -123,6 +125,16 @@ const STAGE_LABELS = {
   vector: 'ベクトル類似(品目库)',
   vector_skipped: 'ベクトル検索スキップ',
   vector_explanations: 'ベクトル類似(説明ページ库)',
+  change_notice_lookup: '変更予定の確認',
+};
+const TOOL_LABELS = {
+  search_waste_item: '品目検索',
+  search_general_info: '一般説明検索',
+  lookup_item_change_notice: '変更予定の確認',
+};
+const STOP_REASON_LABELS = {
+  model_stopped: 'モデル自身が打ち切り(追加確認なし)',
+  max_rounds_reached: 'ラウンド上限到達',
 };
 const RS_LABELS = {2: '上位語', 1: '弱い関連', 0: '無関連'};
 // この stage が実際に向量库(Chroma)へ1回問い合わせた印。「N回打った」を
@@ -160,23 +172,40 @@ function hitPill(hit, pickedNames){
 
 function renderTrail(searchTrail, pickedNames){
   if (!searchTrail || !searchTrail.length) return '';
-  const calls = searchTrail.map(call => {
-    const attempts = (call.attempts || []).map(a => {
-      const hits = (a.hits || []).length
-        ? (a.hits || []).map(h => hitPill(h, pickedNames)).join('')
-        : '<span class="noattempt">空振り</span>';
-      return '<div class="attempt"><div class="stage"><b>'
-        + escapeHtml(STAGE_LABELS[a.stage] || a.stage) + '</b>'
-        + escapeHtml(a.query || '') + '</div><div class="hits">' + hits + '</div></div>';
+
+  // Agentic経路はラウンドごとに検索するので、ラウンド単位でグルーピング
+  // して表示する ― 「ラウンド1で見つけた候補をそのまま、ラウンド2以降で
+  // 確認せず終わっている」ような流れを時系列で追えるようにするため。
+  // round が無い(決定論的経路)場合は1グループにまとめる。
+  const groups = new Map();
+  searchTrail.forEach(call => {
+    const key = call.round || 0;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(call);
+  });
+
+  const body = [...groups.entries()].sort((a, b) => a[0] - b[0]).map(([round, calls]) => {
+    const header = round ? '<div class="round-h">ラウンド ' + round + '</div>' : '';
+    const callsHtml = calls.map(call => {
+      const attempts = (call.attempts || []).map(a => {
+        const hits = (a.hits || []).length
+          ? (a.hits || []).map(h => hitPill(h, pickedNames)).join('')
+          : '<span class="noattempt">空振り</span>';
+        return '<div class="attempt"><div class="stage"><b>'
+          + escapeHtml(STAGE_LABELS[a.stage] || a.stage) + '</b>'
+          + escapeHtml(a.query || '') + '</div><div class="hits">' + hits + '</div></div>';
+      }).join('');
+      const rej = call.rejected_reason
+        ? '<span class="rej">却下: ' + escapeHtml(call.rejected_reason) + '</span>' : '';
+      const toolLabel = TOOL_LABELS[call.tool] ? '[' + TOOL_LABELS[call.tool] + '] ' : '';
+      return '<div class="call"><div class="cq">' + toolLabel + '<b>'
+        + escapeHtml(call.query || '(空)') + '</b>' + rej + '</div>'
+        + (attempts || '<div class="noattempt">試行記録なし</div>') + '</div>';
     }).join('');
-    const rej = call.rejected_reason
-      ? '<span class="rej">却下: ' + escapeHtml(call.rejected_reason) + '</span>' : '';
-    const toolLabel = call.tool === 'search_general_info' ? '[一般説明] ' : '';
-    return '<div class="call"><div class="cq">検索クエリ: ' + toolLabel + '<b>'
-      + escapeHtml(call.query || '(空)') + '</b>' + rej + '</div>'
-      + (attempts || '<div class="noattempt">試行記録なし</div>') + '</div>';
+    return header + callsHtml;
   }).join('');
-  return '<div class="k">検索の過程(採用/却下した候補)</div><div class="trail">' + calls + '</div>';
+
+  return '<div class="k">検索の過程(採用/却下した候補)</div><div class="trail">' + body + '</div>';
 }
 
 function urlList(urls){
@@ -203,6 +232,10 @@ function renderRow(r){
   ];
   if (r.search_trail && r.search_trail.length){
     meta.push(chip('ベクトル検索', countVectorHits(r.search_trail) + '回'));
+  }
+  if (r.agent_rounds){
+    meta.push(chip('検索ラウンド', r.agent_rounds + '回・'
+      + (STOP_REASON_LABELS[r.agent_stop_reason] || r.agent_stop_reason)));
   }
   if (r.safety_gate) meta.push('<span class="chip gate">安全ゲート ' + escapeHtml(r.safety_gate_label || r.safety_gate) + '</span>');
   else if (r.canned_response) meta.push('<span class="chip flag">固定回答</span>');

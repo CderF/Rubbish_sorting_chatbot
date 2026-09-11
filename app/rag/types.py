@@ -185,6 +185,22 @@ class RoutedAnswer:
                    "relation_strength"?: int}]}], "rejected_reason"?: str}
     """
 
+    agent_rounds: int = 0
+    """Agentic経路(`app/rag/agent.py`)がツール呼び出しループを回した回数
+    (決定論的経路では常に0)。`search_trail` の各要素に付く `round` と
+    突き合わせると、「1ラウンド目の検索結果だけで確認もせず即答したか」を
+    事後に見分けられる(要件6-4)。"""
+
+    agent_stop_reason: str | None = None
+    """Agentic経路のツール呼び出しループが終わった理由。
+      "model_stopped"       — あるラウンドでモデルが自発的にツールを
+                               呼ばなくなった(これ以上の確認は不要と判断)
+      "max_rounds_reached"  — `max_iterations` まで毎回何か呼び続け、
+                               回数の上限で打ち切った
+    決定論的経路では None。"model_stopped" かつ `agent_rounds` が少ない
+    (特に1)のに `search_trail` の確度が低い(ベクトル類似のみ・弱い関連)
+    場合が、「検索結果を疑わず即答した」疑いのあるケース。"""
+
     safety_gate: str | None = None
     """STAGE06: 発火した安全ゲートの識別子("6-1a" / "6-2" / "6-3")、未発火なら None。
 

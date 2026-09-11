@@ -109,6 +109,8 @@ def summarize_trace_rows(rows: "list[dict]") -> "list[dict]":
                 "search_trail": [
                     call for call in (r.get("search_trail") or []) if isinstance(call, dict)
                 ],
+                "agent_rounds": r.get("agent_rounds") or 0,
+                "agent_stop_reason": r.get("agent_stop_reason"),
             }
         )
     return out
