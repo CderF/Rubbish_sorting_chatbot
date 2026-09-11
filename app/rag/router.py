@@ -2340,4 +2340,10 @@ def build_trace_record(prompt: str, ans: RoutedAnswer) -> dict:
         "safety_gate": ans.safety_gate,  # STAGE06 6-4: 発火した安全ゲート("6-1a"/"6-2"/"6-3")
         "sources": list(ans.sources),
         "search_trail": list(ans.search_trail),  # 6-4: 検索過程の可視化(採用/却下した候補)
+        # 6-4: LLMに実際に渡した context(canned_response のときは生成自体を
+        # スキップしているので意味が無い)。「検索は正しかったのに生成で
+        # 崩れた」のか「検索自体が誤っていた」のかを、最終回答と並べて事後に
+        # 見分けられるようにする(検索の可視化だけでは埋まらない、生成側の
+        # 限界を切り分けるための最後のピース)。
+        "context": ans.context,
     }

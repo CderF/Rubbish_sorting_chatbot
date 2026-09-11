@@ -77,6 +77,11 @@
   .hitpill .rs{opacity:.75;margin-left:3px}
   .rs2{color:var(--ok)}.rs1{color:var(--warn)}.rs0{color:var(--err)}
   .noattempt{color:var(--muted);font-size:11px}
+
+  .cmp{border:1px solid var(--border);border-radius:8px;padding:8px 10px 2px;margin:6px 0 10px;
+       background:var(--bg)}
+  .cmp .note{color:var(--muted);font-size:11px;margin-bottom:2px}
+  .cmp .k{margin-top:8px}
 </style>
 </head>
 <body>
@@ -220,8 +225,17 @@ function renderRow(r){
       + (r.timeline_item_name ? '<div class="k">時間軸の品目</div><div class="a">'
         + escapeHtml(r.timeline_item_name) + '</div>' : '')
       + '<div class="k">採用した根拠URL</div>' + urlList(r.sources)
-      + '<div class="k">最終回答</div><div class="a">'
-        + escapeHtml(r.final_response || '—') + '</div>'
+      + '<div class="cmp">'
+        + '<div class="note">' + (r.canned_response
+          ? '固定回答/テンプレート回答のため生成(LLM)は経由していない。参考情報。'
+          : 'この context を根拠に LLM が下の回答を生成した ― 内容が一致しているか比較する'
+          + '(一致していないのに回答がずれているなら生成側、context 自体が空・的外れなら検索側の問題)。')
+        + '</div>'
+        + '<div class="k">LLMに渡した context(検索結果)</div><div class="a">'
+          + escapeHtml(r.context || '(空 ― 根拠なし)') + '</div>'
+        + '<div class="k">最終回答</div><div class="a">'
+          + escapeHtml(r.final_response || '—') + '</div>'
+      + '</div>'
     + '</div>';
 
   el.querySelector('.toggle').onclick = () => {
