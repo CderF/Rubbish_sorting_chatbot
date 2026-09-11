@@ -41,6 +41,7 @@ GPU・vLLM は不要。
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import unquote
 from xml.sax.saxutils import escape as xml_escape
 
 from mcp.server.fastmcp import FastMCP
@@ -372,6 +373,11 @@ def schedule_calendar_svg(ward: str, town: str) -> str:
     収集日に当たる曜日を塗ったSVGを返す。ヒットが無ければ強調無しの週表を返す
     (存在しないSVGを返すより「何も無い」ことが見える形にする)。
     """
+    # Resource-template path parameters arrive percent-encoded when the URI
+    # contains Japanese ward/town names (for example ``%E5%B0%8F...``).
+    # Decode them before querying the SQLite schedule table; direct Python
+    # calls may already pass decoded strings, for which ``unquote`` is a no-op.
+    ward, town = unquote(ward), unquote(town)
     result = tools.execute_tool(
         "lookup_collection_schedule", {"ward": ward, "town": town, "waste_type": None}
     )

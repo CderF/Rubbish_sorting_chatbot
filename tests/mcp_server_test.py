@@ -408,6 +408,16 @@ def test_schedule_calendar_svg_resource_reflects_the_real_schedule(mcp_server):
     assert "浅野1丁目" in svg
 
 
+def test_schedule_calendar_svg_decodes_percent_encoded_resource_params(mcp_server):
+    """MCP URI-template parameters are URL-encoded for non-ASCII town names."""
+    svg = mcp_server.schedule_calendar_svg(
+        "%E5%B0%8F%E5%80%89%E5%8C%97%E5%8C%BA",
+        "%E6%B5%85%E9%87%8E1%E4%B8%81%E7%9B%AE",
+    )
+    assert "小倉北区浅野1丁目 の収集日" in svg
+    assert "#1a56b8" in svg
+
+
 def test_schedule_calendar_svg_resource_degrades_gracefully_when_no_hits(mcp_server):
     svg = mcp_server.schedule_calendar_svg("門司区", "存在しない町")
     assert svg.startswith("<svg")
