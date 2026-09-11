@@ -65,6 +65,30 @@ class BridgeError(Exception):
     """許可されていない呼び出し、またはMCPサーバ側のエラー応答。"""
 
 
+def _child_environment() -> dict[str, str]:
+    """Build the MCP child environment without losing deployment-specific paths.
+
+    The chatbot venv on B1 contains MCP 2.x for the WebUI client, while the
+    existing FastMCP server is intentionally kept on MCP 1.x in the isolated
+    ``stage07-mcp/.deps`` directory.  Prefer that directory when it exists;
+    local development without it keeps the normal parent environment.
+    """
+    env = dict(os.environ)
+    candidates = []
+    configured = env.get("STAGE7_MCP_DEPS")
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(REPO_ROOT.parent / "stage07-mcp" / ".deps")
+    candidates.append(Path("/home/teamb2/stage07-mcp/.deps"))
+    deps = next((p for p in candidates if p.is_dir()), None)
+    if deps is not None:
+        old = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(deps)] + ([old] if old else [])
+        )
+    return env
+
+
 def _launch_params() -> StdioServerParameters:
     # 公式SDKの既定(`get_default_environment()`)は PATH/HOME 等の最小限しか
     # 子プロセスへ渡さない — 任意の(信頼できない)MCPサーバに接続する場合の
@@ -78,7 +102,7 @@ def _launch_params() -> StdioServerParameters:
         command=sys.executable,
         args=["-m", "app.mcp_server"],
         cwd=str(REPO_ROOT),
-        env=dict(os.environ),
+        env=_child_environment(),
     )
 
 
