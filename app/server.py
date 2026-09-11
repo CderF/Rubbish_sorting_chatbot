@@ -36,7 +36,7 @@ from collections import OrderedDict
 from io import BytesIO
 
 import pynvml
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -56,6 +56,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from app import mcp_bridge  # noqa: E402  STAGE07 7-2/7-3/7-4: WebUI→MCPブリッジ
 from app.notices import admin as notice_admin  # noqa: E402
 from app.rag import agent, knowledge, router, safety  # noqa: E402  (sys.path 調整後に import)
 from app.rag.types import RoutedAnswer  # noqa: E402
@@ -214,6 +215,14 @@ _basic = HTTPBasic(auto_error=False)
 COOKIE_NAME = "rag_session"
 _valid_tokens: set[str] = set()
 
+# STAGE07 7-4: WebUI 側の「利用者」を区別するための安定Cookie。共通パスワード
+# ログイン(require_login)は個人を識別しないので、これとは別に払い出す。
+# 「新しい会話」ボタンはフロント側の session_id(webui-xxxx)だけをリセットし、
+# このCookieには触れない — 別会話でも記憶が引き継がれることを示すのが目的
+# なので、意図的に session_id と寿命を分けている。
+STAGE7_UID_COOKIE = "stage7_uid"
+STAGE7_UID_MAX_AGE_S = 60 * 60 * 24 * 180  # 180日
+
 
 def _password_ok(password: str) -> bool:
     return bool(WEBUI_PASSWORD) and secrets.compare_digest(password, WEBUI_PASSWORD)
@@ -240,6 +249,25 @@ def require_login(request: Request, creds: HTTPBasicCredentials | None = Depends
     if not _authed(request, creds):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "unauthorized")
     return True
+
+
+def _ensure_stage7_uid(request: Request, response: Response) -> str:
+    """STAGE07 7-4 の `user_id` として使う、ブラウザに紐づく安定ID。
+
+    既にCookieがあればそれを返す。無ければ(初回ログイン、またはこの機能が
+    入る前からの既存ログイン)ここで払い出して `response` にセットする —
+    ログイン直後だけでなく `/stage7/mcp/*` の初回呼び出し時にも通るように
+    しておくことで、機能追加前からのログイン済みブラウザも取りこぼさない。
+    """
+    uid = request.cookies.get(STAGE7_UID_COOKIE)
+    if uid:
+        return uid
+    uid = "webui-" + secrets.token_urlsafe(16)
+    response.set_cookie(
+        STAGE7_UID_COOKIE, uid,
+        httponly=True, samesite="lax", max_age=STAGE7_UID_MAX_AGE_S,
+    )
+    return uid
 
 
 # --------------------------------------------------------------------------
@@ -684,6 +712,7 @@ async def login_submit(request: Request):
     _valid_tokens.add(token)
     resp = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
     resp.set_cookie(COOKIE_NAME, token, httponly=True, samesite="lax", max_age=86400)
+    _ensure_stage7_uid(request, resp)
     return resp
 
 
@@ -692,4 +721,77 @@ async def webui(request: Request, creds: HTTPBasicCredentials | None = Depends(_
     # Browsers get redirected to the login form rather than a bare 401.
     if not _authed(request, creds):
         return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
-    return FileResponse(WEBUI_PATH)
+    resp = FileResponse(WEBUI_PATH)
+    _ensure_stage7_uid(request, resp)
+    return resp
+
+
+# --------------------------------------------------------------------------
+# STAGE07 7-2/7-3/7-4 — WebUI から MCP サーバを呼ぶブリッジ API
+#
+# Claude Desktop 等の外部AIクライアントだけでなく、自分たちの chatbot WebUI
+# からも「MCPサーバに接続して呼び出せる」(7-2)ことを示すために追加した
+# (2026-09-11、メンター指摘対応)。実装は app/mcp_bridge.py に集約し、ここは
+# require_login で守った薄いルーティングのみ。/chat・/ui/chat の採点対象の
+# 挙動には一切触れない。
+# --------------------------------------------------------------------------
+@app.get("/stage7/mcp/tools")
+async def stage7_tools(request: Request, response: Response, _=Depends(require_login)):
+    uid = _ensure_stage7_uid(request, response)
+    tools = await mcp_bridge.list_tools()
+    # Cookie の生値は返さない(要件: パスワードや完全なtokenを漏らさない)。
+    # WebUI が「今どの利用者として動いているか」を示すための短い表示用文字列。
+    return {"tools": tools, "stage7_uid_short": uid[:8] + "…"}
+
+
+@app.get("/stage7/mcp/resources")
+async def stage7_resources(request: Request, response: Response, _=Depends(require_login)):
+    _ensure_stage7_uid(request, response)
+    return await mcp_bridge.list_resources()
+
+
+@app.post("/stage7/mcp/call")
+async def stage7_call(request: Request, response: Response, _=Depends(require_login)):
+    uid = _ensure_stage7_uid(request, response)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    name = body.get("tool")
+    if not isinstance(name, str) or not name:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "tool は必須です")
+    arguments = body.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    if name in mcp_bridge.MEMORY_SCOPED_TOOLS:
+        # 7-4: user_id はクライアントの指定を無視し、認証済みブラウザの
+        # stage7_uid Cookie で必ず上書きする。クライアントに任意の user_id を
+        # 渡させると、別ブラウザ(別利用者)の記憶を読める穴になってしまう。
+        arguments = {**arguments, "user_id": uid}
+
+    try:
+        result = await mcp_bridge.call_tool(name, arguments)
+    except mcp_bridge.BridgeError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    return {"tool": name, "result": result}
+
+
+@app.get("/stage7/mcp/resource")
+async def stage7_resource(
+    uri: str, request: Request, response: Response, _=Depends(require_login)
+):
+    _ensure_stage7_uid(request, response)
+    try:
+        return await mcp_bridge.read_resource(uri)
+    except mcp_bridge.BridgeError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+
+@app.on_event("shutdown")
+async def _shutdown_mcp_bridge():
+    """MCPサーバの子プロセスを残さない(uvicorn の再起動・停止時)。"""
+    await mcp_bridge.shutdown()

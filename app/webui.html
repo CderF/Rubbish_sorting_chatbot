@@ -184,9 +184,56 @@
   .kbadge{display:inline-block;font-size:10px;padding:1px 6px;border-radius:9px;margin-left:6px;
           background:rgba(184,134,11,.16);color:var(--warn);vertical-align:middle}
 
+  /* ---- markdown table (チャット吹き出し・STAGE7パネル共通、7-3) ---- */
+  .mdtable{width:100%;border-collapse:collapse;font-size:12.5px;margin:8px 0}
+  .mdtable th{text-align:left;font-weight:650;padding:6px 9px;border-bottom:2px solid var(--border);
+              background:var(--bg)}
+  .mdtable td{padding:6px 9px;border-bottom:1px solid var(--border);vertical-align:top}
+  .mdtable tr:last-child td{border-bottom:none}
+
+  /* ---- STAGE7 MCP パネル (7-2/7-3/7-4) ---- */
+  .s7modal{background:var(--panel);border:1px solid var(--border);border-radius:14px;
+           width:min(1160px,100%);height:min(760px,100%);display:flex;flex-direction:column;
+           overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.28)}
+  .s7body{flex:1;display:flex;min-height:0}
+  .s7list{width:300px;border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;padding:8px}
+  .s7item{padding:9px 11px;border-radius:8px;cursor:pointer;margin-bottom:3px}
+  .s7item:hover{background:var(--bg)}
+  .s7item.sel{background:var(--accent-soft)}
+  .s7item .t{font-size:13px;font-weight:600;margin-bottom:3px;word-break:break-all}
+  .s7item.sel .t{color:var(--accent)}
+  .s7item .m{font-size:11px;color:var(--muted);line-height:1.5}
+  .s7main{flex:1;overflow-y:auto;padding:16px 18px;min-width:0;display:flex;flex-direction:column;gap:10px}
+  .s7uid{font-size:11px;color:var(--muted)}
+  .s7form label{display:block;font-size:11.5px;color:var(--muted);margin:9px 0 3px}
+  .s7form input,.s7form textarea{width:100%;padding:7px 10px;border:1px solid var(--border);
+          border-radius:7px;font:inherit;font-size:13px;background:var(--bg);color:var(--text)}
+  .s7form textarea{min-height:64px;resize:vertical}
+  .s7runbtn{margin-top:12px;border:1px solid var(--accent);background:var(--accent);color:#fff;
+          border-radius:8px;padding:7px 16px;font-size:13px;cursor:pointer;font-weight:600}
+  .s7runbtn:hover{opacity:.9}
+  .s7runbtn:disabled{opacity:.5;cursor:not-allowed}
+  .s7result{border-top:1px solid var(--border);padding-top:12px;margin-top:4px}
+  .s7result img{max-width:100%;border:1px solid var(--border);border-radius:8px;background:#fff}
+  .s7flags{margin-bottom:6px}
+  .s7flag{display:inline-block;font-size:10.5px;padding:2px 8px;border-radius:9px;margin:2px 4px 2px 0;
+          background:var(--accent-soft);color:var(--accent);font-weight:600}
+  .s7flag.on{background:rgba(28,140,74,.15);color:var(--ok)}
+  .s7raw{background:rgba(127,127,127,.14);border-radius:8px;padding:10px;font-size:11.5px;
+          overflow:auto;max-height:220px;white-space:pre-wrap;word-break:break-word;margin-top:8px}
+  .s7empty{color:var(--muted);font-size:13px;line-height:1.9;padding:26px 4px}
+  .s7memrow{display:flex;gap:8px;flex-wrap:wrap}
+
+  /* ---- ナレッジファイルの編集(7-3) ---- */
+  .keditbar{display:flex;gap:8px;margin-bottom:9px}
+  .kedittext{width:100%;min-height:320px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+             font-size:12.5px;line-height:1.7;padding:11px;border:1px solid var(--border);
+             border-radius:8px;background:var(--bg);color:var(--text);resize:vertical}
+
   @media (max-width:860px){
     aside{display:none}
     .klist{width:150px}
+    .s7list{width:150px}
   }
 </style>
 </head>
@@ -196,6 +243,7 @@
   <h1>北九州市 ごみ分別チャットボット</h1>
   <span class="badge" id="modelBadge">Qwen3-VL-8B-Instruct</span>
   <button class="kbtn" id="knowledgeBtn" style="margin-left:auto">ナレッジ一覧</button>
+  <button class="kbtn" id="stage7Btn" title="STAGE07 MCPサーバのツール・リソースをWebUIから直接呼ぶ">STAGE7 MCP</button>
   <div class="status"><span class="dot" id="dot"></span><span id="statusText">接続確認中…</span></div>
 </header>
 
@@ -299,6 +347,26 @@
   </div>
 </div>
 
+<div class="overlay" id="s7Overlay">
+  <div class="s7modal">
+    <div class="khead">
+      <h2>STAGE7 MCP</h2>
+      <span class="sub" id="s7Summary">読み込み中…</span>
+      <button class="close" id="s7Close" title="閉じる">&times;</button>
+    </div>
+    <div class="s7body">
+      <div class="s7list" id="s7List"></div>
+      <div class="s7main" id="s7Main">
+        <div class="s7empty">
+          左の一覧からツールまたはリソースを選ぶと、パラメータを入力して
+          MCPサーバへ実際に呼び出せます(7-2)。<br><br>
+          「7-4 記憶」からは、このブラウザに紐づく記憶を確認・削除できます。
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 let attachedImage = null;   // base64 without the data: prefix
@@ -321,8 +389,28 @@ function escapeHtml(s){
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
           .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
+/* GFM表(STAGE07 7-3): get_disposal_guidance の markdown フィールドに乗ってくる
+   `| a | b |` / `|---|---|` 形式をテーブルに変換する。escapeHtml 済みの文字列
+   に対して行うので、セル内容がタグとして解釈されることはない。 */
+function mdTableToHtml(block){
+  const lines = block.replace(/\n$/, '').split('\n');
+  if (lines.length < 2) return null;
+  if (!/^\s*\|?[\s:|-]+\|?\s*$/.test(lines[1]) || !lines[1].includes('-')) return null;
+  const splitRow = l => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+  const header = splitRow(lines[0]);
+  const rows = lines.slice(2).filter(l => l.trim()).map(splitRow);
+  let html = '<table class="mdtable"><thead><tr>'
+    + header.map(c => '<th>' + c + '</th>').join('') + '</tr></thead><tbody>';
+  for (const r of rows){
+    html += '<tr>' + r.map(c => '<td>' + c + '</td>').join('') + '</tr>';
+  }
+  return html + '</tbody></table>';
+}
 function renderMarkdown(src){
   let h = escapeHtml(src);
+  // ヘッダ行 + 区切り行(|---|---|) + 0行以上のデータ行、をブロックごとテーブル化。
+  h = h.replace(/^(\|.*\|[ \t]*\n\|[ \t:|-]+\|[ \t]*\n(?:\|.*\|[ \t]*\n?)*)/gm,
+                m => mdTableToHtml(m) || m);
   h = h.replace(/```([\s\S]*?)```/g, (m,c)=>'<pre>'+c.trim()+'</pre>');
   h = h.replace(/`([^`\n]+)`/g, '<code>$1</code>');
   h = h.replace(/^\s*#{4,6}\s+(.+)$/gm, '<h4>$1</h4>');
@@ -771,14 +859,64 @@ async function showNoticeRaw(name){
       return;
     }
     const text = await res.text();
-    $('kDetail').innerHTML = '<div class="url">' + escapeHtml(name) + '</div>';
-    const pre = document.createElement('pre');
-    pre.style.cssText =
-      'white-space:pre-wrap;word-break:break-word;font-size:12.5px;line-height:1.7;margin:0';
-    pre.textContent = text;
-    $('kDetail').appendChild(pre);
+    // STAGE07 7-3: 原文を表示するだけでなく、その場で編集して保存 → 再取り込み
+    // できるようにする(ファイル名・パス・サイズの検証は既存の
+    // app/notices/admin.py の _safe_name / save_notice_file がサーバ側で行う。
+    // ここでは新しいエンドポイントを追加せず、既存の /knowledge/files への
+    // 上書きアップロードとして送るだけ)。
+    $('kDetail').innerHTML =
+      '<div class="url">' + escapeHtml(name) + '</div>'
+      + '<div class="keditbar">'
+      + '<button class="kact" id="kSaveBtn">保存</button>'
+      + '<button class="kact" id="kSaveIngestBtn">保存して再取り込み</button>'
+      + '</div>';
+    const ta = document.createElement('textarea');
+    ta.className = 'kedittext';
+    ta.id = 'kEditArea';
+    ta.value = text;
+    $('kDetail').appendChild(ta);
+    const status = document.createElement('div');
+    status.id = 'kEditStatus';
+    status.style.cssText = 'font-size:12px;color:var(--muted);margin-top:8px';
+    $('kDetail').appendChild(status);
+
+    $('kSaveBtn').onclick = () => saveNoticeEdit(name, false);
+    $('kSaveIngestBtn').onclick = () => saveNoticeEdit(name, true);
   }catch(e){
     $('kDetail').innerHTML = '<div class="kempty">' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+async function saveNoticeEdit(name, alsoIngest){
+  const text = $('kEditArea').value;
+  $('kEditStatus').textContent = '保存中…';
+  try{
+    const res = await fetch('/knowledge/files?name=' + encodeURIComponent(name), {
+      method: 'POST',
+      headers: {'Content-Type': 'text/markdown; charset=utf-8'},
+      body: text
+    });
+    if (res.status === 401){ location.href = '/login'; return; }
+    if (!res.ok){
+      const d = await res.json().catch(() => ({}));
+      $('kEditStatus').textContent = '保存失敗: ' + (d.detail || res.status);
+      return;
+    }
+    if (!alsoIngest){
+      $('kEditStatus').textContent = '保存しました(' + new Date().toLocaleTimeString() + ')';
+      loadSources();
+      return;
+    }
+    $('kEditStatus').textContent = '保存しました。取り込み中…';
+    const ires = await fetch(
+      '/knowledge/files/' + encodeURIComponent(name) + '/ingest', {method: 'POST'});
+    const idata = await ires.json().catch(() => ({}));
+    $('kEditStatus').textContent = ires.ok
+      ? '保存 + 取り込み完了: ' + (idata.summary || '')
+      : '保存済み・取り込み失敗: ' + (idata.detail || ires.status);
+    loadSources();
+  }catch(e){
+    $('kEditStatus').textContent = '失敗: ' + e.message;
   }
 }
 
@@ -814,8 +952,258 @@ $('kFileInput').onchange = e => {
 };
 $('kOverlay').onclick = e => { if (e.target === $('kOverlay')) closeKnowledge(); };
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeKnowledge();
+  if (e.key === 'Escape'){ closeKnowledge(); closeStage7(); }
 });
+
+/* ---------- STAGE07 MCP パネル (7-2/7-3/7-4) ----------
+   Claude Desktop 等の外部AIクライアントだけでなく、この chatbot WebUI からも
+   MCPサーバに実接続してツール・リソースを呼べることを示す(2026-09-11、
+   メンター指摘対応)。/stage7/mcp/* はサーバ側で require_login + ホワイト
+   リストを掛けている(app/mcp_bridge.py)。 */
+function openStage7(){
+  $('s7Overlay').classList.add('open');
+  loadStage7();
+}
+function closeStage7(){
+  $('s7Overlay').classList.remove('open');
+}
+
+function _s7Select(el){
+  for (const c of $('s7List').children) c.classList.remove('sel');
+  if (el) el.classList.add('sel');
+}
+
+async function loadStage7(){
+  $('s7List').innerHTML = '';
+  $('s7Summary').textContent = '読み込み中…';
+  try{
+    const [tRes, rRes] = await Promise.all([
+      fetch('/stage7/mcp/tools'), fetch('/stage7/mcp/resources')
+    ]);
+    if (tRes.status === 401 || rRes.status === 401){ location.href = '/login'; return; }
+    const t = await tRes.json();
+    const r = await rRes.json();
+    const tools = t.tools || [];
+    const resources = r.resources || [];
+    const templates = r.resource_templates || [];
+    $('s7Summary').textContent =
+      tools.length + ' ツール / ' + resources.length + ' リソース / '
+      + templates.length + ' テンプレート — user_id: ' + (t.stage7_uid_short || '?');
+
+    const group = (label) => {
+      const hd = document.createElement('div');
+      hd.className = 'kgrouphd';
+      hd.textContent = label;
+      $('s7List').appendChild(hd);
+    };
+
+    group('ツール(7-1/7-2)');
+    for (const tool of tools){
+      const el = document.createElement('div');
+      el.className = 's7item';
+      const desc = (tool.description || '').split('\n')[0].slice(0, 64);
+      el.innerHTML = '<div class="t">' + escapeHtml(tool.name) + '</div>'
+        + '<div class="m">' + escapeHtml(desc) + '</div>';
+      el.onclick = () => selectTool(tool, el);
+      $('s7List').appendChild(el);
+    }
+
+    group('リソース(7-1/7-3)');
+    for (const res of resources){
+      const el = document.createElement('div');
+      el.className = 's7item';
+      el.innerHTML = '<div class="t">' + escapeHtml(res.uri) + '</div>'
+        + '<div class="m">' + escapeHtml(res.description || '') + '</div>';
+      el.onclick = () => selectResource(res.uri, el);
+      $('s7List').appendChild(el);
+    }
+    for (const tpl of templates){
+      const el = document.createElement('div');
+      el.className = 's7item';
+      el.innerHTML = '<div class="t">' + escapeHtml(tpl.uriTemplate) + '</div>'
+        + '<div class="m">' + escapeHtml((tpl.description || '').slice(0, 64)) + '</div>';
+      el.onclick = () => selectTemplate(tpl, el);
+      $('s7List').appendChild(el);
+    }
+
+    group('7-4 記憶');
+    const memEl = document.createElement('div');
+    memEl.className = 's7item';
+    memEl.innerHTML = '<div class="t">このブラウザの記憶を見る/消す</div>'
+      + '<div class="m">get_disposal_guidance が自動で読み書きする区・町名の状態</div>';
+    memEl.onclick = () => selectMemoryPanel(memEl);
+    $('s7List').appendChild(memEl);
+  }catch(e){
+    $('s7Summary').textContent = '取得に失敗しました';
+    $('s7Main').innerHTML = '<div class="s7empty">' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+function selectTool(tool, el){
+  _s7Select(el);
+  const schema = tool.inputSchema || {};
+  const props = schema.properties || {};
+  const required = new Set(schema.required || []);
+  let form = '<div class="s7form"><h3 style="margin:0">' + escapeHtml(tool.name) + '</h3>'
+    + '<div class="m" style="color:var(--muted);font-size:12px;margin-top:4px;white-space:pre-wrap">'
+    + escapeHtml(tool.description) + '</div>';
+  for (const [key, prop] of Object.entries(props)){
+    if (key === 'user_id') continue;   // 7-4: Cookie(stage7_uid)から自動で入る
+    const hint = (prop && (prop.description || prop.type)) || '';
+    form += '<label>' + escapeHtml(key) + (required.has(key) ? ' *' : '') + '</label>'
+      + '<input data-arg="' + escapeHtml(key) + '" placeholder="' + escapeHtml(hint) + '">';
+  }
+  form += '<button class="s7runbtn" id="s7Run">呼び出す</button></div>'
+    + '<div class="s7result" id="s7Result"></div>';
+  $('s7Main').innerHTML = form;
+  $('s7Run').onclick = () => runTool(tool.name);
+}
+
+async function runTool(name){
+  const args = {};
+  for (const input of $('s7Main').querySelectorAll('[data-arg]')){
+    if (input.value !== '') args[input.dataset.arg] = input.value;
+  }
+  $('s7Result').innerHTML = '<div class="s7empty">呼び出し中…</div>';
+  try{
+    const res = await fetch('/stage7/mcp/call', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tool: name, arguments: args})
+    });
+    if (res.status === 401){ location.href = '/login'; return; }
+    const d = await res.json();
+    if (!res.ok){
+      $('s7Result').innerHTML = '<div class="s7empty">エラー: ' + escapeHtml(d.detail || String(res.status)) + '</div>';
+      return;
+    }
+    renderToolResult(d.result);
+  }catch(e){
+    $('s7Result').innerHTML = '<div class="s7empty">' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+function renderToolResult(r){
+  let html = '';
+  const flags = [];
+  if ('found' in r) flags.push(['found: ' + r.found, !!r.found]);
+  if ('used_memory' in r) flags.push(['used_memory: ' + r.used_memory, !!r.used_memory]);
+  if ('match_stage' in r) flags.push(['match_stage: ' + r.match_stage, r.match_stage === 'exact']);
+  if (flags.length){
+    html += '<div class="s7flags">' + flags.map(([label, on]) =>
+      '<span class="s7flag' + (on ? ' on' : '') + '">' + escapeHtml(label) + '</span>').join('') + '</div>';
+  }
+  if (r && r.canned_response){
+    html += '<div class="bubble" style="background:var(--bot-bg);color:var(--bot-fg);white-space:pre-wrap">'
+      + escapeHtml(r.canned_response) + '</div>';
+  }
+  if (r && r.markdown){
+    html += renderMarkdown(r.markdown);
+  }
+  if (r && r.remembered && Object.keys(r.remembered).length){
+    html += '<div style="font-size:12px;color:var(--muted);margin-top:6px">記憶: '
+      + escapeHtml(JSON.stringify(r.remembered)) + '</div>';
+  }
+  html += '<div class="s7raw">' + escapeHtml(JSON.stringify(r, null, 2)) + '</div>';
+  $('s7Result').innerHTML = html;
+}
+
+function selectResource(uri, el){
+  _s7Select(el);
+  $('s7Main').innerHTML =
+    '<div class="s7form"><h3 style="margin:0">' + escapeHtml(uri) + '</h3>'
+    + '<button class="s7runbtn" id="s7Run">読み取る</button></div>'
+    + '<div class="s7result" id="s7Result"></div>';
+  $('s7Run').onclick = () => runResource(uri);
+}
+
+function selectTemplate(tpl, el){
+  _s7Select(el);
+  // "schedule-calendar://{ward}/{town}" の {変数} をフォームの入力欄にする。
+  const params = [...tpl.uriTemplate.matchAll(/\{([^}]+)\}/g)].map(m => m[1]);
+  let form = '<div class="s7form"><h3 style="margin:0">' + escapeHtml(tpl.uriTemplate) + '</h3>'
+    + '<div class="m" style="color:var(--muted);font-size:12px;margin-top:4px">'
+    + escapeHtml(tpl.description || '') + '</div>';
+  for (const p of params){
+    form += '<label>' + escapeHtml(p) + '</label>'
+      + '<input data-tplarg="' + escapeHtml(p) + '" placeholder="例: 小倉北区 / 浅野1丁目">';
+  }
+  form += '<button class="s7runbtn" id="s7Run">読み取る</button></div>'
+    + '<div class="s7result" id="s7Result"></div>';
+  $('s7Main').innerHTML = form;
+  $('s7Run').onclick = () => {
+    let uri = tpl.uriTemplate;
+    for (const input of $('s7Main').querySelectorAll('[data-tplarg]')){
+      uri = uri.replace('{' + input.dataset.tplarg + '}', encodeURIComponent(input.value || ''));
+    }
+    runResource(uri);
+  };
+}
+
+async function runResource(uri){
+  $('s7Result').innerHTML = '<div class="s7empty">読み取り中…</div>';
+  try{
+    const res = await fetch('/stage7/mcp/resource?uri=' + encodeURIComponent(uri));
+    if (res.status === 401){ location.href = '/login'; return; }
+    const d = await res.json();
+    if (!res.ok){
+      $('s7Result').innerHTML = '<div class="s7empty">エラー: ' + escapeHtml(d.detail || String(res.status)) + '</div>';
+      return;
+    }
+    let html = '';
+    if ((d.mimeType || '').startsWith('image/svg+xml') && d.text){
+      // STAGE07 7-3: SVGを生DOMに挿入せず <img> の data: URI として表示する
+      // (サーバ生成の信頼できる内容だが、リソース経路である以上テキスト出力と
+      // 同列には扱わない — スクリプト実行のできない画像として渡す)。
+      const b64 = btoa(unescape(encodeURIComponent(d.text)));
+      html += '<img src="data:image/svg+xml;base64,' + b64 + '" alt="' + escapeHtml(uri) + '">';
+    } else if (d.text){
+      try{
+        html += '<div class="s7raw">' + escapeHtml(JSON.stringify(JSON.parse(d.text), null, 2)) + '</div>';
+      }catch(_e){
+        html += '<div class="s7raw">' + escapeHtml(d.text) + '</div>';
+      }
+    }
+    $('s7Result').innerHTML = html || '<div class="s7empty">内容がありません</div>';
+  }catch(e){
+    $('s7Result').innerHTML = '<div class="s7empty">' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+function selectMemoryPanel(el){
+  _s7Select(el);
+  $('s7Main').innerHTML =
+    '<div class="s7form"><h3 style="margin:0">7-4 記憶(このブラウザ)</h3>'
+    + '<div class="m" style="color:var(--muted);font-size:12px;margin-top:4px">'
+    + 'get_disposal_guidance が自動で読み書きする区・町名を確認・削除します。'
+    + 'user_id はCookieから自動で入るため入力欄はありません。</div>'
+    + '<div class="s7memrow" style="margin-top:12px">'
+    + '<button class="s7runbtn" id="s7MemRecall">現在の記憶を見る</button>'
+    + '<button class="s7runbtn" id="s7MemForget" style="background:var(--err);border-color:var(--err)">記憶を消す</button>'
+    + '</div></div><div class="s7result" id="s7Result"></div>';
+  $('s7MemRecall').onclick = () => runMemoryCall('recall_facts');
+  $('s7MemForget').onclick = () => {
+    if (confirm('このブラウザの記憶を全て消します。よろしいですか?')) runMemoryCall('forget_facts');
+  };
+}
+
+async function runMemoryCall(tool){
+  $('s7Result').innerHTML = '<div class="s7empty">実行中…</div>';
+  try{
+    const res = await fetch('/stage7/mcp/call', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tool, arguments: {}})
+    });
+    if (res.status === 401){ location.href = '/login'; return; }
+    const d = await res.json();
+    $('s7Result').innerHTML = '<div class="s7raw">' + escapeHtml(JSON.stringify(d.result || d, null, 2)) + '</div>';
+  }catch(e){
+    $('s7Result').innerHTML = '<div class="s7empty">' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+$('stage7Btn').onclick = openStage7;
+$('s7Close').onclick = closeStage7;
+$('s7Overlay').onclick = e => { if (e.target === $('s7Overlay')) closeStage7(); };
 
 /* ---------- live stats ---------- */
 async function refreshStats(){
