@@ -172,6 +172,19 @@ class RoutedAnswer:
     させる(STAGE03採点フィードバック: 品目ごとの「収集枠」の違いを反映
     できていなかった実例が根拠)。"""
 
+    search_trail: list[dict] = field(default_factory=list)
+    """要件6-4追加分: 品目検索で実際に試した段(完全一致/部分一致/埋め込み/
+    別名/ベクトル)と、各段で返ってきた候補(採用されたかどうかに関わらず)。
+
+    `describe_sources()` / `build_trace_record()` に載せ、`/trace` で
+    「どのクエリでどの候補が返り、なぜ採用・却下されたか」を事後に追える
+    ようにする(4-3 確度ゲートの可視化)。1要素 = 1回の品目検索呼び出し
+    (Agentic経路はモデルが複数回呼べるため複数要素になりうる):
+      {"query": str, "attempts": [{"stage": str, "query": str,
+        "hits": [{"item_name": str, "disposal_method": str,
+                   "relation_strength"?: int}]}], "rejected_reason"?: str}
+    """
+
     safety_gate: str | None = None
     """STAGE06: 発火した安全ゲートの識別子("6-1a" / "6-2" / "6-3")、未発火なら None。
 

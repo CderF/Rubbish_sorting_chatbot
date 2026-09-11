@@ -60,6 +60,23 @@
   .det ul{margin:3px 0;padding-left:18px}
   .det li{margin:1px 0;word-break:break-all}
   .det a{color:var(--accent)}
+
+  .trail{border:1px solid var(--border);border-radius:8px;margin:4px 0 8px;overflow:hidden}
+  .trail .call{padding:7px 10px;border-top:1px solid var(--border)}
+  .trail .call:first-child{border-top:none}
+  .trail .call .cq{font-size:11.5px;color:var(--muted);margin-bottom:5px}
+  .trail .call .cq b{color:var(--text);font-weight:600}
+  .trail .rej{color:var(--err);font-size:11px;margin-left:6px}
+  .attempt{display:flex;gap:8px;align-items:flex-start;padding:3px 0;font-size:11.5px}
+  .attempt .stage{flex:0 0 auto;min-width:112px;color:var(--muted)}
+  .attempt .stage b{color:var(--text);font-weight:600;display:block;font-size:11.5px}
+  .attempt .hits{flex:1;display:flex;flex-wrap:wrap;gap:4px}
+  .hitpill{padding:1px 7px;border-radius:9px;background:var(--bg);border:1px solid var(--border);
+           font-size:11px;white-space:nowrap}
+  .hitpill.picked{background:rgba(28,140,74,.15);border-color:transparent;color:var(--ok);font-weight:600}
+  .hitpill .rs{opacity:.75;margin-left:3px}
+  .rs2{color:var(--ok)}.rs1{color:var(--warn)}.rs0{color:var(--err)}
+  .noattempt{color:var(--muted);font-size:11px}
 </style>
 </head>
 <body>
@@ -92,6 +109,51 @@ function chip(label, value, cls){
        + escapeHtml(v) + '</span>';
 }
 
+const STAGE_LABELS = {
+  canonical_alias: '別名表(完全一致)',
+  exact: '完全一致',
+  partial: '部分一致',
+  embedded: '埋め込み品名',
+  alias_embedded: '別名表(埋め込み)',
+  vector: 'ベクトル類似',
+  vector_skipped: 'ベクトル検索スキップ',
+};
+const RS_LABELS = {2: '上位語', 1: '弱い関連', 0: '無関連'};
+
+function hitPill(hit, pickedNames){
+  if (typeof hit === 'string') hit = {item_name: hit};
+  const name = hit.item_name || '';
+  const picked = pickedNames.has(name);
+  let rs = '';
+  if (hit.relation_strength !== undefined && hit.relation_strength !== null){
+    rs = '<span class="rs rs' + hit.relation_strength + '">('
+       + (RS_LABELS[hit.relation_strength] ?? hit.relation_strength) + ')</span>';
+  }
+  const dm = hit.disposal_method ? ' → ' + escapeHtml(hit.disposal_method) : '';
+  return '<span class="hitpill' + (picked ? ' picked' : '') + '">'
+       + escapeHtml(name) + dm + rs + '</span>';
+}
+
+function renderTrail(searchTrail, pickedNames){
+  if (!searchTrail || !searchTrail.length) return '';
+  const calls = searchTrail.map(call => {
+    const attempts = (call.attempts || []).map(a => {
+      const hits = (a.hits || []).length
+        ? (a.hits || []).map(h => hitPill(h, pickedNames)).join('')
+        : '<span class="noattempt">空振り</span>';
+      return '<div class="attempt"><div class="stage"><b>'
+        + escapeHtml(STAGE_LABELS[a.stage] || a.stage) + '</b>'
+        + escapeHtml(a.query || '') + '</div><div class="hits">' + hits + '</div></div>';
+    }).join('');
+    const rej = call.rejected_reason
+      ? '<span class="rej">却下: ' + escapeHtml(call.rejected_reason) + '</span>' : '';
+    return '<div class="call"><div class="cq">検索クエリ: <b>'
+      + escapeHtml(call.query || '(空)') + '</b>' + rej + '</div>'
+      + (attempts || '<div class="noattempt">試行記録なし</div>') + '</div>';
+  }).join('');
+  return '<div class="k">検索の過程(採用/却下した候補)</div><div class="trail">' + calls + '</div>';
+}
+
 function urlList(urls){
   if (!urls || !urls.length) return '<div class="a">—</div>';
   return '<ul>' + urls.map(u =>
@@ -120,6 +182,8 @@ function renderRow(r){
   if (r.analogy) meta.push('<span class="chip flag">4-3 ' + (r.analogy_unreliable ? '類推(確度不足)' : '類推') + '</span>');
   (r.missing || []).forEach(m => meta.push(chip('不足', m)));
 
+  const pickedNames = new Set(r.item_hit_names || []);
+
   el.innerHTML =
     '<div class="q">' + escapeHtml(r.prompt || '(空)') + '</div>'
     + '<div class="meta">' + meta.join('') + '</div>'
@@ -129,6 +193,7 @@ function renderRow(r){
         + escapeHtml((r.item_candidates || []).join(' / ') || '—') + '</div>'
       + '<div class="k">早見表ヒット名</div><div class="a">'
         + escapeHtml((r.item_hit_names || []).join(' / ') || '—') + '</div>'
+      + renderTrail(r.search_trail, pickedNames)
       + (r.timeline_item_name ? '<div class="k">時間軸の品目</div><div class="a">'
         + escapeHtml(r.timeline_item_name) + '</div>' : '')
       + '<div class="k">採用した根拠URL</div>' + urlList(r.sources)

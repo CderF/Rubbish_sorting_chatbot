@@ -36,6 +36,7 @@ from app.rag.router import (
     _district_groups,
     _partial_lookup_ok,
     _pick_embedded_item,
+    _relation_strength,
     _resolve_embedded_alias,
     _uniform_district_schedule,
     _vector_query_ok,
@@ -169,6 +170,12 @@ def _tool_search_waste_item(query: str) -> dict:
     if not query:
         return {"error": "query is required"}
 
+    # 要件6-4: `/trace` で「どの段をどのクエリで試し、何が返ったか」を事後に
+    # 追えるよう、採用/却下に関わらず全段の試行を残す(`router._search_item`
+    # と同じ形。`app/rag/agent.py._run_loop` がこれを収集して
+    # `RoutedAnswer.search_trail` に載せる)。
+    trail: list[dict] = []
+
     # 既知の品名の言い換え(「テレビ」→「テレビ(ブラウン管式・液晶式・
     # プラズマ式)」等)は、部分一致の並び順やベクトル距離の揺れに任せず
     # 正式名へ先に固定する(router.py._search_item と同じ、共通の
@@ -176,12 +183,16 @@ def _tool_search_waste_item(query: str) -> dict:
     canonical = resolve_canonical_alias(query)
     if canonical:
         exact = lookup_item_exact(canonical)
+        trail.append({"stage": "canonical_alias", "query": canonical,
+                      "hits": [_serialize_item(exact)] if exact else []})
         if exact:
-            return {"match_stage": "exact", "items": [_serialize_item(exact)]}
+            return {"match_stage": "exact", "items": [_serialize_item(exact)], "trail": trail}
 
     exact = lookup_item_exact(query)
+    trail.append({"stage": "exact", "query": query,
+                  "hits": [_serialize_item(exact)] if exact else []})
     if exact:
-        return {"match_stage": "exact", "items": [_serialize_item(exact)]}
+        return {"match_stage": "exact", "items": [_serialize_item(exact)], "trail": trail}
 
     # 以下3つのガードは `router._search_item` と同一の規則。Agentic経路は
     # `_blocking_route` を経由しないため、ここに入れないと既定オンの
@@ -190,12 +201,16 @@ def _tool_search_waste_item(query: str) -> dict:
     # ないので、ツール側で同じ歯止めを掛ける)。
     if _partial_lookup_ok(query):
         partial = lookup_item_partial(query)[:5]
+        trail.append({"stage": "partial", "query": query,
+                      "hits": [_serialize_item(i) for i in partial]})
         if partial:
-            return {"match_stage": "partial", "items": [_serialize_item(i) for i in partial]}
+            return {"match_stage": "partial", "items": [_serialize_item(i) for i in partial], "trail": trail}
 
     embedded = _pick_embedded_item(query, lookup_item_contained_in(query))
+    trail.append({"stage": "embedded", "query": query,
+                  "hits": [_serialize_item(embedded)] if embedded else []})
     if embedded is not None:
-        return {"match_stage": "exact", "items": [_serialize_item(embedded)]}
+        return {"match_stage": "exact", "items": [_serialize_item(embedded)], "trail": trail}
 
     # 言い換え表の語が質問文にそのまま埋もれているケースの救済(router._search_item
     # と同じ規則。「硫酸」→「薬品(家庭医薬品でないもの)」等)。完全一致・部分一致・
@@ -203,16 +218,32 @@ def _tool_search_waste_item(query: str) -> dict:
     alias_target = _resolve_embedded_alias(query)
     if alias_target:
         alias_hit = lookup_item_exact(alias_target)
+        trail.append({"stage": "alias_embedded", "query": query,
+                      "hits": [_serialize_item(alias_hit)] if alias_hit else []})
         if alias_hit is not None:
-            return {"match_stage": "exact", "items": [_serialize_item(alias_hit)]}
+            return {"match_stage": "exact", "items": [_serialize_item(alias_hit)], "trail": trail}
 
     if not _vector_query_ok(query):
-        return {"match_stage": "none", "items": []}
+        trail.append({"stage": "vector_skipped", "query": query, "hits": []})
+        return {"match_stage": "none", "items": [], "trail": trail}
 
     vector = vector_search_items(query, top_k=3)
+    trail.append({
+        "stage": "vector",
+        "query": query,
+        "hits": [
+            {
+                "item_name": i.item_name,
+                "disposal_method": i.disposal_method,
+                "relation_strength": _relation_strength(query, i.item_name),
+            }
+            for i in vector
+        ],
+    })
     return {
         "match_stage": "vector" if vector else "none",
         "items": [_serialize_item(i) for i in vector],
+        "trail": trail,
     }
 
 

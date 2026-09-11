@@ -778,11 +778,17 @@ def extract_item_name(prompt: str, strip_waste_words: bool | None = None) -> str
 
 
 # --- 検索 ------------------------------------------------------------------
+def _hit_brief(rec: "ItemRecord | None") -> dict | None:
+    if rec is None:
+        return None
+    return {"item_name": rec.item_name, "disposal_method": rec.disposal_method}
+
+
 def _search_item(
     item_name: str,
     extra_candidates: list[str] | None = None,
     vector_query: str | None = None,
-) -> tuple[list[ItemRecord], str | None]:
+) -> tuple[list[ItemRecord], str | None, list[dict]]:
     """完全一致 → 部分一致 → ベクトル類似度 の順にフォールバックする(早見表パス)。
 
     `extra_candidates` があれば、主候補(`item_name`)の完全一致・部分一致が
@@ -802,34 +808,48 @@ def _search_item(
     後退する)。呼び出し側(`_blocking_route`)は修飾語を落とす前の原文断片を
     `vector_query` として渡す。省略時は `item_name` を使う(後方互換)。
 
-    戻り値は (ヒット, どの段で当たったか)。段(`item_match_stage`)は WebUI の
-    根拠表示用。回答ロジックが使う「質問の品名そのものか、似た別品目か」の
-    判定は別で、呼び出し側の `_classify_item_match`(名前一致ベース)で行う。
+    戻り値は (ヒット, どの段で当たったか, 検索過程のトレイル)。段
+    (`item_match_stage`)は WebUI の根拠表示用。回答ロジックが使う「質問の
+    品名そのものか、似た別品目か」の判定は別で、呼び出し側の
+    `_classify_item_match`(名前一致ベース)で行う。
+
+    トレイル(要件6-4)は、実際に試した段ごとに `{"stage", "query", "hits"}`
+    を積んだリスト。採用されなかった段(0件)も含めて全部残すので、`/trace`
+    で「完全一致・部分一致は空振りし、ベクトルの上位3件にも正解が無かった」
+    ように、途中経過を事後に追える。ベクトル段の `hits` だけは各候補に
+    `relation_strength`(`_relation_strength` のスコア、0/1/2)を添える。
     """
+    trail: list[dict] = []
+
     canonical = resolve_canonical_alias(item_name)
     if canonical:
         exact = lookup_item_exact(canonical)
+        trail.append({"stage": "canonical_alias", "query": canonical, "hits": [_hit_brief(exact)] if exact else []})
         if exact:
-            return [exact], "exact"
+            return [exact], "exact", trail
 
     exact = lookup_item_exact(item_name)
+    trail.append({"stage": "exact", "query": item_name, "hits": [_hit_brief(exact)] if exact else []})
     if exact:
-        return [exact], "exact"
+        return [exact], "exact", trail
     if _partial_lookup_ok(item_name):
         partial = lookup_item_partial(item_name)[:5]
+        trail.append({"stage": "partial", "query": item_name, "hits": [_hit_brief(p) for p in partial]})
         if partial:
-            return partial, "partial"
+            return partial, "partial", trail
     for cand in extra_candidates or []:
         if cand == item_name:
             continue
         exact = lookup_item_exact(cand)
+        trail.append({"stage": "exact", "query": cand, "hits": [_hit_brief(exact)] if exact else []})
         if exact:
-            return [exact], "exact"
+            return [exact], "exact", trail
         if not _partial_lookup_ok(cand):
             continue
         partial = lookup_item_partial(cand)[:5]
+        trail.append({"stage": "partial", "query": cand, "hits": [_hit_brief(p) for p in partial]})
         if partial:
-            return partial, "partial"
+            return partial, "partial", trail
 
     # 2026-09-10 実採点trace回帰の救済: `_QUESTION_TAIL` の定型に一致せず
     # item_name が文全体のままでも、その中に実在の品名がそのまま埋め込まれて
@@ -840,13 +860,15 @@ def _search_item(
     # 「直後が文末・助詞・質問定型」の境界チェックをかける(「捨てたらいいか」
     # に「たらい」が偶然含まれる、のような事故を防ぐ)。
     embedded = _pick_embedded_item(item_name, lookup_item_contained_in(item_name))
+    trail.append({"stage": "embedded", "query": item_name, "hits": [_hit_brief(embedded)] if embedded else []})
     if embedded is None:
         for cand in extra_candidates or []:
             embedded = _pick_embedded_item(cand, lookup_item_contained_in(cand))
+            trail.append({"stage": "embedded", "query": cand, "hits": [_hit_brief(embedded)] if embedded else []})
             if embedded is not None:
                 break
     if embedded is not None:
-        return [embedded], "exact"
+        return [embedded], "exact", trail
 
     # 言い換え表(`_CANONICAL_ALIASES`)の語が質問文にそのまま埋もれている
     # ケースの救済。「硫酸」のように早見表に品名として存在しない物質名を、
@@ -859,8 +881,9 @@ def _search_item(
         if not target:
             continue
         rec = lookup_item_exact(target)
+        trail.append({"stage": "alias_embedded", "query": probe, "hits": [_hit_brief(rec)] if rec else []})
         if rec is not None:
-            return [rec], "exact"
+            return [rec], "exact", trail
 
     # 埋め込み品名も見つからず、ベクトル検索に渡すクエリ自体が文・代名詞
     # 参照・相槌らしいなら(`_looks_like_a_sentence`)、ベクトル検索にも
@@ -868,10 +891,23 @@ def _search_item(
     # 最近傍を拾って断定してしまうだけ(2026-09-10 実採点trace回帰)。
     final_query = vector_query or item_name
     if not _vector_query_ok(final_query):
-        return [], None
+        trail.append({"stage": "vector_skipped", "query": final_query, "hits": []})
+        return [], None, trail
 
     vector = vector_search_items(final_query, top_k=3)
-    return vector, ("vector" if vector else None)
+    trail.append({
+        "stage": "vector",
+        "query": final_query,
+        "hits": [
+            {
+                "item_name": v.item_name,
+                "disposal_method": v.disposal_method,
+                "relation_strength": _relation_strength(final_query, v.item_name),
+            }
+            for v in vector
+        ],
+    })
+    return vector, ("vector" if vector else None), trail
 
 
 # item_name の直前に来てよい文字(文頭 or 助詞・記号・空白)。「電動スケート
@@ -1136,9 +1172,11 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
     ans.item_from_image = bool(image_item_name)
 
     if item_name:
-        ans.item_hits, ans.item_match_stage = _search_item(
+        ans.item_hits, ans.item_match_stage, _trail = _search_item(
             item_name, item_candidates[1:], vector_query
         )
+        if _trail:
+            ans.search_trail = [{"query": item_name, "attempts": _trail}]
         ans.item_match = _classify_item_match(item_candidates, ans.item_hits)
 
         # 候補文字列が質問定型で汚れて exact/partial を素通りしても、ヒット名
@@ -2276,4 +2314,5 @@ def build_trace_record(prompt: str, ans: RoutedAnswer) -> dict:
         "template_response": ans.template_response,
         "safety_gate": ans.safety_gate,  # STAGE06 6-4: 発火した安全ゲート("6-1a"/"6-2"/"6-3")
         "sources": list(ans.sources),
+        "search_trail": list(ans.search_trail),  # 6-4: 検索過程の可視化(採用/却下した候補)
     }

@@ -102,6 +102,10 @@ def summarize_trace_rows(rows: "list[dict]") -> "list[dict]":
                 "canned_response": bool(r.get("canned_response")),
                 "sources": list(r.get("sources") or []),
                 "final_response": _truncate(str(r.get("final_response") or "")),
+                # 6-4: 検索過程の可視化。古い形式のトレース行には無いので既定は空。
+                "search_trail": [
+                    call for call in (r.get("search_trail") or []) if isinstance(call, dict)
+                ],
             }
         )
     return out

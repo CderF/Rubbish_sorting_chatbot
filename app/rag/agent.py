@@ -276,6 +276,10 @@ async def _run_loop(
     # search_waste_item の呼び出しごとの結果(match_stage, items)。ループを跨いで
     # 単純に collected_items へ extend しない理由は `_narrow_item_hits` 参照。
     item_call_results: list[tuple[str | None, list[SimpleNamespace]]] = []
+    # 要件6-4: モデルが呼んだ search_waste_item ごとの検索過程(却下された
+    # 呼び出しも含む)。`/trace` でエージェント経路の判断を事後に追えるよう
+    # `RoutedAnswer.search_trail` に載せる。
+    search_trails: list[dict] = []
     collected_schedules: list[SimpleNamespace] = []
     collected_explanations: list[dict] = []
     collected_notices: list[dict] = []
@@ -300,13 +304,22 @@ async def _run_loop(
 
             if call.name == "search_waste_item":
                 query = call.arguments.get("query") or ""
+                trail_entry = {"query": query, "attempts": result.get("trail", [])}
                 if category_intent is not None or not _query_grounded_in_text(query, grounding_text):
                     # このターンが特定品目ではなくごみ種別そのものの質問
                     # (category_intent)か、利用者がこのセッションで一度も
                     # 言っていない品目名をモデルが作り出した(5-1 ガード)。
                     # ツール応答はループの文脈には残すが、検索結果としては
-                    # 採用しない。
+                    # 採用しない。理由も記録して `/trace` で「なぜ却下したか」
+                    # まで追えるようにする。
+                    trail_entry["rejected_reason"] = (
+                        "ごみ種別そのものの質問(category_intent)"
+                        if category_intent is not None
+                        else "会話に基づかないクエリ(5-1 ガード)"
+                    )
+                    search_trails.append(trail_entry)
                     continue
+                search_trails.append(trail_entry)
                 if not detected_item:
                     detected_item = query
                 items = [SimpleNamespace(**item) for item in result.get("items", [])]
@@ -473,6 +486,7 @@ async def _run_loop(
         detected_item=detected_item,
         detected_ward=detected_ward,
         detected_town=detected_town,
+        search_trail=search_trails,
     )
 
 
@@ -795,6 +809,7 @@ def _build_routed_answer(
     detected_ward: str | None,
     detected_town: str | None,
     district_notes: list[str] | None = None,
+    search_trail: list[dict] | None = None,
 ) -> RoutedAnswer:
     q = _norm(query)
     item_match = "none"
@@ -803,6 +818,7 @@ def _build_routed_answer(
 
     ans = RoutedAnswer(
         found=True,
+        search_trail=list(search_trail or []),
         item_match=item_match,
         item_hits=items,
         schedule_hits=schedules,

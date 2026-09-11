@@ -121,14 +121,16 @@ def test_search_item_returns_hits_and_stage(monkeypatch):
     # 正式名「テレビ(ブラウン管式・液晶式・プラズマ式)」に固定される)ので、
     # この汎用の exact-match 確認には別名工を使う。
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: _rec(n))
-    assert _search_item("傘") == ([_rec("傘")], "exact")
+    hits, stage, _trail = _search_item("傘")
+    assert (hits, stage) == ([_rec("傘")], "exact")
     monkeypatch.setattr(router, "lookup_item_exact", lambda n: None)
     monkeypatch.setattr(router, "lookup_item_partial", lambda n, limit=10: [])
     # lookup_item_contained_in(STAGE06 根因2)は exact/partial の後に実DBを
     # 引くため、vector 段を検証するテストでは必ず空を返すよう閉じておく。
     monkeypatch.setattr(router, "lookup_item_contained_in", lambda *a, **k: [])
     monkeypatch.setattr(router, "vector_search_items", lambda q, top_k=3: [])
-    assert _search_item("宇宙服") == ([], None)
+    hits, stage, _trail = _search_item("宇宙服")
+    assert (hits, stage) == ([], None)
 
 
 # --- code-side single candidate for 4-3 (採点フィードバック) -----------
