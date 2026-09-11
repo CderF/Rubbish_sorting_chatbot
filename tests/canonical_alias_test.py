@@ -50,7 +50,7 @@ def test_unknown_query_has_no_alias():
 
 
 def test_deterministic_path_uses_the_alias_before_partial_match_ordering():
-    hits, stage = _search_item("テレビ")
+    hits, stage, _trail = _search_item("テレビ")
     assert stage == "exact"
     assert len(hits) == 1
     assert hits[0].item_name == "テレビ(ブラウン管式・液晶式・プラズマ式)"
@@ -111,7 +111,7 @@ def test_embedded_alias_accepts_a_part_suffix():
 
 
 def test_deterministic_path_resolves_a_substance_through_the_embedded_alias():
-    hits, stage = _search_item(
+    hits, stage, _trail = _search_item(
         "理科の実験で使った硫酸が残っているのですが、どう処分すればいいですか？"
     )
     assert stage == "exact"

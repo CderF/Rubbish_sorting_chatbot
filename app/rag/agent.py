@@ -276,6 +276,10 @@ async def _run_loop(
     # search_waste_item の呼び出しごとの結果(match_stage, items)。ループを跨いで
     # 単純に collected_items へ extend しない理由は `_narrow_item_hits` 参照。
     item_call_results: list[tuple[str | None, list[SimpleNamespace]]] = []
+    # 要件6-4: モデルが呼んだ search_waste_item ごとの検索過程(却下された
+    # 呼び出しも含む)。`/trace` でエージェント経路の判断を事後に追えるよう
+    # `RoutedAnswer.search_trail` に載せる。
+    search_trails: list[dict] = []
     collected_schedules: list[SimpleNamespace] = []
     collected_explanations: list[dict] = []
     collected_notices: list[dict] = []
@@ -285,12 +289,25 @@ async def _run_loop(
     detected_ward: str | None = None
     detected_town: str | None = None
 
-    for _ in range(max_iterations):
+    # 要件6-4: 「モデルが RAG から怪しい/不正確な結果を受け取ったのに、
+    # 自分で正しいと判断してそれ以上ツールを呼ばず直接回答したか」を事後に
+    # 見分けるための情報。`stop_reason` は "model_stopped"(あるラウンドで
+    # ツール呼び出しが0件になり、モデル自身が「これ以上確認は要らない」と
+    # 判断してループを抜けた) と "max_rounds_reached"(`max_iterations` まで
+    # 毎回何かしら呼び続け、回数の上限で打ち切った)を区別する。前者かつ
+    # ラウンド数が少ない(特に1)のに検索結果の確度が低い(向量类似のみ・
+    # 弱い関連)場合が、まさに「検索結果を疑わず即答した」疑いのあるケース。
+    rounds_used = 0
+    stop_reason = "max_rounds_reached"
+
+    for round_index in range(max_iterations):
+        rounds_used = round_index + 1
         prompt_input = build_prompt(messages, tools=TOOL_SCHEMAS)
         text = await _generate_once(engine, prompt_input, sampling_params)
 
         calls = parse_tool_calls(text)
         if not calls:
+            stop_reason = "model_stopped"
             break
 
         messages.append({"role": "assistant", "content": text})
@@ -300,13 +317,27 @@ async def _run_loop(
 
             if call.name == "search_waste_item":
                 query = call.arguments.get("query") or ""
+                trail_entry = {
+                    "tool": "search_waste_item",
+                    "round": rounds_used,
+                    "query": query,
+                    "attempts": result.get("trail", []),
+                }
                 if category_intent is not None or not _query_grounded_in_text(query, grounding_text):
                     # このターンが特定品目ではなくごみ種別そのものの質問
                     # (category_intent)か、利用者がこのセッションで一度も
                     # 言っていない品目名をモデルが作り出した(5-1 ガード)。
                     # ツール応答はループの文脈には残すが、検索結果としては
-                    # 採用しない。
+                    # 採用しない。理由も記録して `/trace` で「なぜ却下したか」
+                    # まで追えるようにする。
+                    trail_entry["rejected_reason"] = (
+                        "ごみ種別そのものの質問(category_intent)"
+                        if category_intent is not None
+                        else "会話に基づかないクエリ(5-1 ガード)"
+                    )
+                    search_trails.append(trail_entry)
                     continue
+                search_trails.append(trail_entry)
                 if not detected_item:
                     detected_item = query
                 items = [SimpleNamespace(**item) for item in result.get("items", [])]
@@ -323,6 +354,12 @@ async def _run_loop(
                     district_notes.append(result["district_note"])
 
             elif call.name == "search_general_info":
+                search_trails.append({
+                    "tool": "search_general_info",
+                    "round": rounds_used,
+                    "query": call.arguments.get("query") or "",
+                    "attempts": result.get("trail", []),
+                })
                 for chunk in result.get("results", []):
                     if category_intent is not None:
                         # 種別そのものの質問では、埋め込み類似度だけで
@@ -338,6 +375,23 @@ async def _run_loop(
                         sources.append(chunk["source_url"])
 
             elif call.name == "lookup_item_change_notice":
+                # システムプロンプトが「品目が見つかったら必ず呼ぶ」と課している
+                # 唯一の追加確認ステップ。これが呼ばれたこと自体を検索結果と同じ
+                # トレイル形式で残すと、「見つけた品目を確認もせず即答したか」を
+                # search_waste_item の呼び出し回数と突き合わせて見分けられる。
+                search_trails.append({
+                    "tool": "lookup_item_change_notice",
+                    "round": rounds_used,
+                    "query": call.arguments.get("item_name") or "",
+                    "attempts": [{
+                        "stage": "change_notice_lookup",
+                        "query": call.arguments.get("item_name") or "",
+                        "hits": (
+                            [{"item_name": "出し方の変更予定あり"}]
+                            if result.get("has_pending_change") else []
+                        ),
+                    }],
+                })
                 if result.get("has_pending_change"):
                     collected_notices.append(result)
                     for seg in [result.get("current")] + result.get("future", []):
@@ -473,6 +527,9 @@ async def _run_loop(
         detected_item=detected_item,
         detected_ward=detected_ward,
         detected_town=detected_town,
+        search_trail=search_trails,
+        agent_rounds=rounds_used,
+        agent_stop_reason=stop_reason,
     )
 
 
@@ -795,6 +852,9 @@ def _build_routed_answer(
     detected_ward: str | None,
     detected_town: str | None,
     district_notes: list[str] | None = None,
+    search_trail: list[dict] | None = None,
+    agent_rounds: int = 0,
+    agent_stop_reason: str | None = None,
 ) -> RoutedAnswer:
     q = _norm(query)
     item_match = "none"
@@ -803,6 +863,9 @@ def _build_routed_answer(
 
     ans = RoutedAnswer(
         found=True,
+        search_trail=list(search_trail or []),
+        agent_rounds=agent_rounds,
+        agent_stop_reason=agent_stop_reason,
         item_match=item_match,
         item_hits=items,
         schedule_hits=schedules,

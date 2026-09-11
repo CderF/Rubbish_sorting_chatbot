@@ -172,6 +172,35 @@ class RoutedAnswer:
     させる(STAGE03採点フィードバック: 品目ごとの「収集枠」の違いを反映
     できていなかった実例が根拠)。"""
 
+    search_trail: list[dict] = field(default_factory=list)
+    """要件6-4追加分: 品目検索で実際に試した段(完全一致/部分一致/埋め込み/
+    別名/ベクトル)と、各段で返ってきた候補(採用されたかどうかに関わらず)。
+
+    `describe_sources()` / `build_trace_record()` に載せ、`/trace` で
+    「どのクエリでどの候補が返り、なぜ採用・却下されたか」を事後に追える
+    ようにする(4-3 確度ゲートの可視化)。1要素 = 1回の品目検索呼び出し
+    (Agentic経路はモデルが複数回呼べるため複数要素になりうる):
+      {"query": str, "attempts": [{"stage": str, "query": str,
+        "hits": [{"item_name": str, "disposal_method": str,
+                   "relation_strength"?: int}]}], "rejected_reason"?: str}
+    """
+
+    agent_rounds: int = 0
+    """Agentic経路(`app/rag/agent.py`)がツール呼び出しループを回した回数
+    (決定論的経路では常に0)。`search_trail` の各要素に付く `round` と
+    突き合わせると、「1ラウンド目の検索結果だけで確認もせず即答したか」を
+    事後に見分けられる(要件6-4)。"""
+
+    agent_stop_reason: str | None = None
+    """Agentic経路のツール呼び出しループが終わった理由。
+      "model_stopped"       — あるラウンドでモデルが自発的にツールを
+                               呼ばなくなった(これ以上の確認は不要と判断)
+      "max_rounds_reached"  — `max_iterations` まで毎回何か呼び続け、
+                               回数の上限で打ち切った
+    決定論的経路では None。"model_stopped" かつ `agent_rounds` が少ない
+    (特に1)のに `search_trail` の確度が低い(ベクトル類似のみ・弱い関連)
+    場合が、「検索結果を疑わず即答した」疑いのあるケース。"""
+
     safety_gate: str | None = None
     """STAGE06: 発火した安全ゲートの識別子("6-1a" / "6-2" / "6-3")、未発火なら None。
 
