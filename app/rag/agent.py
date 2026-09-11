@@ -304,7 +304,11 @@ async def _run_loop(
 
             if call.name == "search_waste_item":
                 query = call.arguments.get("query") or ""
-                trail_entry = {"query": query, "attempts": result.get("trail", [])}
+                trail_entry = {
+                    "tool": "search_waste_item",
+                    "query": query,
+                    "attempts": result.get("trail", []),
+                }
                 if category_intent is not None or not _query_grounded_in_text(query, grounding_text):
                     # このターンが特定品目ではなくごみ種別そのものの質問
                     # (category_intent)か、利用者がこのセッションで一度も
@@ -336,6 +340,11 @@ async def _run_loop(
                     district_notes.append(result["district_note"])
 
             elif call.name == "search_general_info":
+                search_trails.append({
+                    "tool": "search_general_info",
+                    "query": call.arguments.get("query") or "",
+                    "attempts": result.get("trail", []),
+                })
                 for chunk in result.get("results", []):
                     if category_intent is not None:
                         # 種別そのものの質問では、埋め込み類似度だけで

@@ -311,7 +311,19 @@ def _tool_search_general_info(query: str) -> dict:
                 "score": c["score"],
             }
             for c in chunks
-        ]
+        ],
+        # 要件6-4: search_general_info は字面での事前フィルタが無く必ず
+        # 説明ページの向量库を1回叩く(router.general_info_for_category と
+        # 同じトレイル形)。`app/rag/agent.py._run_loop` が
+        # RoutedAnswer.search_trail に集約する。
+        "trail": [{
+            "stage": "vector_explanations",
+            "query": query,
+            "hits": [
+                {"title": c.get("source_page_title", ""), "score": c.get("score")}
+                for c in chunks
+            ],
+        }],
     }
 
 

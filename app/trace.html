@@ -115,13 +115,32 @@ const STAGE_LABELS = {
   partial: '部分一致',
   embedded: '埋め込み品名',
   alias_embedded: '別名表(埋め込み)',
-  vector: 'ベクトル類似',
+  vector: 'ベクトル類似(品目库)',
   vector_skipped: 'ベクトル検索スキップ',
+  vector_explanations: 'ベクトル類似(説明ページ库)',
 };
 const RS_LABELS = {2: '上位語', 1: '弱い関連', 0: '無関連'};
+// この stage が実際に向量库(Chroma)へ1回問い合わせた印。「N回打った」を
+// 数えるときはこれだけをカウントする(vector_skipped は打っていない)。
+const VECTOR_STAGES = new Set(['vector', 'vector_explanations']);
+
+function countVectorHits(searchTrail){
+  let n = 0;
+  (searchTrail || []).forEach(call =>
+    (call.attempts || []).forEach(a => { if (VECTOR_STAGES.has(a.stage)) n++; }));
+  return n;
+}
 
 function hitPill(hit, pickedNames){
   if (typeof hit === 'string') hit = {item_name: hit};
+  if (hit.title !== undefined){
+    // 説明ページのチャンク(search_general_info)。品名候補とは形が違う
+    // ―本文に種別名が含まれていたか(grounded)で採用/却下を示す。
+    const scoreTxt = (hit.score === undefined || hit.score === null)
+      ? '' : '<span class="rs">(score ' + Number(hit.score).toFixed(3) + ')</span>';
+    return '<span class="hitpill' + (hit.grounded ? ' picked' : '') + '">'
+         + escapeHtml(hit.title || '(無題)') + ' ' + scoreTxt + '</span>';
+  }
   const name = hit.item_name || '';
   const picked = pickedNames.has(name);
   let rs = '';
@@ -147,7 +166,8 @@ function renderTrail(searchTrail, pickedNames){
     }).join('');
     const rej = call.rejected_reason
       ? '<span class="rej">却下: ' + escapeHtml(call.rejected_reason) + '</span>' : '';
-    return '<div class="call"><div class="cq">検索クエリ: <b>'
+    const toolLabel = call.tool === 'search_general_info' ? '[一般説明] ' : '';
+    return '<div class="call"><div class="cq">検索クエリ: ' + toolLabel + '<b>'
       + escapeHtml(call.query || '(空)') + '</b>' + rej + '</div>'
       + (attempts || '<div class="noattempt">試行記録なし</div>') + '</div>';
   }).join('');
@@ -176,6 +196,9 @@ function renderRow(r){
     chip('早見表ヒット', (r.item_hit_names || []).length),
     chip('収集日ヒット', r.schedule_hits),
   ];
+  if (r.search_trail && r.search_trail.length){
+    meta.push(chip('ベクトル検索', countVectorHits(r.search_trail) + '回'));
+  }
   if (r.safety_gate) meta.push('<span class="chip gate">安全ゲート ' + escapeHtml(r.safety_gate_label || r.safety_gate) + '</span>');
   else if (r.canned_response) meta.push('<span class="chip flag">固定回答</span>');
   if (r.timeline_change) meta.push('<span class="chip flag">4-2 変更予定</span>');

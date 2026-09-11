@@ -209,7 +209,7 @@ def category_procedure_intent(
 _CATEGORY_NO_CONTEXT_REPLY = "具体的な品目名と、お住まいの区・町名を教えてください。"
 
 
-def general_info_for_category(category: str) -> tuple[str, str] | None:
+def general_info_for_category(category: str) -> tuple[tuple[str, str] | None, dict]:
     """種別そのものの手続き質問(procedure_like)に、知識ベースの一般説明
     (`search_general_info`)で答えられる根拠があれば `(説明文, 出典URL)` を
     返す。無ければ None。
@@ -222,12 +222,36 @@ def general_info_for_category(category: str) -> tuple[str, str] | None:
     返ってきたチャンクの本文に実際に種別名が含まれているものだけを信頼する
     (`app/rag/agent.py` の `_query_grounded_in_text` と同じ、埋め込み類似度
     だけに頼らない字面の裏取り)。
+
+    戻り値の第2要素は要件6-4用のトレイル1件(`RoutedAnswer.search_trail` に
+    そのまま積める形)。`search_general_info`(説明ページの向量库)は前段の
+    字面一致で回避できず必ず1回問い合わせるので、`hits` には返ってきた
+    チャンクごとに実際に採用したか(`grounded`、本文に種別名を含むか)を
+    添える。
     """
-    for chunk in vector_search_explanations(f"{category} 出し方 申込み方法", top_k=3):
+    query = f"{category} 出し方 申込み方法"
+    chunks = vector_search_explanations(query, top_k=3)
+    trail = {
+        "tool": "search_general_info",
+        "query": query,
+        "attempts": [{
+            "stage": "vector_explanations",
+            "query": query,
+            "hits": [
+                {
+                    "title": c.get("source_page_title", ""),
+                    "score": c.get("score"),
+                    "grounded": category in (c.get("text") or ""),
+                }
+                for c in chunks
+            ],
+        }],
+    }
+    for chunk in chunks:
         text = chunk.get("text") or ""
         if category in text:
-            return text, chunk.get("source_url", "")
-    return None
+            return (text, chunk.get("source_url", "")), trail
+    return None, trail
 
 
 # 「〜はどう捨てますか」「〜はどこで回収してもらえますか」「〜の処分方法を
@@ -1142,7 +1166,8 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
             # は守らず、「ごみ箱」「ふれあい収集」等を作り出すことがある
             # (4-3確度ゲートと同じ理由)。知識ベースに根拠があれば使い、
             # 無ければ固定の確認文へ倒す ― どちらの分岐も自由生成させない。
-            info = general_info_for_category(category_waste_type)
+            info, _trail_entry = general_info_for_category(category_waste_type)
+            ans.search_trail.append(_trail_entry)
             if info is not None:
                 text, source_url = info
                 ans.found = True
@@ -1176,7 +1201,7 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
             item_name, item_candidates[1:], vector_query
         )
         if _trail:
-            ans.search_trail = [{"query": item_name, "attempts": _trail}]
+            ans.search_trail.append({"tool": "search_waste_item", "query": item_name, "attempts": _trail})
         ans.item_match = _classify_item_match(item_candidates, ans.item_hits)
 
         # 候補文字列が質問定型で汚れて exact/partial を素通りしても、ヒット名
