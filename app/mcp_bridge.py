@@ -65,6 +65,16 @@ class BridgeError(Exception):
     """許可されていない呼び出し、またはMCPサーバ側のエラー応答。"""
 
 
+def _field(obj: Any, *names: str, default: Any = None) -> Any:
+    """Read an MCP model field across v1 camelCase and v2 snake_case SDKs."""
+    for name in names:
+        try:
+            return getattr(obj, name)
+        except AttributeError:
+            continue
+    return default
+
+
 def _child_environment() -> dict[str, str]:
     """Build the MCP child environment without losing deployment-specific paths.
 
@@ -151,7 +161,7 @@ class MCPBridge:
             {
                 "name": t.name,
                 "description": (t.description or "").strip(),
-                "inputSchema": t.inputSchema,
+                "inputSchema": _field(t, "inputSchema", "input_schema", default={}),
             }
             for t in result.tools
             if t.name in ALLOWED_TOOLS
@@ -174,13 +184,15 @@ class MCPBridge:
             ],
             "resource_templates": [
                 {
-                    "uriTemplate": t.uriTemplate,
+                    "uriTemplate": _field(t, "uriTemplate", "uri_template", default=""),
                     "name": t.name,
                     "description": (t.description or "").strip(),
-                    "mimeType": t.mimeType,
+                    "mimeType": _field(t, "mimeType", "mime_type"),
                 }
-                for t in templates.resourceTemplates
-                if t.uriTemplate.startswith(ALLOWED_RESOURCE_SCHEMES)
+                for t in _field(templates, "resourceTemplates", "resource_templates", default=[])
+                if _field(t, "uriTemplate", "uri_template", default="").startswith(
+                    ALLOWED_RESOURCE_SCHEMES
+                )
             ],
         }
 
@@ -191,16 +203,18 @@ class MCPBridge:
             session = await self._ensure_session()
             result = await session.call_tool(name, arguments)
 
-        if result.structuredContent is not None:
-            payload: Any = result.structuredContent
+        structured = _field(result, "structuredContent", "structured_content")
+        if structured is not None:
+            payload: Any = structured
         else:
-            text = result.content[0].text if result.content else ""
+            content = _field(result, "content", default=[])
+            text = content[0].text if content else ""
             try:
                 payload = json.loads(text) if text else {}
             except json.JSONDecodeError:
                 payload = {"text": text}
 
-        if result.isError:
+        if _field(result, "isError", "is_error", default=False):
             message = payload.get("error") if isinstance(payload, dict) else None
             raise BridgeError(message or "MCPツールがエラーを返しました")
         return payload if isinstance(payload, dict) else {"result": payload}
