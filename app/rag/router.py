@@ -1168,8 +1168,10 @@ def _blocking_route(prompt: str, image_item_name: str | None = None) -> RoutedAn
             ans.item_hits = _override_analogy_hits(ans.detected_item, ans.item_hits)
 
         # 類似候補があれば必ず1件に絞って区分を導く(canned 断りは「類似品が
-        # あるのに確認だけ促すのは減点」という採点フィードバックで否定された)。
-        # `analogy_unreliable` は使える候補が1つも無いときだけ。
+        # あるのに確認だけ促すのは減点」という採点フィードバックで否定された、
+        # PR #36。`tests/notices_similar_item_test.py::
+        # test_blocking_route_uses_best_vector_hit_instead_of_canned` 等で
+        # 固定済みの動作)。`analogy_unreliable` は使える候補が1つも無いときだけ。
         if ans.item_match == "analogy" and ans.item_match_stage == "vector":
             ans.analogy_unreliable = _analogy_pick(ans.item_hits, ans.detected_item) is None
 
@@ -1599,6 +1601,15 @@ _CANONICAL_ALIASES = {
     "農薬の空き容器": "農薬びん(家庭用)(中身のないもの)",
     "農薬の容器": "農薬びん(家庭用)(中身のないもの)",
     "注射器": "注射筒",
+    # 2026-09-11 実機の手動検証で確認。「シューズ」を含む品目(ランニング
+    # シューズ等)は早見表に個別の行が無く、ベクトル類似に任せると語頭が
+    # 共通なだけの「ランニングマシン(粗大ごみ)」に化ける事故を確認した。
+    # 「シューズ」は靴の一般的な言い換え語であり特定の品目名ではないため、
+    # ここに置いても特定の質問への決め打ちにはならない(早見表の「靴(くつ)」
+    # へ一般名詞として解決するだけ)。`_resolve_embedded_alias` の境界検査
+    # (`_AFTER_NAME_OK`)により、「シューズボックス」のように「シューズ」の
+    # 直後に別の語が続く既存の品名までは横取りしない。
+    "シューズ": "靴(くつ)",
 }
 
 
